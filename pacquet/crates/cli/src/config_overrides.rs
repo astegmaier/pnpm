@@ -1,5 +1,8 @@
 use pacquet_config::Config;
-use std::ffi::{OsStr, OsString};
+use std::{
+    collections::BTreeMap,
+    ffi::{OsStr, OsString},
+};
 
 /// CLI overrides parsed from pnpm's `--config.<key>=<value>` dotted-key
 /// syntax. Upstream pnpm uses [`npm-conf`](https://github.com/npm/npm-conf)
@@ -18,16 +21,13 @@ use std::ffi::{OsStr, OsString};
 #[derive(Debug, Default)]
 pub struct ConfigOverrides {
     registry: Option<String>,
+    registries: BTreeMap<String, String>,
 }
 
 impl ConfigOverrides {
     /// Pull `--config.<key>=<value>` tokens out of `argv` and collect
     /// them. Returns the parsed overrides together with the remaining
     /// argv tokens (in their original order) for clap to parse.
-    ///
-    /// Malformed tokens — `--config.foo` with no `=`, or `--config.=value`
-    /// with an empty key — are dropped: clap would reject `--config.*` as
-    /// unknown anyway, and the dropped tokens carry no usable signal.
     pub fn extract<Argv>(argv: Argv) -> (Self, Vec<OsString>)
     where
         Argv: IntoIterator<Item = OsString>,
@@ -46,7 +46,11 @@ impl ConfigOverrides {
 
     fn set(&mut self, key: &str, value: &str) {
         if key == "registry" {
-            self.registry = Some(value.to_owned());
+            self.registry = Some(normalize_registry_url(value));
+            return;
+        }
+        if let Some(scope) = scoped_registry_key(key) {
+            self.registries.insert(scope.to_owned(), normalize_registry_url(value));
         }
     }
 
@@ -55,7 +59,10 @@ impl ConfigOverrides {
     /// Mirrors pnpm 11's "CLI > yaml > .npmrc > defaults" precedence.
     pub fn apply(&self, config: &mut Config) {
         if let Some(registry) = &self.registry {
-            config.registry = registry.clone();
+            config.registry.clone_from(registry);
+        }
+        for (scope, registry) in &self.registries {
+            config.registries.insert(scope.clone(), registry.clone());
         }
     }
 }
@@ -83,69 +90,14 @@ fn classify(arg: &OsStr) -> ConfigToken<'_> {
     ConfigToken::WellFormed { key, value }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::ConfigOverrides;
-    use pacquet_config::Config;
-    use pretty_assertions::assert_eq;
-    use std::ffi::OsString;
-
-    fn argv<Items: IntoIterator<Item = &'static str>>(items: Items) -> Vec<OsString> {
-        items.into_iter().map(OsString::from).collect()
-    }
-
-    #[test]
-    fn extract_separates_config_tokens_from_argv() {
-        let (overrides, remaining) = ConfigOverrides::extract(argv([
-            "pacquet",
-            "--config.registry=https://example.test/",
-            "install",
-            "--frozen-lockfile",
-        ]));
-        assert_eq!(remaining, argv(["pacquet", "install", "--frozen-lockfile"]));
-        let mut config = Config::default();
-        overrides.apply(&mut config);
-        assert_eq!(config.registry, "https://example.test/");
-    }
-
-    #[test]
-    fn unknown_keys_are_dropped_silently() {
-        let (overrides, remaining) =
-            ConfigOverrides::extract(argv(["pacquet", "--config.unknown-key=whatever", "install"]));
-        assert_eq!(remaining, argv(["pacquet", "install"]));
-        let default_registry = Config::default().registry;
-        let mut config = Config::default();
-        overrides.apply(&mut config);
-        assert_eq!(config.registry, default_registry, "no known key set ⇒ registry untouched");
-    }
-
-    #[test]
-    fn malformed_tokens_are_dropped() {
-        let (_, remaining) = ConfigOverrides::extract(argv([
-            "--config.registry",
-            "--config.=missing-key",
-            "install",
-        ]));
-        assert_eq!(remaining, argv(["install"]));
-    }
-
-    #[test]
-    fn last_value_wins_for_repeated_keys() {
-        let (overrides, _) = ConfigOverrides::extract(argv([
-            "--config.registry=https://first.test/",
-            "--config.registry=https://second.test/",
-        ]));
-        let mut config = Config::default();
-        overrides.apply(&mut config);
-        assert_eq!(config.registry, "https://second.test/");
-    }
-
-    #[test]
-    fn apply_is_a_noop_when_no_overrides_set() {
-        let (overrides, _) = ConfigOverrides::extract(argv(["pacquet", "install"]));
-        let default_registry = Config::default().registry;
-        let mut config = Config::default();
-        overrides.apply(&mut config);
-        assert_eq!(config.registry, default_registry);
-    }
+fn scoped_registry_key(key: &str) -> Option<&str> {
+    key.strip_suffix(":registry")
+        .filter(|scope| scope.starts_with('@') && scope.len() > 1 && !scope.contains('/'))
 }
+
+fn normalize_registry_url(registry: &str) -> String {
+    if registry.ends_with('/') { registry.to_string() } else { format!("{registry}/") }
+}
+
+#[cfg(test)]
+mod tests;

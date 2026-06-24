@@ -1,12 +1,22 @@
-use super::{GitFetcher, exec_git, extract_host, should_use_shallow};
-use crate::error::GitFetcherError;
+use super::{GitFetcher, exec_git_with, extract_host, is_valid_commit_hash, should_use_shallow};
+use crate::{error::GitFetcherError, prepare_package::AllowBuildRef};
 use pacquet_executor::ScriptsPrependNodePath;
 use pacquet_reporter::SilentReporter;
 use pacquet_store_dir::StoreDir;
 #[cfg(unix)]
 use pacquet_testing_utils::env_guard::EnvGuard;
-use std::{fs, path::Path, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 use tempfile::tempdir;
+
+/// Run `git` (resolved through `PATH`) with `args` and capture stdout —
+/// a convenience wrapper around [`exec_git_with`] for fixture setup that
+/// does not need to override the binary location.
+fn exec_git(args: &[&str], cwd: Option<&Path>) -> Result<String, GitFetcherError> {
+    exec_git_with(Path::new("git"), args, cwd)
+}
 
 /// Build a bare repo whose manifest declares a `prepare` script. The
 /// script is whatever the caller passes — typically a `node -e '…'`
@@ -22,10 +32,8 @@ fn make_bare_repo_with_prepare_script(tmp: &Path, prepare_script: &str) -> (Path
     // Manifest with no dependencies so the synthesized `<pm>-install`
     // step has nothing to fetch from a network registry — the test
     // stays self-contained even without verdaccio / a mock registry.
-    // The prepare script is plumbed straight in.
     let manifest = format!(
-        r#"{{"name":"x","version":"1.0.0","main":"index.js","scripts":{{"prepare":{prepare:?}}}}}"#,
-        prepare = prepare_script,
+        r#"{{"name":"x","version":"1.0.0","main":"index.js","scripts":{{"prepare":{prepare_script:?}}}}}"#,
     );
     fs::write(work.join("package.json"), manifest).unwrap();
     fs::write(work.join("index.js"), "module.exports = 'src';\n").unwrap();
@@ -37,8 +45,8 @@ fn make_bare_repo_with_prepare_script(tmp: &Path, prepare_script: &str) -> (Path
     (bare, commit)
 }
 
-fn allow_all_builds<'a>() -> &'a (dyn Fn(&str, &str) -> bool + Send + Sync) {
-    &|_, _| true
+fn allow_all_builds<'a>() -> AllowBuildRef<'a> {
+    &|_| true
 }
 
 /// Create a tiny bare git repo whose single commit ships a
@@ -67,8 +75,8 @@ fn make_bare_repo(tmp: &Path) -> (PathBuf, String) {
     (bare, commit)
 }
 
-fn deny_all_builds<'a>() -> &'a (dyn Fn(&str, &str) -> bool + Send + Sync) {
-    &|_, _| false
+fn deny_all_builds<'a>() -> AllowBuildRef<'a> {
+    &|_| false
 }
 
 #[test]
@@ -82,6 +90,55 @@ fn should_use_shallow_matches_known_host() {
     assert!(should_use_shallow("https://github.com/x/y.git", &hosts));
     assert!(should_use_shallow("git+ssh://git@github.com/x/y.git", &hosts));
     assert!(!should_use_shallow("https://example.com/x/y.git", &hosts));
+}
+
+#[test]
+fn is_valid_commit_hash_accepts_full_sha() {
+    assert!(is_valid_commit_hash("c9b30e71d704cd30fa71f2edd1ecc7dcc4985493"));
+    assert!(is_valid_commit_hash("C9B30E71D704CD30FA71F2EDD1ECC7DCC4985493"));
+}
+
+#[test]
+fn is_valid_commit_hash_rejects_short_or_option_shaped_values() {
+    assert!(!is_valid_commit_hash("deadbeef"));
+    assert!(!is_valid_commit_hash(""));
+    assert!(!is_valid_commit_hash("--upload-pack=touch /tmp/pwned"));
+    assert!(!is_valid_commit_hash("c9b30e71d704cd30fa71f2edd1ecc7dcc4985493 "));
+    // 40 chars but contains a non-hex digit.
+    assert!(!is_valid_commit_hash("c9b30e71d704cd30fa71f2edd1ecc7dcc498549z"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fetcher_rejects_option_shaped_commit() {
+    let store_root = tempdir().unwrap();
+    let store_dir = StoreDir::from(store_root.path().to_path_buf());
+    let err = GitFetcher {
+        repo: "file:///tmp/githost",
+        commit: "--upload-pack=touch /tmp/pwned",
+        path: None,
+        git_shallow_hosts: &[],
+        allow_build: deny_all_builds(),
+        ignore_scripts: false,
+        unsafe_perm: true,
+        user_agent: None,
+        scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        script_shell: None,
+        node_execpath: None,
+        npm_execpath: None,
+        store_dir: &store_dir,
+        package_id: "pkg@1.0.0",
+        requester: "/test",
+        store_index_writer: None,
+        files_index_file: "pkg@1.0.0\tbuilt",
+        git_bin: None,
+    }
+    .run::<SilentReporter>()
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, GitFetcherError::InvalidCommit { .. }),
+        "expected InvalidCommit, got {err:?}",
+    );
 }
 
 #[test]
@@ -179,9 +236,6 @@ async fn fetcher_rejects_commit_mismatch() {
 #[tokio::test(flavor = "multi_thread")]
 async fn fetcher_blocks_build_when_not_allowed() {
     let tmp = tempdir().unwrap();
-    // A repo whose manifest declares a `prepare` script — exercises
-    // the `allow_build` gate without actually spawning the script
-    // (the policy is denying-all here).
     let work = tmp.path().join("work");
     let bare = tmp.path().join("repo.git");
     fs::create_dir_all(&work).unwrap();
@@ -295,10 +349,6 @@ fn make_bare_repo_without_manifest(tmp: &Path) -> (PathBuf, String) {
     (bare, commit)
 }
 
-/// Ports pnpm's `fetch a package from Git sub folder` at
-/// <https://github.com/pnpm/pnpm/blob/94240bc046/fetching/git-fetcher/test/index.ts#L69>.
-/// The fetcher must pack only the files under `resolution.path`, not
-/// the monorepo root or sibling packages.
 #[tokio::test(flavor = "multi_thread")]
 async fn fetcher_packs_subfolder_when_path_set() {
     let tmp = tempdir().unwrap();
@@ -340,12 +390,6 @@ async fn fetcher_packs_subfolder_when_path_set() {
     );
 }
 
-/// Ports pnpm's `fetch a package without a package.json` at
-/// <https://github.com/pnpm/pnpm/blob/94240bc046/fetching/git-fetcher/test/index.ts#L150>.
-/// `prepare_package` returns `should_be_built: false` when no manifest
-/// is present, and the fetcher imports whatever files the packlist
-/// finds — the install dispatcher rejects manifest-less packages
-/// downstream, but the fetcher itself must not crash.
 #[tokio::test(flavor = "multi_thread")]
 async fn fetcher_handles_repo_without_package_json() {
     let tmp = tempdir().unwrap();
@@ -383,12 +427,6 @@ async fn fetcher_handles_repo_without_package_json() {
     assert!(received.cas_paths.contains_key("index.js"));
 }
 
-/// Ports pnpm's `do not build the package when scripts are ignored`
-/// at <https://github.com/pnpm/pnpm/blob/94240bc046/fetching/git-fetcher/test/index.ts#L247>.
-/// A repo with `scripts.prepare` set must NOT run the script when
-/// `ignore_scripts: true`; the fetcher still reports
-/// `should_be_built: true` so the caller knows the package wanted a
-/// build (matches upstream's `shouldBeBuilt = true` short-circuit).
 #[tokio::test(flavor = "multi_thread")]
 async fn fetcher_skips_build_when_ignore_scripts() {
     let tmp = tempdir().unwrap();
@@ -456,13 +494,6 @@ async fn fetcher_skips_build_when_ignore_scripts() {
     assert!(received.cas_paths.contains_key("index.js"));
 }
 
-/// Ports pnpm's `fetch a package from Git that has a prepare script`
-/// at <https://github.com/pnpm/pnpm/blob/94240bc046/fetching/git-fetcher/test/index.ts#L129>.
-/// End-to-end: a manifest with `scripts.prepare` set, `allow_build`
-/// returning true, and `ignore_scripts: false` runs the prepare
-/// lifecycle. The prepare script writes a marker file; the test
-/// confirms the marker lands in `cas_paths`, proving the script
-/// actually executed (the file didn't exist in the source tree).
 #[tokio::test(flavor = "multi_thread")]
 async fn fetcher_runs_prepare_script_when_allowed() {
     let tmp = tempdir().unwrap();
@@ -513,12 +544,6 @@ async fn fetcher_runs_prepare_script_when_allowed() {
     assert!(received.cas_paths.contains_key("index.js"));
 }
 
-/// Ports pnpm's `fail when preparing a git-hosted package` at
-/// <https://github.com/pnpm/pnpm/blob/94240bc046/fetching/git-fetcher/test/index.ts#L212>.
-/// A prepare script that exits non-zero must surface as
-/// `GitFetcherError::Prepare(PreparePackageError::LifecycleFailed)`
-/// carrying the `ERR_PNPM_PREPARE_PACKAGE` diagnostic code — the
-/// fetcher refuses to add a broken-build snapshot to the CAS.
 #[tokio::test(flavor = "multi_thread")]
 async fn fetcher_surfaces_prepare_failure() {
     let tmp = tempdir().unwrap();
@@ -580,14 +605,10 @@ async fn fetcher_surfaces_prepare_failure() {
     );
 }
 
-/// Ports pnpm's `allow git package with prepare script` at
-/// <https://github.com/pnpm/pnpm/blob/94240bc046/fetching/git-fetcher/test/index.ts#L280>.
-/// Mirror of the existing `fetcher_blocks_build_when_not_allowed`
-/// (line 263) but with `allow_build` returning true: the gate
-/// permits the build, the script runs, and the snapshot ships. The
-/// distinction matters — without this test, a regression that
-/// inverted the gate's polarity (block-when-allowed) would still
-/// keep the block-test green.
+/// Mirror of `fetcher_blocks_build_when_not_allowed` with
+/// `allow_build` returning true. The distinction matters — without
+/// this test, a regression that inverted the gate's polarity
+/// (block-when-allowed) would still keep the block-test green.
 #[tokio::test(flavor = "multi_thread")]
 async fn fetcher_runs_prepare_when_allow_build_returns_true() {
     let tmp = tempdir().unwrap();
@@ -600,10 +621,9 @@ async fn fetcher_runs_prepare_when_allow_build_returns_true() {
     let repo_url = format!("file://{}", bare.display());
 
     // Targeted allow_build that returns true for *this* package only —
-    // catches a regression where the gate ignores the (name, version)
-    // pair and falls through to default-allow or default-deny.
-    let allow_x_only: &(dyn Fn(&str, &str) -> bool + Send + Sync) =
-        &|name, version| name == "x" && version == "1.0.0";
+    // catches a regression where the gate ignores the dep path and
+    // falls through to default-allow or default-deny.
+    let allow_x_only: AllowBuildRef<'_> = &|dep_path| dep_path == "x@1.0.0";
 
     let received = GitFetcher {
         repo: &repo_url,
@@ -638,6 +658,95 @@ async fn fetcher_runs_prepare_when_allow_build_returns_true() {
         "allow_build returning true must let the prepare script run: keys = {:?}",
         received.cas_paths.keys().collect::<Vec<_>>(),
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fetcher_rejects_untrusted_manifest_identity() {
+    let tmp = tempdir().unwrap();
+    let (bare, commit) = make_bare_repo_with_prepare_script(
+        tmp.path(),
+        r#"node -e "require('fs').writeFileSync('BUILD_RAN.marker', 'ok')""#,
+    );
+    let store_root = tempdir().unwrap();
+    let store_dir = StoreDir::from(store_root.path().to_path_buf());
+    let repo_url = format!("file://{}", bare.display());
+    let allow_registry_artifacts_only: AllowBuildRef<'_> = &|dep_path| !dep_path.contains("://");
+
+    let err = GitFetcher {
+        repo: &repo_url,
+        commit: &commit,
+        path: None,
+        git_shallow_hosts: &[],
+        allow_build: allow_registry_artifacts_only,
+        ignore_scripts: false,
+        unsafe_perm: true,
+        user_agent: None,
+        scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        script_shell: None,
+        node_execpath: None,
+        npm_execpath: None,
+        store_dir: &store_dir,
+        package_id: "x@git+file:///tmp/repo.git#abc123",
+        requester: "/test",
+        store_index_writer: None,
+        files_index_file: "x@git+file:///tmp/repo.git#abc123\tbuilt",
+        git_bin: None,
+    }
+    .run::<SilentReporter>()
+    .await
+    .unwrap_err();
+
+    match err {
+        GitFetcherError::Prepare(crate::error::PreparePackageError::NotAllowed {
+            name,
+            version,
+        }) => {
+            assert_eq!(name, "x");
+            assert_eq!(version, "1.0.0");
+        }
+        other => panic!("expected NotAllowed, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fetcher_allows_untrusted_manifest_identity_by_dep_path() {
+    let tmp = tempdir().unwrap();
+    let (bare, commit) = make_bare_repo_with_prepare_script(
+        tmp.path(),
+        r#"node -e "require('fs').writeFileSync('BUILD_RAN.marker', 'ok')""#,
+    );
+    let store_root = tempdir().unwrap();
+    let store_dir = StoreDir::from(store_root.path().to_path_buf());
+    let repo_url = format!("file://{}", bare.display());
+    let package_id = "x@git+file:///tmp/repo.git#abc123";
+    let allow_dep_path: AllowBuildRef<'_> = &|dep_path| dep_path == package_id;
+
+    let received = GitFetcher {
+        repo: &repo_url,
+        commit: &commit,
+        path: None,
+        git_shallow_hosts: &[],
+        allow_build: allow_dep_path,
+        ignore_scripts: false,
+        unsafe_perm: true,
+        user_agent: None,
+        scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        script_shell: None,
+        node_execpath: None,
+        npm_execpath: None,
+        store_dir: &store_dir,
+        package_id,
+        requester: "/test",
+        store_index_writer: None,
+        files_index_file: "x@git+file:///tmp/repo.git#abc123\tbuilt",
+        git_bin: None,
+    }
+    .run::<SilentReporter>()
+    .await
+    .unwrap();
+
+    assert!(received.built);
+    assert!(received.cas_paths.contains_key("BUILD_RAN.marker"));
 }
 
 /// Write a `git` shim shell script to `dir/git` that:

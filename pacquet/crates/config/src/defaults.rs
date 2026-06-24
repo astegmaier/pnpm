@@ -3,7 +3,7 @@ use pacquet_store_dir::StoreDir;
 use std::{env, path::PathBuf};
 
 #[cfg(windows)]
-use std::{path::Component, path::Path};
+use std::path::{Component, Path};
 
 pub fn default_hoist_pattern() -> Vec<String> {
     vec!["*".to_string()]
@@ -13,6 +13,7 @@ pub fn default_hoist_pattern() -> Vec<String> {
 /// <https://github.com/pnpm/pnpm/blob/94240bc046/config/reader/src/index.ts#L155-L162>,
 /// which follows
 /// <https://github.com/npm/git/blob/1e1dbd26bd/lib/clone.js#L13-L19>.
+#[must_use]
 pub fn default_git_shallow_hosts() -> Vec<String> {
     vec![
         "github.com".to_string(),
@@ -35,7 +36,6 @@ pub fn default_public_hoist_pattern() -> Vec<String> {
     Vec::new()
 }
 
-// Get the drive letter from a path on Windows. If it's not a Windows path, return None.
 #[cfg(windows)]
 fn get_drive_letter(current_dir: &Path) -> Option<char> {
     if let Some(Component::Prefix(prefix_component)) = current_dir.components().next()
@@ -61,12 +61,6 @@ fn default_store_dir_windows(home_dir: &Path, current_dir: &Path) -> PathBuf {
     PathBuf::from(format!("{current_drive}:\\.pnpm-store"))
 }
 
-/// If the `$PNPM_HOME` env variable is set, then `$PNPM_HOME/store`.
-/// If the `$XDG_DATA_HOME` env variable is set, then `$XDG_DATA_HOME/pnpm/store`.
-/// On Windows: `~/AppData/Local/pnpm/store` (same drive) or `<drive>:\.pnpm-store` (different drive).
-/// On macOS: `~/Library/pnpm/store`.
-/// On Linux: `~/.local/share/pnpm/store`.
-///
 /// Generic over [`EnvVar`], [`GetHomeDir`], and [`GetCurrentDir`]
 /// so unit tests can drive every branch — `PNPM_HOME` set,
 /// `XDG_DATA_HOME` set, neither set — without mutating the process
@@ -113,7 +107,7 @@ where
         return default_store_dir_windows(&home_dir, &current_dir).into();
     }
 
-    // https://doc.rust-lang.org/std/env/consts/constant.OS.html
+    // <https://doc.rust-lang.org/std/env/consts/constant.OS.html>
     match env::consts::OS {
         "linux" => home_dir.join(".local/share/pnpm/store").into(),
         "macos" => home_dir.join("Library/pnpm/store").into(),
@@ -127,52 +121,29 @@ pub fn default_modules_dir() -> PathBuf {
 }
 
 /// Resolve the directory pnpm reads `config.yaml` (the global config
-/// file) from.
-///
-/// Port of pnpm's
-/// [`getConfigDir`](https://github.com/pnpm/pnpm/blob/2a9bd897bf/config/reader/src/dirs.ts#L67-L86).
-/// Resolution order:
-///
-/// 1. `$XDG_CONFIG_HOME/pnpm`.
-/// 2. macOS: `~/Library/Preferences/pnpm`.
-/// 3. Other non-Windows: `~/.config/pnpm`.
-/// 4. Windows: `%LOCALAPPDATA%/pnpm/config`, falling back to
-///    `~/.config/pnpm` when `LOCALAPPDATA` is unset.
-///
-/// Returns `None` when the home directory is unavailable and the env
-/// vars that bypass it are also unset — the caller treats that as
-/// "no global config file."
+/// file) from. Threads this crate's [`EnvVar`] / [`GetHomeDir`] seam
+/// into [`pacquet_config_dir::config_dir`] — the shared port of
+/// pnpm's `getConfigDir`, also used by the registry server — under
+/// the `pnpm` leaf.
 pub fn default_config_dir<Sys>() -> Option<PathBuf>
 where
     Sys: EnvVar + GetHomeDir,
 {
-    if let Some(xdg_config_home) = Sys::var("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(xdg_config_home).join("pnpm"));
-    }
-    if env::consts::OS == "windows"
-        && let Some(local_app_data) = Sys::var("LOCALAPPDATA")
-    {
-        return Some(PathBuf::from(local_app_data).join("pnpm/config"));
-    }
-    let home_dir = Sys::home_dir()?;
-    Some(match env::consts::OS {
-        "macos" => home_dir.join("Library/Preferences/pnpm"),
-        _ => home_dir.join(".config/pnpm"),
-    })
+    let xdg_config_home = Sys::var("XDG_CONFIG_HOME");
+    let local_app_data = Sys::var("LOCALAPPDATA");
+    pacquet_config_dir::config_dir(
+        "pnpm",
+        env::consts::OS,
+        xdg_config_home.as_deref(),
+        local_app_data.as_deref(),
+        Sys::home_dir,
+    )
 }
 
 /// Resolve the default packument-cache directory.
 ///
 /// Port of pnpm's
 /// [`getCacheDir`](https://github.com/pnpm/pnpm/blob/2a9bd897bf/config/reader/src/dirs.ts#L4-L23).
-/// Resolution order:
-///
-/// 1. `$XDG_CACHE_HOME/pnpm` — set on Linux desktops following the
-///    XDG base-dir spec.
-/// 2. macOS: `~/Library/Caches/pnpm`.
-/// 3. Other non-Windows: `~/.cache/pnpm`.
-/// 4. Windows: `%LOCALAPPDATA%/pnpm-cache`, falling back to
-///    `~/.pnpm-cache` when `LOCALAPPDATA` is unset.
 ///
 /// Generic over [`EnvVar`] and [`GetHomeDir`] for the same reason
 /// as [`default_store_dir`]: unit tests drive every branch without
@@ -189,9 +160,10 @@ where
     let home_dir = Sys::home_dir().expect("Home directory is not available");
     match env::consts::OS {
         "macos" => home_dir.join("Library/Caches/pnpm"),
-        "windows" => Sys::var("LOCALAPPDATA")
-            .map(|local_app_data| PathBuf::from(local_app_data).join("pnpm-cache"))
-            .unwrap_or_else(|| home_dir.join(".pnpm-cache")),
+        "windows" => Sys::var("LOCALAPPDATA").map_or_else(
+            || home_dir.join(".pnpm-cache"),
+            |local_app_data| PathBuf::from(local_app_data).join("pnpm-cache"),
+        ),
         _ => home_dir.join(".cache/pnpm"),
     }
 }
@@ -215,9 +187,6 @@ pub fn default_virtual_store_dir() -> PathBuf {
 /// downstream. Pacquet doesn't have a `--global` CLI flag at all
 /// (only `install --frozen-lockfile`), so the only applicable
 /// upstream default is the `false` one.
-///
-/// pnpm/pacquet#444 originally cited the same `L392-L394` range but
-/// read it as an unconditional default — corrected here.
 pub fn default_enable_global_virtual_store() -> bool {
     false
 }
@@ -230,16 +199,26 @@ pub fn default_modules_cache_max_age() -> u64 {
     10080
 }
 
-/// Default `virtualStoreDirMaxLength` matching pnpm's fallback at
-/// <https://github.com/pnpm/pnpm/blob/1819226b51/installing/modules-yaml/src/index.ts#L101-L103>.
+/// Default `virtualStoreDirMaxLength` matching pnpm's platform-aware
+/// config default at
+/// <https://github.com/pnpm/pnpm/blob/d50d691e5a/config/reader/src/index.ts#L216>.
+#[must_use]
+pub fn default_virtual_store_dir_max_length() -> u64 {
+    if cfg!(windows) { 60 } else { 120 }
+}
+
+/// Default `peersSuffixMaxLength` matching pnpm's fallback at
+/// <https://github.com/pnpm/pnpm/blob/39101f5e37/deps/path/src/index.ts#L197>
+/// (parameter default on `createPeerDepGraphHash`).
 ///
 /// Kept as a free function (not a re-export of
-/// `pacquet_modules_yaml::DEFAULT_VIRTUAL_STORE_DIR_MAX_LENGTH`) so
-/// `pacquet-config` doesn't pull in the modules-yaml crate just for one
-/// integer. Both copies must agree; the modules-yaml side carries the
+/// `pacquet_lockfile::DEFAULT_PEERS_SUFFIX_MAX_LENGTH`) so
+/// `pacquet-config` doesn't pull in the lockfile crate just for one
+/// integer. Both copies must agree; the lockfile side carries the
 /// same upstream link.
-pub fn default_virtual_store_dir_max_length() -> u64 {
-    120
+#[must_use]
+pub fn default_peers_suffix_max_length() -> u64 {
+    1000
 }
 
 pub fn default_fetch_retries() -> u32 {
@@ -256,6 +235,32 @@ pub fn default_fetch_retry_mintimeout() -> u64 {
 
 pub fn default_fetch_retry_maxtimeout() -> u64 {
     60_000
+}
+
+/// pacquet's user-facing release version — the same value
+/// `pacquet --version` prints. Single source of truth so the CLI
+/// version string and the default `User-Agent` (`default_user_agent`)
+/// can't drift apart.
+pub const PACQUET_VERSION: &str = "0.2.2";
+
+pub fn default_fetch_timeout() -> u64 {
+    pacquet_network::DEFAULT_FETCH_TIMEOUT_MS
+}
+
+/// Default `User-Agent`, mirroring pnpm v11's
+/// [`config/reader/src/index.ts:293`](https://github.com/pnpm/pnpm/blob/1819226b51/config/reader/src/index.ts#L293)
+/// format `${name}/${version} npm/? node/${nodeVersion} ${platform} ${arch}`.
+/// The `name/version` segment is `pnpm/pacquet-<version>` so registries can
+/// tell pacquet's traffic apart from the TypeScript pnpm CLI. pacquet has no
+/// embedded Node runtime, so the `node/` segment is the `?` placeholder pnpm
+/// already uses for `npm/`. Platform and arch use Node's naming via
+/// [`pacquet_detect_libc::host_platform`] / [`pacquet_detect_libc::host_arch`].
+pub fn default_user_agent() -> String {
+    format!(
+        "pnpm/pacquet-{PACQUET_VERSION} npm/? node/? {} {}",
+        pacquet_detect_libc::host_platform(),
+        pacquet_detect_libc::host_arch(),
+    )
 }
 
 /// Default `childConcurrency` matching upstream's
@@ -275,23 +280,36 @@ pub fn default_child_concurrency_with_parallelism(parallelism: u32) -> u32 {
     parallelism.min(4)
 }
 
+/// Default `workspaceConcurrency` matching upstream's
+/// [`getDefaultWorkspaceConcurrency`](https://github.com/pnpm/pnpm/blob/b4f8f47ac2/config/reader/src/concurrency.ts#L21-L23),
+/// the default for `workspace-concurrency` at
+/// [`config/reader/src/index.ts:208`](https://github.com/pnpm/pnpm/blob/b4f8f47ac2/config/reader/src/index.ts#L208).
+///
+/// Identical in value to `default_child_concurrency` — both pnpm
+/// settings default through the same upstream `getDefaultWorkspaceConcurrency`
+/// — but exposed under its own name so the
+/// [`crate::Config::workspace_concurrency`] field default reads at its
+/// own call site.
+#[must_use]
+pub fn default_workspace_concurrency() -> u32 {
+    default_child_concurrency()
+}
+
 /// Available CPU parallelism, mirroring upstream's
 /// [`getAvailableParallelism`](https://github.com/pnpm/pnpm/blob/b4f8f47ac2/config/reader/src/concurrency.ts#L5-L13).
 /// Floors at 1.
+#[must_use]
 pub fn available_parallelism() -> u32 {
-    std::thread::available_parallelism().map(|count| count.get() as u32).unwrap_or(1).max(1)
+    std::thread::available_parallelism().map_or(1, |count| count.get() as u32).max(1)
 }
 
 /// Resolve `childConcurrency` from a possibly-negative yaml value
 /// to a concrete `u32`. Mirrors upstream's
-/// [`getWorkspaceConcurrency`](https://github.com/pnpm/pnpm/blob/b4f8f47ac2/config/reader/src/concurrency.ts#L25-L34):
-///
-/// - `None` → default (`min(4, parallelism)`).
-/// - Positive `n` → `n`.
-/// - Zero or negative `n` → `max(1, parallelism - |n|)`.
+/// [`getWorkspaceConcurrency`](https://github.com/pnpm/pnpm/blob/b4f8f47ac2/config/reader/src/concurrency.ts#L25-L34).
 ///
 /// The negative-offset semantics let users say "use all cores minus
 /// N" without hardcoding the core count.
+#[must_use]
 pub fn resolve_child_concurrency(option: Option<i32>) -> u32 {
     resolve_child_concurrency_with_parallelism(option, available_parallelism())
 }
@@ -323,17 +341,6 @@ pub fn resolve_child_concurrency_with_parallelism(option: Option<i32>, paralleli
 ///   process.getuid?.() !== 0,
 /// ```
 ///
-/// Truth table:
-/// - Windows or Cygwin → `true`. POSIX privilege drop doesn't
-///   apply; upstream's `process.platform === 'win32' ||
-///   process.platform === 'cygwin'` branch fires unconditionally.
-/// - POSIX (excluding Cygwin), not running as root → `true`. Nothing
-///   to drop from.
-/// - POSIX, running as root → `false`. Lifecycle scripts will run
-///   under TMPDIR isolation to `node_modules/.tmp`.
-/// - Anything else (e.g. `wasm32-*`) → `true`. No POSIX privilege
-///   model to drop into; behave like upstream's Windows branch.
-///
 /// Pacquet's executor doesn't currently consume `unsafe_perm` to
 /// actually drop uid/gid (upstream's own [`@pnpm/npm-lifecycle`
 /// implementation](https://github.com/pnpm/npm-lifecycle/blob/d2d8e790/index.js#L236-L239)
@@ -351,19 +358,16 @@ pub fn resolve_child_concurrency_with_parallelism(option: Option<i32>, paralleli
 /// where `setgid` doesn't exist; it doesn't translate to Rust
 /// (libc's `setgid` is always available on POSIX hosts where libc
 /// compiles).
+#[must_use]
 pub fn default_unsafe_perm() -> bool {
     platform_unsafe_perm_default()
 }
 
-/// Windows / Cygwin branch — always `true` (no POSIX privilege
-/// drop applies).
 #[cfg(any(windows, target_os = "cygwin"))]
 fn platform_unsafe_perm_default() -> bool {
     true
 }
 
-/// POSIX (excluding Cygwin) — drop privileges only when running
-/// as root.
 #[cfg(all(unix, not(target_os = "cygwin")))]
 fn platform_unsafe_perm_default() -> bool {
     is_unsafe_perm_posix(posix_getuid())
@@ -381,6 +385,7 @@ fn platform_unsafe_perm_default() -> bool {
 /// Pure-logic helper exposed for tests so the POSIX branch can be
 /// exercised under both root and non-root uids without root
 /// privileges. Mirrors the POSIX half of [`default_unsafe_perm`].
+#[must_use]
 pub fn is_unsafe_perm_posix(uid: u32) -> bool {
     // `unsafe_perm = true` means "do NOT drop privileges". Drop
     // only when we *are* root (uid == 0).

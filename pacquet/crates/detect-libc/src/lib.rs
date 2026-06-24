@@ -14,6 +14,7 @@ pub enum Implementation {
 impl Implementation {
     /// Return the string used in pnpm's platform selector: `"glibc"` or
     /// `"musl"`.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Implementation::Glibc => "glibc",
@@ -30,7 +31,7 @@ impl Implementation {
 /// detection methods fail.
 ///
 /// Detection order:
-/// 1. **ELF interpreter** — read PT_INTERP from `/proc/self/exe`.
+/// 1. **ELF interpreter** — read `PT_INTERP` from `/proc/self/exe`.
 ///    If the dynamic linker path contains `"/ld-musl-"` → musl;
 ///    if it contains `"/ld-linux-"` → glibc.
 /// 2. **Filesystem** — read first 2048 bytes of `/usr/bin/ldd`.
@@ -44,6 +45,7 @@ impl Implementation {
 /// and the command fallback is only reached when cheaper methods
 /// fail. This makes detection work in slim containers where
 /// `getconf` or `ldd` may not be on PATH or installed at all.
+#[must_use]
 pub fn detect() -> Option<Implementation> {
     if !is_linux() {
         return None;
@@ -60,40 +62,43 @@ fn detect_implementation() -> Option<Implementation> {
     elf::detect().or_else(filesystem::detect).or_else(command::detect)
 }
 
-#[cfg(test)]
-mod tests {
-    #[cfg(target_os = "linux")]
-    use super::detect;
-    use super::{Implementation, is_linux};
-
-    #[test]
-    fn detect_non_linux() {
-        assert!(target_os_is_linux_matches_is_linux_fn());
-    }
-
-    fn target_os_is_linux_matches_is_linux_fn() -> bool {
-        cfg!(target_os = "linux") == is_linux()
-    }
-
-    #[test]
-    fn libc_implementation_as_str_glibc() {
-        assert_eq!(Implementation::Glibc.as_str(), "glibc");
-    }
-
-    #[test]
-    fn libc_implementation_as_str_musl() {
-        assert_eq!(Implementation::Musl.as_str(), "musl");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn detect_integration_host() {
-        let result = detect();
-        if let Some(libc) = result {
-            assert!(
-                libc == Implementation::Glibc || libc == Implementation::Musl,
-                "unexpected libc: {libc:?}",
-            );
-        }
+/// Map `std::env::consts::OS` to Node's `process.platform` naming.
+/// Node uses `darwin` / `linux` / `win32` / `freebsd` / `openbsd` /
+/// `sunos` / `aix` / `android`. Rust uses `macos` / `linux` /
+/// `windows` / `freebsd` / `openbsd` / `solaris` / `aix` /
+/// `android`. Only `macos`, `windows`, and `solaris` differ.
+#[must_use]
+pub fn host_platform() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        "windows" => "win32",
+        "solaris" => "sunos",
+        other => other,
     }
 }
+
+/// Map `std::env::consts::ARCH` to Node's `process.arch` naming.
+/// Node uses `x64` / `arm64` / `ia32` / `arm` / `s390x` / `ppc64`
+/// / `ppc64` (LE, same string) / `loong64` / `riscv64`. Rust uses
+/// `x86_64` / `aarch64` / `x86` / `arm` / `s390x` / `powerpc64` /
+/// `powerpc64le` / `loongarch64` / `riscv64`. Mappings below mirror
+/// what Node itself emits on each target — anything left as
+/// passthrough (e.g. `arm`, `s390x`, `riscv64`) already matches
+/// between the two naming schemes.
+#[must_use]
+pub fn host_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        "x86" => "ia32",
+        // Node calls big-endian and little-endian POWER both
+        // `ppc64`; only big-endian gets `endianness === 'BE'` to
+        // distinguish them. Rust's two arch values both map here.
+        "powerpc64" | "powerpc64le" => "ppc64",
+        "loongarch64" => "loong64",
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests;

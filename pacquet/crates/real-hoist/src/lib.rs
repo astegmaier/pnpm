@@ -11,12 +11,13 @@
 //! [yarn-hoist]: https://github.com/yarnpkg/berry/blob/4287909fa6a0a1ec976a55776bff606864b31990/packages/yarnpkg-nm/sources/hoist.ts
 
 use derive_more::{Display, Error};
-use indexmap::IndexSet;
+use indexmap::{IndexMap, IndexSet};
 use miette::Diagnostic;
 use pacquet_lockfile::{Lockfile, PkgName, PkgNameVerPeer, ProjectSnapshot, SnapshotEntry};
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    fmt::Write as _,
     rc::Rc,
 };
 
@@ -84,11 +85,10 @@ pub struct HoisterTree {
     pub dependency_kind: HoisterDependencyKind,
     /// Tiebreaker used upstream when ranking competing hoist
     /// candidates. Carried through the type for parity with
-    /// `@yarnpkg/nm`'s `HoisterTree.hoistPriority` but currently
-    /// unread by pacquet's algorithm — pacquet builds every node
-    /// with `0` and the popularity-based preference pass that
-    /// would consume it isn't ported yet (see the "popularity-
-    /// based ident preference" gap on `nm_hoist`).
+    /// `@yarnpkg/nm`'s `HoisterTree.hoistPriority`, but pacquet
+    /// builds every node with `0`, so the preference pass ranks
+    /// purely by usage count — the `hoistPriority` tier stays inert
+    /// until a producer sets it.
     pub hoist_priority: u32,
     /// Children of this node. Order matches insertion order — the
     /// hoister depends on it.
@@ -248,8 +248,8 @@ impl<Inner> std::ops::Deref for RcByPtr<Inner> {
     }
 }
 
-impl<T> From<Rc<T>> for RcByPtr<T> {
-    fn from(rc: Rc<T>) -> Self {
+impl<Inner> From<Rc<Inner>> for RcByPtr<Inner> {
+    fn from(rc: Rc<Inner>) -> Self {
         Self(rc)
     }
 }
@@ -515,15 +515,18 @@ fn collect_snapshot_deps(
     Ok(())
 }
 
-/// Encode an importer id for use as a child node's `name`. Upstream
-/// uses `encodeURIComponent`, which percent-encodes everything
-/// except `A-Z a-z 0-9 - _ . ! ~ * ' ( )`. Pacquet workspace
-/// importers are filesystem-relative paths, so the common case is
-/// alphanumeric + `/` + `-` + `_`. Encode `/` (since it would
-/// confuse `node_modules` directory parsing) and pass the rest
-/// through; if a richer set ever shows up the function can switch
-/// to a full encoder without touching call sites.
-fn percent_encode_path(text: &str) -> String {
+/// Encode an importer id for use as a child node's `name` (and in
+/// the hoisting-limits locator keys built by
+/// `pacquet_package_manager::get_hoisting_limits`). Upstream uses
+/// `encodeURIComponent`, which percent-encodes everything except
+/// `A-Z a-z 0-9 - _ . ! ~ * ' ( )`. Pacquet workspace importers are
+/// filesystem-relative paths, so the common case is alphanumeric +
+/// `/` + `-` + `_`. Encode `/` (since it would confuse
+/// `node_modules` directory parsing) and pass the rest through; if a
+/// richer set ever shows up the function can switch to a full
+/// encoder without touching call sites.
+#[must_use]
+pub fn percent_encode_path(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
@@ -546,7 +549,7 @@ fn percent_encode_path(text: &str) -> String {
                 // verbatim — pacquet's lockfile doesn't currently
                 // hand the wrapper non-ASCII paths.
                 if (other as u32) < 0x80 {
-                    out.push_str(&format!("%{:02X}", other as u32));
+                    write!(out, "%{:02X}", other as u32).unwrap();
                 } else {
                     out.push(other);
                 }
@@ -565,53 +568,19 @@ fn percent_encode_path(text: &str) -> String {
 /// dependency that doesn't collide with an already-hoisted name
 /// surfaces at the root, just like a flat `node_modules`.
 ///
-/// What this models today:
-///
-/// * Free hoist: a transitive dep with no name collision at the
-///   root surfaces at the root.
-/// * Identity dedup: a dep reachable through multiple parents
-///   (same `Rc` thanks to the wrapper's `nodes` cache) collapses
-///   to one node at root.
-/// * Parent-wins on version conflict: when two distinct deps
-///   share an alias but resolve to different snapshot keys, the
-///   first one the DFS reaches takes the root slot and the other
-///   stays under its parent.
-/// * Peer-shadow refusal: a candidate whose `peer_names` would
-///   resolve against an ancestor's dep with a different ident
-///   than the root carries stays nested under its parent. See
-///   [`would_shadow_peer`] for the ancestor-path walk and how
-///   pacquet's DAG-preserving model differs from upstream's
-///   per-path tree clone in rare cross-path mismatch cases.
-/// * Multi-round convergence: when a round refuses a hoist
-///   because of a peer mismatch and a subsequent move shifts the
-///   blocking ident out of the ancestor chain (or into a
-///   compatible root slot), the next round reconsiders the
-///   refused candidate. The outer loop in [`hoist_into_root`]
-///   iterates until a round makes no moves. Bounded by O(N)
-///   rounds since each move is one-way (parent → root).
-///
-/// What this models today (continued):
-///
-/// * `hoistingLimits` borders. Names in
-///   `opts.hoisting_limits[root_locator]` are kept out of the
-///   root's `node_modules` (`AbsorbDecision::Border`). Mirrors
-///   upstream's `isHoistBorder` flag.
-/// * `externalDependencies` placeholders — the wrapper adds them
-///   as zero-children `ExternalSoftLink` nodes at the root, and
-///   strips them from the result post-hoist. Same observable
-///   shape as upstream.
+/// Among competing versions of one name, the most-used version
+/// wins the root slot — ported from upstream's `buildPreferenceMap`
+/// / `getHoistIdentMap` (see [`build_hoist_ident_map`]) and the
+/// per-pass ident shift in [`hoist_into_root`].
 ///
 /// What this does *not* model yet:
 ///
-/// * Popularity-based ident preference (upstream's
-///   `buildPreferenceMap`). When two distinct deps share an
-///   alias, pacquet picks the first-visited; upstream picks the
-///   one with more incoming references. Outcome differs for the
-///   handful of upstream test cases that exercise the tie-break.
-/// * Multi-importer (workspace) hoist trees — pacquet's wrapper
-///   refuses lockfiles with non-root importers upfront via
-///   `UnsupportedWorkspace`. Workspace-aware hoisting requires
-///   per-importer roots and a different output shape.
+/// * Per-importer roots and the multi-level output shape upstream
+///   produces for workspaces. [`hoist`] does attach every non-root
+///   importer as a `Workspace`-kind child of the virtual `.` root
+///   when [`HoistOpts::hoist_workspace_packages`] is enabled, but the
+///   algorithm still hoists into that single `.` root rather than
+///   giving each importer its own hoisting root.
 /// * `ExternalSoftLink` descendants — pacquet creates soft-links
 ///   only as zero-children placeholders, so upstream's
 ///   "only-hoist-when-all-descendants-hoist" rule has nothing to
@@ -647,6 +616,17 @@ enum AbsorbDecision {
     /// Root's name slot is free; the child should be moved up to
     /// the root.
     Free,
+    /// Root's name slot is free, but this candidate's ident is not
+    /// the one currently preferred for its name (see
+    /// [`build_hoist_ident_map`]). The candidate stays under its
+    /// parent this pass; a later pass — after the preferred ident
+    /// either claims the slot or is shifted out in
+    /// [`hoist_into_root`] — may reconsider it. Mirrors upstream's
+    /// `hoistedIdent === node.ident` gate in `getNodeHoistInfo` at
+    /// [hoist.ts:387][prefer-gate].
+    ///
+    /// [prefer-gate]: https://github.com/yarnpkg/berry/blob/4287909fa6a0a1ec976a55776bff606864b31990/packages/yarnpkg-nm/sources/hoist.ts#L387
+    Defer,
     /// Root already holds *this exact `Rc`* (the same node was
     /// reachable through another parent path and got hoisted
     /// earlier). The duplicate reference in the current parent
@@ -666,15 +646,29 @@ enum AbsorbDecision {
     /// [peer-shadow-root]: https://github.com/yarnpkg/berry/blob/4287909fa6a0a1ec976a55776bff606864b31990/packages/yarnpkg-nm/sources/hoist.ts#L414
     /// [peer-path]: https://github.com/yarnpkg/berry/blob/4287909fa6a0a1ec976a55776bff606864b31990/packages/yarnpkg-nm/sources/hoist.ts#L454-L479
     PeerShadow,
-    /// The candidate's name is in `opts.hoisting_limits` for the
-    /// current root locator. The caller asked us to keep this name
-    /// out of the root's `node_modules`, so the candidate stays
-    /// nested under its parent. Mirrors upstream's `isHoistBorder`
-    /// flag set during `cloneTree` from
-    /// [`hoist.ts:707`][hoist-border].
+    /// The candidate sits beneath a hoisting border — its parent (or
+    /// a higher ancestor) has a name listed in
+    /// `opts.hoisting_limits` for the root locator. A bordered node's
+    /// descendants stay nested beneath it rather than hoisting to the
+    /// root, so the candidate stays under its parent. Mirrors
+    /// upstream's `isHoistBorder` flag set during `cloneTree` from
+    /// [`hoist.ts:707`][hoist-border], which blocks a bordered node's
+    /// children from hoisting past it (not the bordered node itself).
     ///
     /// [hoist-border]: https://github.com/yarnpkg/berry/blob/4287909fa6a0a1ec976a55776bff606864b31990/packages/yarnpkg-nm/sources/hoist.ts#L707
     Border,
+}
+
+/// Immutable context shared across every [`hoist_subtree`] call in
+/// one [`hoist_into_root`] pass: the hoisting root, the active
+/// border-name set, and the per-name preferred-ident map. Bundled
+/// into one struct so the recursive walker stays under the argument
+/// limit; only `root_index`, `visited`, and the per-node position
+/// (`node`, `ancestor_path`, `under_border`) vary per call.
+struct HoistCtx<'a> {
+    root: &'a Rc<HoisterResult>,
+    border_names: &'a BTreeSet<String>,
+    hoist_ident_map: &'a HashMap<String, VecDeque<String>>,
 }
 
 /// Walk the result tree and hoist every eligible descendant of
@@ -714,23 +708,185 @@ fn hoist_into_root(root: &Rc<HoisterResult>, root_locator: &str, opts: &HoistOpt
     let mut root_index: HashMap<String, RcByPtr<HoisterResult>> =
         root.dependencies.borrow().iter().map(|dep| (dep.0.name.clone(), dep.clone())).collect();
 
-    // Look up the names the caller asked us not to hoist to *this*
-    // root. Upstream stores this on each child as `isHoistBorder`
-    // during `cloneTree`; pacquet stays DAG-shaped and looks the
-    // names up by-name at decision time, which is equivalent since
-    // there's only one root locator. An empty fallback set means
-    // the check is effectively a no-op when no limits are configured.
+    // Per-name candidate idents ordered most-preferred first. Only
+    // the front ident of each name may claim the root slot; the
+    // shift below promotes the next candidate when the preferred one
+    // can't be placed. Built from the pre-hoist subtree, matching
+    // yarn's `buildPreferenceMap(rootNode)` call at the top of
+    // `hoistTo`.
+    let mut hoist_ident_map = build_hoist_ident_map(root);
+
+    // Look up the border names for *this* root locator: a node whose
+    // name is in this set is a hoisting border, so its descendants
+    // stay nested beneath it. Upstream stores the flag on each node
+    // as `isHoistBorder` during `cloneTree`; pacquet stays DAG-shaped
+    // and looks the names up by-name at decision time, which is
+    // equivalent since there's only one root locator. An empty
+    // fallback set means the check is a no-op when no limits are set.
     let empty_set: BTreeSet<String> = BTreeSet::new();
     let border_names: &BTreeSet<String> =
         opts.hoisting_limits.get(root_locator).unwrap_or(&empty_set);
 
     loop {
         let mut visited: HashSet<*const HoisterResult> = HashSet::new();
-        let changed = hoist_subtree(root, &[], root, &mut root_index, &mut visited, border_names);
-        if !changed {
+        let ctx = HoistCtx { root, border_names, hoist_ident_map: &hoist_ident_map };
+        let changed = hoist_subtree(root, &[], &ctx, &mut root_index, &mut visited, false);
+
+        // Per-pass ident shift: a name with more than one candidate
+        // ident whose preferred ident still hasn't reached the root
+        // drops that ident and promotes the next one, so a later pass
+        // can place a less-preferred version when the most-preferred
+        // is unreachable (nested under a conflict / border / peer).
+        // Mirrors the `idents.shift()` loop in yarn's `hoistTo` at
+        // <https://github.com/yarnpkg/berry/blob/4287909fa6a0a1ec976a55776bff606864b31990/packages/yarnpkg-nm/sources/hoist.ts>.
+        let mut shifted = false;
+        for (name, idents) in &mut hoist_ident_map {
+            if idents.len() > 1 && !root_index.contains_key(name) {
+                idents.pop_front();
+                shifted = true;
+            }
+        }
+
+        if !changed && !shifted {
             break;
         }
     }
+}
+
+/// The single canonical reference of a (pre-hoist) result node,
+/// used as its "ident" in the preference map and the per-name
+/// candidate lists. Pre-hoist nodes carry exactly one reference
+/// (see [`convert`]).
+fn node_ident(node: &HoisterResult) -> String {
+    node.references.borrow().iter().next().cloned().unwrap_or_default()
+}
+
+/// One entry of the preference map: the set of dependent idents
+/// (and peer-dependent idents) that pull in a given `(name,
+/// ident)` package. Usage count is the sum of the two, matching
+/// yarn's `entry.dependents.size + entry.peerDependents.size`.
+#[derive(Default)]
+struct PreferenceEntry {
+    dependents: HashSet<String>,
+    peer_dependents: HashSet<String>,
+}
+
+impl PreferenceEntry {
+    fn usages(&self) -> usize {
+        self.dependents.len() + self.peer_dependents.len()
+    }
+}
+
+/// Port of yarn's `buildPreferenceMap` + `getHoistIdentMap`. For
+/// each dependency name reachable from `root`, returns its
+/// candidate idents (references) ordered most-preferred first:
+///
+/// 1. The root's own direct deps are seeded first, so a version the
+///    root depends on always wins its name slot.
+/// 2. Every other ident follows, ordered by usage (the count of
+///    distinct dependents + peer-dependents) descending, stable on
+///    ties (preserving depth-first discovery order).
+///
+/// [`hoist_into_root`] consults the front of each list as the
+/// currently-preferred ident and shifts it as passes progress.
+/// Ports
+/// <https://github.com/yarnpkg/berry/blob/4287909fa6a0a1ec976a55776bff606864b31990/packages/yarnpkg-nm/sources/hoist.ts>.
+fn build_hoist_ident_map(root: &Rc<HoisterResult>) -> HashMap<String, VecDeque<String>> {
+    let mut preference: IndexMap<(String, String), PreferenceEntry> = IndexMap::new();
+    let mut seen: HashSet<*const HoisterResult> = HashSet::new();
+    seen.insert(Rc::as_ptr(root));
+
+    let root_ident = node_ident(root);
+    let root_children: Vec<Rc<HoisterResult>> =
+        root.dependencies.borrow().iter().map(|dep| Rc::clone(&dep.0)).collect();
+    for dep in &root_children {
+        if !root.peer_names.contains(&dep.name) {
+            add_dependent(&root_ident, dep, &mut preference, &mut seen);
+        }
+    }
+
+    // Seed the result with the root and its direct deps so their
+    // idents always rank first. Mirrors `getHoistIdentMap`'s initial
+    // `identMap` construction before the sorted append loop.
+    let mut ident_map: IndexMap<String, VecDeque<String>> = IndexMap::new();
+    ident_map.insert(root.name.clone(), VecDeque::from([root_ident]));
+    for dep in &root_children {
+        if !root.peer_names.contains(&dep.name) {
+            ident_map.insert(dep.name.clone(), VecDeque::from([node_ident(dep)]));
+        }
+    }
+
+    let mut keys: Vec<(String, String)> = preference.keys().cloned().collect();
+    // `hoist_priority` is always 0 in pacquet, so the sort reduces to
+    // usage (descending). `sort_by` is stable, so equal-usage keys
+    // keep preference-map insertion order (depth-first discovery) —
+    // matching yarn's `keyList.sort`, which is likewise stable on
+    // equal usage.
+    keys.sort_by(|left, right| preference[right].usages().cmp(&preference[left].usages()));
+    for (name, ident) in keys {
+        if root.peer_names.contains(&name) {
+            continue;
+        }
+        let idents = ident_map.entry(name).or_default();
+        if !idents.contains(&ident) {
+            idents.push_back(ident);
+        }
+    }
+
+    ident_map.into_iter().collect()
+}
+
+/// Recursive half of [`build_hoist_ident_map`]'s preference pass.
+/// Records `dependent_ident` as a dependent of `node`, then (the
+/// first time `node` is seen) recurses into its non-peer children
+/// and records peer children as peer-dependents. Mirrors yarn's
+/// `addDependent`.
+fn add_dependent(
+    dependent_ident: &str,
+    node: &Rc<HoisterResult>,
+    preference: &mut IndexMap<(String, String), PreferenceEntry>,
+    seen: &mut HashSet<*const HoisterResult>,
+) {
+    let parent_ident = node_ident(node);
+    preference
+        .entry((node.name.clone(), parent_ident.clone()))
+        .or_default()
+        .dependents
+        .insert(dependent_ident.to_string());
+
+    if seen.insert(Rc::as_ptr(node)) {
+        let children: Vec<Rc<HoisterResult>> =
+            node.dependencies.borrow().iter().map(|dep| Rc::clone(&dep.0)).collect();
+        for child in children {
+            if node.peer_names.contains(&child.name) {
+                preference
+                    .entry((child.name.clone(), node_ident(&child)))
+                    .or_default()
+                    .peer_dependents
+                    .insert(parent_ident.clone());
+            } else {
+                add_dependent(&parent_ident, &child, preference, seen);
+            }
+        }
+    }
+}
+
+/// Whether `child` carries the ident currently preferred for its
+/// name. Names absent from `hoist_ident_map` (none reachable, or a
+/// root peer) carry no preference and hoist freely. Ports yarn's
+/// `hoistedIdent === node.ident` gate in `getNodeHoistInfo` at
+/// [hoist.ts:387](https://github.com/yarnpkg/berry/blob/4287909fa6a0a1ec976a55776bff606864b31990/packages/yarnpkg-nm/sources/hoist.ts#L387).
+fn is_preferred_ident(
+    child: &HoisterResult,
+    hoist_ident_map: &HashMap<String, VecDeque<String>>,
+) -> bool {
+    let Some(idents) = hoist_ident_map.get(&child.name) else {
+        return true;
+    };
+    let Some(preferred) = idents.front() else {
+        return true;
+    };
+    child.references.borrow().iter().next().is_some_and(|reference| reference == preferred)
 }
 
 /// Depth-first hoist driver. `ancestor_path` is the path from
@@ -742,16 +898,27 @@ fn hoist_into_root(root: &Rc<HoisterResult>, root_locator: &str, opts: &HoistOpt
 fn hoist_subtree(
     node: &Rc<HoisterResult>,
     ancestor_path: &[Rc<HoisterResult>],
-    root: &Rc<HoisterResult>,
+    ctx: &HoistCtx<'_>,
     root_index: &mut HashMap<String, RcByPtr<HoisterResult>>,
     visited: &mut HashSet<*const HoisterResult>,
-    border_names: &BTreeSet<String>,
+    under_border: bool,
 ) -> bool {
+    let &HoistCtx { root, border_names, hoist_ident_map } = ctx;
     let root_ptr = Rc::as_ptr(root);
     if !visited.insert(Rc::as_ptr(node)) {
         return false;
     }
     let mut changed_in_subtree = false;
+
+    // A node whose name is in `border_names` is a hoisting border:
+    // its descendants are kept nested beneath it rather than hoisted
+    // to the root. `under_border` carries that boundary down the
+    // recursion — once any proper ancestor of a node is a border,
+    // the node (and everything below it) stays put. Mirrors
+    // upstream's `isHoistBorder` flag, which blocks a bordered
+    // node's *children* from hoisting past it, not the bordered
+    // node itself.
+    let children_blocked = under_border || border_names.contains(&node.name);
 
     // Snapshot the current children so we can mutate
     // `node.dependencies` mid-iteration without invalidating the
@@ -775,18 +942,21 @@ fn hoist_subtree(
             continue;
         }
 
-        let mut decision = match root_index.get(&child.0.name) {
-            None => AbsorbDecision::Free,
-            Some(existing) if Rc::ptr_eq(&existing.0, &child.0) => AbsorbDecision::SameNode,
-            Some(_) => AbsorbDecision::Conflict,
+        // A hoisting border on this `node` (or any ancestor) keeps
+        // every descendant nested, so the child stays under its
+        // parent regardless of whether the root slot is free. Decided
+        // before the free/dedup/conflict lookup because the border
+        // wins outright.
+        let mut decision = if children_blocked {
+            AbsorbDecision::Border
+        } else {
+            match root_index.get(&child.0.name) {
+                None if is_preferred_ident(&child.0, hoist_ident_map) => AbsorbDecision::Free,
+                None => AbsorbDecision::Defer,
+                Some(existing) if Rc::ptr_eq(&existing.0, &child.0) => AbsorbDecision::SameNode,
+                Some(_) => AbsorbDecision::Conflict,
+            }
         };
-
-        // Hoisting limits ride on top of the basic decision: even
-        // if the slot is free and no peer would shadow, the caller
-        // may have asked us to keep this name out of the root.
-        if matches!(decision, AbsorbDecision::Free) && border_names.contains(&child.0.name) {
-            decision = AbsorbDecision::Border;
-        }
 
         // Peer-aware refusal layered on top of the basic
         // free / dedup / conflict decision. `Conflict` already
@@ -830,22 +1000,28 @@ fn hoist_subtree(
                     changed_in_subtree = true;
                     vec![Rc::clone(root)]
                 }
-                AbsorbDecision::Conflict | AbsorbDecision::PeerShadow | AbsorbDecision::Border => {
-                    // Stays at the current parent. The version
-                    // already at root wins the slot, hoisting would
-                    // shadow a peer dependency, or the caller's
-                    // `hoisting_limits` blocked the name. Child's
-                    // ancestor path is the path through `node`; a
-                    // later round may revisit this candidate with a
-                    // different peer / conflict context (limits are
-                    // fixed so the Border verdict won't change).
+                AbsorbDecision::Conflict
+                | AbsorbDecision::PeerShadow
+                | AbsorbDecision::Border
+                | AbsorbDecision::Defer => {
+                    // Stays at the current parent, so the child's
+                    // ancestor path is the path through `node`. A later
+                    // round may revisit it with a different peer /
+                    // conflict / preference context; only `Border` is
+                    // terminal, since the limit boundary never moves.
                     path_for_children.clone()
                 }
             }
         };
 
-        let child_changed =
-            hoist_subtree(&child.0, &child_recursion_path, root, root_index, visited, border_names);
+        let child_changed = hoist_subtree(
+            &child.0,
+            &child_recursion_path,
+            ctx,
+            root_index,
+            visited,
+            children_blocked,
+        );
         changed_in_subtree |= child_changed;
     }
     changed_in_subtree
@@ -913,40 +1089,36 @@ fn would_shadow_peer(
                 .find(|dep| dep.0.name == *peer_name)
                 .map(|dep| Rc::clone(&dep.0));
 
-            match provider_rc {
-                Some(provider) => {
-                    // Found a concrete provider in the ancestor
-                    // chain. Compare its identity against root's
-                    // current slot for the same name.
-                    match root_index.get(peer_name) {
-                        Some(at_root) if Rc::ptr_eq(&at_root.0, &provider) => {
-                            // Root already carries this exact
-                            // provider — promoting the candidate
-                            // doesn't change resolution. Move to
-                            // the next peer.
-                            continue 'peer_loop;
-                        }
-                        _ => {
-                            // Root either has a different ident
-                            // for this peer or doesn't have one
-                            // at all. Either way, hoisting would
-                            // shadow.
-                            return true;
-                        }
+            if let Some(provider) = provider_rc {
+                // Found a concrete provider in the ancestor
+                // chain. Compare its identity against root's
+                // current slot for the same name.
+                match root_index.get(peer_name) {
+                    Some(at_root) if Rc::ptr_eq(&at_root.0, &provider) => {
+                        // Root already carries this exact
+                        // provider — promoting the candidate
+                        // doesn't change resolution. Move to
+                        // the next peer.
+                        continue 'peer_loop;
+                    }
+                    _ => {
+                        // Root either has a different ident
+                        // for this peer or doesn't have one
+                        // at all. Either way, hoisting would
+                        // shadow.
+                        return true;
                     }
                 }
-                None => {
-                    // This ancestor doesn't supply the peer.
-                    // Walk further up — the actual provider may
-                    // be a parent of this ancestor (the common
-                    // shape is `ancestor` peer-passes the name
-                    // through to its own parent). If we exhaust
-                    // the path without finding any provider,
-                    // there's no ancestor-bound peer to shadow
-                    // and the candidate may hoist freely for
-                    // this peer.
-                }
             }
+            // This ancestor doesn't supply the peer.
+            // Walk further up — the actual provider may
+            // be a parent of this ancestor (the common
+            // shape is `ancestor` peer-passes the name
+            // through to its own parent). If we exhaust
+            // the path without finding any provider,
+            // there's no ancestor-bound peer to shadow
+            // and the candidate may hoist freely for
+            // this peer.
         }
         // No ancestor (excluding root) provides the peer; the
         // candidate either resolves it at root or leaves it
@@ -959,7 +1131,7 @@ fn convert(
     tree: &HoisterTree,
     memo: &mut HashMap<*const HoisterTree, Rc<HoisterResult>>,
 ) -> Rc<HoisterResult> {
-    let ptr = tree as *const HoisterTree;
+    let ptr = std::ptr::from_ref::<HoisterTree>(tree);
     if let Some(existing) = memo.get(&ptr) {
         return Rc::clone(existing);
     }

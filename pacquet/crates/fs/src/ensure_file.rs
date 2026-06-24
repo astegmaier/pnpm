@@ -42,7 +42,7 @@ const ENFILE: i32 = 23;
 /// the helper is a thin pass-through there — the trailing `op()`
 /// after the `cfg(unix)` block is the one and only attempt on that
 /// platform. Pacquet's Windows build path otherwise stays unchanged.
-fn retry_on_fd_pressure<Func, Value>(mut op: Func) -> io::Result<Value>
+pub(crate) fn retry_on_fd_pressure<Func, Value>(mut op: Func) -> io::Result<Value>
 where
     Func: FnMut() -> io::Result<Value>,
 {
@@ -52,7 +52,7 @@ where
         for _ in 0..32 {
             match op() {
                 Ok(value) => return Ok(value),
-                Err(error) if matches!(error.raw_os_error(), Some(EMFILE) | Some(ENFILE)) => {
+                Err(error) if matches!(error.raw_os_error(), Some(EMFILE | ENFILE)) => {
                     std::thread::sleep(backoff);
                     backoff = (backoff * 2).min(Duration::from_millis(200));
                 }
@@ -171,7 +171,7 @@ pub fn ensure_file(
     // See the "Process-local per-path mutex" bullet above and
     // [`cas_write_lock`] for the rationale.
     let lock = cas_write_lock(file_path);
-    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -210,7 +210,7 @@ pub fn ensure_file(
 ///
 /// **Coordination contract.** Callers handing in the same `&Path`
 /// always receive the same `Mutex<()>`. The hasher is initialised
-/// once per process (`OnceLock<RandomState>`) so the path-to-stripe
+/// once per process (`LazyLock<RandomState>`) so the path-to-stripe
 /// mapping stays stable for the lifetime of the process; writers
 /// (`ensure_file`) and verifiers (`check_pkg_files_integrity`) of the
 /// same path are guaranteed to meet on the same lock and serialise.
@@ -225,9 +225,8 @@ pub fn ensure_file(
 /// `write_all` is still running.
 pub fn cas_write_lock(file_path: &Path) -> &'static Mutex<()> {
     use std::collections::hash_map::RandomState;
-    static BUILDER: std::sync::OnceLock<RandomState> = std::sync::OnceLock::new();
-    let builder = BUILDER.get_or_init(RandomState::new);
-    let mut hasher = builder.build_hasher();
+    static BUILDER: std::sync::LazyLock<RandomState> = std::sync::LazyLock::new(RandomState::new);
+    let mut hasher = BUILDER.build_hasher();
     std::hash::Hash::hash(file_path, &mut hasher);
     let stripe = (hasher.finish() as usize) & (NUM_CAS_LOCK_STRIPES - 1);
     &CAS_LOCK_STRIPES[stripe]
@@ -309,11 +308,11 @@ fn verify_or_rewrite(
 /// Stream `file_path` and byte-compare against `content` without
 /// buffering the whole file in memory.
 ///
-/// `fs::read` (previous shape) allocated a `Vec<u8>` the size of the
-/// file; on a CAS entry for a large binary (10–30 MB isn't unusual in
-/// `@napi-rs/*`, `esbuild`, etc.) and many concurrent rayon workers
-/// hitting this branch, the extra allocation stacked up. Streaming in
-/// 8 KB chunks holds a fixed stack buffer regardless of file size.
+/// Reading the whole file into a `Vec<u8>` would allocate the size of
+/// the file; on a CAS entry for a large binary (10–30 MB isn't unusual
+/// in `@napi-rs/*`, `esbuild`, etc.) and many concurrent rayon workers
+/// hitting this branch, that allocation stacks up. Streaming in 8 KB
+/// chunks holds a fixed stack buffer regardless of file size.
 ///
 /// Any chunk mismatch returns `Ok(false)` immediately — we don't
 /// finish reading the file once we know it differs. An
@@ -452,7 +451,7 @@ fn write_atomic(
 
 /// Total budget for retrying a rename that keeps hitting transient
 /// errors. Matches pnpm's `rename-overwrite` retry window.
-const RENAME_RETRY_BUDGET: Duration = Duration::from_secs(60);
+const RENAME_RETRY_BUDGET: Duration = Duration::from_mins(1);
 
 /// Cap on per-iteration sleep — pnpm grows the backoff by 10 ms each
 /// loop and stops growing at 100 ms.
@@ -509,12 +508,15 @@ fn rename_with_retry(src: &Path, dst: &Path) -> io::Result<()> {
 ///
 /// On Unix, `rename` returning `EACCES`/`EPERM` is essentially
 /// always a permanent permission issue (non-writable directory,
-/// sticky-bit conflict, AppArmor deny) — retrying for 60 s just
+/// sticky-bit conflict, `AppArmor` deny) — retrying for 60 s just
 /// stretches out the failure. `EBUSY` on Unix also tends to be
 /// permanent (mount-point conflicts). So on non-Windows the
 /// classifier is disabled and any `rename` error propagates
 /// immediately.
-fn is_transient_rename_error(#[cfg_attr(not(windows), allow(unused))] error: &io::Error) -> bool {
+fn is_transient_rename_error(
+    #[cfg_attr(not(windows), allow(unused, reason = "only inspected in the Windows branch below"))]
+    error: &io::Error,
+) -> bool {
     #[cfg(windows)]
     {
         matches!(error.kind(), io::ErrorKind::PermissionDenied | io::ErrorKind::ResourceBusy)

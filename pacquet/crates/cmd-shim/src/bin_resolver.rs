@@ -1,4 +1,5 @@
-use crate::{capabilities::FsWalkFiles, path_util::lexical_normalize};
+use crate::capabilities::FsWalkFiles;
+use pacquet_fs::is_subdir;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -32,6 +33,7 @@ const BIN_OWNER_OVERRIDES: &[(&str, &[&str])] = &[
 /// Whether `pkg_name` is a legitimate owner of the given `bin_name`. The
 /// default rule is "the package named `X` owns the `X` bin"; overrides cover
 /// cases like `npx` shipping inside `npm`. Mirrors `pkgOwnsBin`.
+#[must_use]
 pub fn pkg_owns_bin(bin_name: &str, pkg_name: &str) -> bool {
     if bin_name == pkg_name {
         return true;
@@ -44,25 +46,6 @@ pub fn pkg_owns_bin(bin_name: &str, pkg_name: &str) -> bool {
 
 /// Read every bin declared by `manifest` and return them as [`Command`]s
 /// rooted at `pkg_path`.
-///
-/// Handles the three cases pnpm supports, in order:
-///
-/// 1. `bin` as a string. The bin name is the package's own `name` (with any
-///    `@scope/` prefix stripped). Empty / missing `name` skips the entry, in
-///    parity with pnpm's `INVALID_PACKAGE_NAME` guard.
-/// 2. `bin` as an object. Each `(commandName, relativePath)` becomes a
-///    command, with `@scope/` stripped from the key.
-/// 3. Fallback: `directories.bin`. Every regular file under the directory
-///    becomes a command, with the file basename as the bin name. The
-///    directory itself must resolve under `pkg_path`; a `directories.bin`
-///    that escapes via `..` returns an empty list.
-///
-/// Validation, exactly mirroring pnpm:
-///
-/// - Bin name must be URL-safe (`name == encodeURIComponent(name)`) or be the
-///   single-character `$`. This is the path-traversal guard.
-/// - Bin path must resolve under `pkg_path`. Prevents a malicious manifest
-///   from writing shims that exec a sibling package.
 pub fn get_bins_from_package_manifest<Sys: FsWalkFiles>(
     manifest: &Value,
     pkg_path: &Path,
@@ -85,8 +68,7 @@ pub fn get_bins_from_package_manifest<Sys: FsWalkFiles>(
 /// <https://github.com/pnpm/pnpm/blob/4750fd370c/bins/resolver/src/index.ts>.
 ///
 /// Symlinks are not followed; pnpm uses `tinyglobby` with
-/// `followSymbolicLinks: false`. Missing directory degrades to an empty
-/// list (pnpm's `ENOENT` short-circuit).
+/// `followSymbolicLinks: false`.
 fn commands_from_directories_bin<Sys: FsWalkFiles>(
     bin_dir_rel: &str,
     pkg_path: &Path,
@@ -138,8 +120,6 @@ fn commands_from_bin(bin: &Value, pkg_name: Option<&str>, pkg_path: &Path) -> Ve
 
     let mut commands = Vec::with_capacity(entries.len());
     for (command_name, bin_relative_path) in entries {
-        // Strip any `@scope/` prefix. Mirrors `commandsFromBin`'s
-        // `commandName[0] === '@'` branch.
         let bin_name = if command_name.starts_with('@') {
             match command_name.find('/') {
                 Some(slash) => command_name[slash + 1..].to_string(),
@@ -170,28 +150,21 @@ fn commands_from_bin(bin: &Value, pkg_name: Option<&str>, pkg_path: &Path) -> Ve
 ///
 /// `encodeURIComponent` leaves the following bytes unescaped:
 /// `A-Z a-z 0-9 - _ . ! ~ * ' ( )`.
+///
+/// `.` and `..` survive `encodeURIComponent` unchanged but resolve to the bin
+/// directory itself or its parent when joined to a target dir, so they are
+/// rejected explicitly.
 fn is_safe_bin_name(name: &str) -> bool {
     if name == "$" {
         return true;
     }
-    if name.is_empty() {
+    if name.is_empty() || name == "." || name == ".." {
         return false;
     }
     name.bytes().all(|byte| {
         byte.is_ascii_alphanumeric()
             || matches!(byte, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')')
     })
-}
-
-/// Whether `child` resolves to a path under `parent`, after lexically
-/// normalising `..` segments. Mirrors `isSubdir(pkgPath, binPath)` from pnpm's
-/// `is-subdir`. We deliberately do not canonicalize via the filesystem.
-/// The guard runs before the bin file exists at its final location, and
-/// pnpm's implementation is purely lexical too.
-fn is_subdir(parent: &Path, child: &Path) -> bool {
-    let parent_norm = lexical_normalize(parent);
-    let child_norm = lexical_normalize(child);
-    child_norm.starts_with(&parent_norm)
 }
 
 #[cfg(test)]

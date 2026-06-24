@@ -1,41 +1,94 @@
 mod auth;
+mod priority_semaphore;
 mod proxy;
+mod retry;
 #[cfg(test)]
 mod tests;
 mod tls;
 
-pub use auth::{AuthHeaders, base64_encode, nerf_dart};
+pub use auth::{AuthHeaders, AuthHeadersByScope, DEFAULT_REGISTRY_SCOPE, base64_encode, nerf_dart};
 pub use proxy::{NoProxySetting, ProxyConfig, ProxyError};
+pub use retry::{RetryOpts, send_with_retry, should_retry_status};
 pub use tls::{PerRegistryTls, RegistryTls, TlsConfig, TlsError};
 
+use priority_semaphore::{Permit, PrioritySemaphore};
 use proxy::{NoProxyMatcher, parse_proxy_url, strip_userinfo};
 use reqwest::{
     Certificate, Client, Identity, Proxy,
     header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use std::{collections::HashMap, num::NonZeroUsize, ops::Deref, sync::Arc, time::Duration};
-use tokio::sync::{Semaphore, SemaphorePermit};
 
-/// Default `User-Agent` pacquet sends on every request made by the
-/// install client — registry metadata fetches and tarball downloads
-/// alike, including tarball URLs that point at non-registry hosts.
+/// Fallback `User-Agent` for the install client's no-config
+/// constructors ([`ThrottledClient::new_for_installs`],
+/// [`ThrottledClient::from_client`]) and for the case where a
+/// configured user-agent string cannot be encoded as an HTTP header
+/// value.
 ///
-/// Identical to pnpm v11's
-/// [`network/fetch/src/fetchFromRegistry.ts`](https://github.com/pnpm/pnpm/blob/1819226b51/network/fetch/src/fetchFromRegistry.ts#L9):
-/// the literal string `pnpm`. A default `reqwest::Client` sends *no*
-/// User-Agent at all, which some registry CDNs and corporate WAFs
-/// treat as a bot signature and either block at the edge or terminate
-/// mid-handshake (surfacing as a generic "error sending request for
-/// url" with no body to look at).
+/// Production installs override this with the value resolved by
+/// `pacquet-config` (`userAgent`, defaulting to pnpm's
+/// `pnpm/pacquet-<version> npm/? node/? <platform> <arch>` format — see
+/// `config/reader/src/index.ts`). The `pnpm` token is preserved in
+/// that default so any UA-keyed allow / rate-limit rule that lets pnpm
+/// through also lets pacquet through.
 ///
-/// We deliberately send `pnpm` rather than `pacquet/<version>` so
-/// any UA-keyed allow / rate-limit rule that lets pnpm through also
-/// lets pacquet through. Pacquet is a port of pnpm; behavioural
-/// parity, including what the registry sees on the wire, is the
-/// goal.
-const DEFAULT_USER_AGENT: &str = "pnpm";
+/// A default `reqwest::Client` sends *no* User-Agent at all, which
+/// some registry CDNs and corporate WAFs treat as a bot signature and
+/// either block at the edge or terminate mid-handshake (surfacing as a
+/// generic "error sending request for url" with no body to look at).
+/// The install client therefore always sends one.
+pub const DEFAULT_USER_AGENT: &str = "pnpm";
 
-/// Wrapper around [`Client`] with concurrent request limit enforced by the [`Semaphore`] mechanism.
+/// Permit priority used by [`ThrottledClient::acquire`] /
+/// [`ThrottledClient::acquire_for_url`] for callers that don't pass an
+/// explicit one. Marks the request as latency class — packument and
+/// other metadata fetches that gate resolution progress — served FIFO
+/// and preferred over size-prioritized downloads beyond the downloads'
+/// reserved share of the pool (see the `priority_semaphore` module
+/// docs for the two-class grant policy).
+pub const UNPRIORITIZED: u64 = u64::MAX;
+
+/// Default per-request timeout in milliseconds, matching pnpm v11's
+/// `fetchTimeout` default of `60000`
+/// ([`config/reader/src/index.ts:151`](https://github.com/pnpm/pnpm/blob/1819226b51/config/reader/src/index.ts#L151)).
+/// Source of truth for `pacquet-config`'s `default_fetch_timeout`.
+pub const DEFAULT_FETCH_TIMEOUT_MS: u64 = 60_000;
+
+/// Tunable network knobs threaded into the install client. Ports
+/// pnpm's `networkConcurrency`, `fetchTimeout`, and `userAgent`
+/// settings; `pacquet-config` owns their defaults and override
+/// sources (`pnpm-workspace.yaml`, `PNPM_CONFIG_*`, CLI flags) and
+/// hands the resolved values here.
+#[derive(Debug, Clone)]
+pub struct NetworkSettings {
+    /// Maximum number of concurrent in-flight network requests — the
+    /// semaphore size. Default: [`default_network_concurrency`].
+    pub network_concurrency: usize,
+
+    /// Per-request total deadline, applied as both reqwest's response
+    /// timeout and its connect timeout — mirroring pnpm, whose
+    /// `AbortSignal.timeout(fetchTimeout)` bounds the whole request and
+    /// whose undici `connectTimeout` is `fetchTimeout + 1`. Default:
+    /// [`DEFAULT_FETCH_TIMEOUT_MS`].
+    pub fetch_timeout: Duration,
+
+    /// Value of the `User-Agent` header sent on every request.
+    /// Default: [`DEFAULT_USER_AGENT`].
+    pub user_agent: String,
+}
+
+impl Default for NetworkSettings {
+    fn default() -> Self {
+        NetworkSettings {
+            network_concurrency: default_network_concurrency(),
+            fetch_timeout: Duration::from_millis(DEFAULT_FETCH_TIMEOUT_MS),
+            user_agent: DEFAULT_USER_AGENT.to_string(),
+        }
+    }
+}
+
+/// Wrapper around [`Client`] with a concurrent request limit enforced
+/// by a priority-ordered semaphore (`priority_semaphore` module).
 ///
 /// Holds a default [`Client`] for the top-level proxy / TLS config
 /// plus an optional map of per-registry clients keyed by nerf-darted
@@ -45,9 +98,20 @@ const DEFAULT_USER_AGENT: &str = "pnpm";
 /// client. The semaphore is shared across both — bounding the total
 /// concurrent socket count regardless of which registry a request
 /// targets.
+///
+/// When the pool saturates, freed slots are granted by a two-class
+/// policy (see the `priority_semaphore` module docs): requests
+/// acquired without an explicit priority ([`Self::acquire`],
+/// [`Self::acquire_for_url`]) form the FIFO latency class (typically
+/// metadata fetches gating resolution progress), while downloads pass
+/// their estimated pipeline work through
+/// [`Self::acquire_for_url_with_priority`] and are guaranteed a
+/// reserved share of the pool, granted most-expensive-first — so the
+/// longest download jobs start early and neither class starves the
+/// other.
 #[derive(Debug)]
 pub struct ThrottledClient {
-    semaphore: Semaphore,
+    semaphore: PrioritySemaphore,
     client: Client,
     /// Per-registry clients keyed by nerf-darted URI. Empty when no
     /// `//host/:cert=…` / `:key=…` / `:ca=…` / `:cafile=…` /
@@ -78,11 +142,11 @@ pub struct ThrottledClient {
 /// still draining, and the per-process FD count overruns the
 /// platform limit — surfacing as `EMFILE` "too many open files".
 pub struct ThrottledClientGuard<'a> {
-    _permit: SemaphorePermit<'a>,
+    _permit: Permit,
     client: &'a Client,
 }
 
-impl<'a> Deref for ThrottledClientGuard<'a> {
+impl Deref for ThrottledClientGuard<'_> {
     type Target = Client;
 
     fn deref(&self) -> &Client {
@@ -97,15 +161,14 @@ impl ThrottledClient {
     /// against [`default_network_concurrency`] — typically the full
     /// `send + body-consume` lifetime, not just `.send()`.
     pub async fn acquire(&self) -> ThrottledClientGuard<'_> {
-        let permit =
-            self.semaphore.acquire().await.expect("semaphore shouldn't have been closed this soon");
+        let permit = self.semaphore.acquire(UNPRIORITIZED).await;
         ThrottledClientGuard { _permit: permit, client: &self.client }
     }
 
     /// Construct the default throttled client used for real installs.
     ///
     /// Network topology is ported from pnpm v11's
-    /// `network/fetch/src/dispatcher.ts` (see #280):
+    /// `network/fetch/src/dispatcher.ts` (see [#280](https://github.com/pnpm/pacquet/issues/280)):
     ///
     /// * **HTTP/1.1 only.** A default `reqwest::Client` upgrades to
     ///   HTTP/2 via ALPN whenever the registry advertises it
@@ -115,17 +178,18 @@ impl ThrottledClient {
     ///   window was slower than opening ~50 independent HTTP/1.1
     ///   connections that each get their own congestion window and
     ///   saturate bandwidth in parallel.
-    /// * **`network_concurrency` concurrent in-flight requests**,
-    ///   matching pnpm's `networkConcurrency` default (see
-    ///   [`default_network_concurrency`]). Pnpm uses a 50-socket
-    ///   per-host pool ceiling (`DEFAULT_MAX_SOCKETS` in
+    /// * **[`NetworkSettings::network_concurrency`] concurrent
+    ///   in-flight requests**, defaulting to pnpm's `networkConcurrency`
+    ///   formula (see [`default_network_concurrency`]). Pnpm uses a
+    ///   50-socket per-host pool ceiling (`DEFAULT_MAX_SOCKETS` in
     ///   `network/fetch/src/dispatcher.ts`) *and* a smaller
     ///   request-level cap that bounds how many fetches it actually
     ///   runs at once; pacquet's semaphore plays the second role.
-    /// * **`User-Agent: pnpm`** matching pnpm's
-    ///   `fetchFromRegistry.ts`. A default `reqwest::Client` sends
-    ///   no UA, which can trip CDN / WAF rules that reject or RST
-    ///   bot-shaped traffic before any HTTP response is produced.
+    /// * **A `User-Agent` header** ([`NetworkSettings::user_agent`],
+    ///   defaulting to [`DEFAULT_USER_AGENT`]). A default
+    ///   `reqwest::Client` sends no UA, which can trip CDN / WAF rules
+    ///   that reject or RST bot-shaped traffic before any HTTP response
+    ///   is produced.
     ///
     /// `pool_idle_timeout(4s)` matches
     /// [`agentkeepalive`'s](https://github.com/node-modules/agentkeepalive/blob/1e5e312f36/lib/agent.js#L39-L41)
@@ -139,13 +203,14 @@ impl ThrottledClient {
     /// runs hundreds of fetches in seconds) but well below the
     /// typical edge keepalive.
     ///
-    /// `timeout(5min)` is the per-request deadline, not the socket
-    /// inactivity timeout. A default `reqwest::Client` has no
-    /// deadlines at all, so a stalled upstream hangs the install
-    /// indefinitely. 5 min is deliberately generous — npm tarballs
-    /// are usually under 5 MB but can reach hundreds of MB on slow
-    /// connections — and catches truly stuck sockets, not
-    /// short-lived hiccups.
+    /// [`NetworkSettings::fetch_timeout`] is the per-request deadline,
+    /// not the socket inactivity timeout. A default `reqwest::Client`
+    /// has no deadlines at all, so a stalled upstream hangs the install
+    /// indefinitely. It is applied as both the response timeout and the
+    /// connect timeout, mirroring pnpm — whose `AbortSignal.timeout`
+    /// bounds the whole fetch and whose undici `connectTimeout` is
+    /// `fetchTimeout + 1`. Default: [`DEFAULT_FETCH_TIMEOUT_MS`] (60s),
+    /// matching pnpm's `fetchTimeout`.
     ///
     /// `hickory_dns(true)` swaps reqwest's default resolver
     /// (tokio's `lookup_host`, which calls the platform's blocking
@@ -159,13 +224,15 @@ impl ThrottledClient {
     /// because Node's `dns.lookup`
     /// runs on libuv's 4-thread pool, naturally throttling concurrent
     /// `getaddrinfo` calls. `hickory-dns` queries DNS over UDP / TCP
-    /// directly, bypassing `mDNSResponder` and the EAI_NONAME flake
+    /// directly, bypassing `mDNSResponder` and the `EAI_NONAME` flake
     /// entirely.
+    #[must_use]
     pub fn new_for_installs() -> Self {
         Self::for_installs(
             &ProxyConfig::default(),
             &TlsConfig::default(),
             &PerRegistryTls::default(),
+            &NetworkSettings::default(),
         )
         .expect("default proxy + TLS configs carry no URLs/PEMs and cannot fail")
     }
@@ -208,18 +275,31 @@ impl ThrottledClient {
         proxy: &ProxyConfig,
         tls: &TlsConfig,
         per_registry: &PerRegistryTls,
+        settings: &NetworkSettings,
     ) -> Result<Self, ForInstallsError> {
+        if settings.network_concurrency == 0 {
+            return Err(ForInstallsError::ZeroNetworkConcurrency);
+        }
         let https = proxy.https_proxy.as_deref().map(parse_proxy_url).transpose()?;
         let http = proxy.http_proxy.as_deref().map(parse_proxy_url).transpose()?;
         let no_proxy = Arc::new(NoProxyMatcher::from(proxy.no_proxy.as_ref()));
+        // Read once here, not inside `build_client`: `for_installs`
+        // builds one client per per-registry override, so loading the
+        // bundle per call would re-read and re-parse it N times.
+        let extra_ca_certs = load_node_extra_ca_certs();
 
         let build_client = |effective_tls: &TlsConfig| -> Result<Client, ForInstallsError> {
-            let mut builder = default_client_builder();
+            let mut builder = default_client_builder(settings);
             if let Some(url) = https.clone() {
                 builder = builder.proxy(build_scheme_proxy(url, "https", Arc::clone(&no_proxy)));
             }
             if let Some(url) = http.clone() {
                 builder = builder.proxy(build_scheme_proxy(url, "http", Arc::clone(&no_proxy)));
+            }
+            // Lowest-priority additive roots; `apply_tls` layers the
+            // `.npmrc` ca/cafile roots on top next.
+            for cert in &extra_ca_certs {
+                builder = builder.add_root_certificate(cert.clone());
             }
             builder = apply_tls(builder, effective_tls)?;
             Ok(builder.build().expect("build reqwest client with default timeouts and proxy"))
@@ -240,7 +320,7 @@ impl ThrottledClient {
         }
 
         Ok(ThrottledClient {
-            semaphore: Semaphore::new(default_network_concurrency()),
+            semaphore: PrioritySemaphore::new(settings.network_concurrency),
             client: default_client,
             per_registry: per_registry_clients,
             routing: per_registry.clone(),
@@ -252,8 +332,9 @@ impl ThrottledClient {
     /// [`Self::new_for_installs`] sets — e.g. sub-second connect
     /// timeouts so firewalled / unreachable URLs fail within the
     /// test-suite budget instead of waiting on TCP retry.
+    #[must_use]
     pub fn from_client(client: Client) -> Self {
-        let semaphore = Semaphore::new(default_network_concurrency());
+        let semaphore = PrioritySemaphore::new(default_network_concurrency());
         ThrottledClient {
             semaphore,
             client,
@@ -282,8 +363,22 @@ impl ThrottledClient {
     /// just to satisfy the type signature — the lookup itself works
     /// on the raw string form.
     pub async fn acquire_for_url(&self, url: &str) -> ThrottledClientGuard<'_> {
-        let permit =
-            self.semaphore.acquire().await.expect("semaphore shouldn't have been closed this soon");
+        self.acquire_for_url_with_priority(url, UNPRIORITIZED).await
+    }
+
+    /// [`Self::acquire_for_url`], but queueing behind the saturated
+    /// pool at an explicit `priority` instead of [`UNPRIORITIZED`] —
+    /// the throughput class of the two-class grant policy. Tarball
+    /// downloads pass their estimated pipeline work (0 when unknown)
+    /// so that freed slots go to the most expensive pending archive
+    /// first — the longest download+extract jobs start earliest and
+    /// never end up running alone after the small ones drained.
+    pub async fn acquire_for_url_with_priority(
+        &self,
+        url: &str,
+        priority: u64,
+    ) -> ThrottledClientGuard<'_> {
+        let permit = self.semaphore.acquire(priority).await;
         let client = self
             .routing
             .pick_for_url(url)
@@ -297,17 +392,70 @@ impl ThrottledClient {
 /// ([`ThrottledClient::new_for_installs`] documents the why behind each
 /// setting). Both `new_for_installs` and [`ThrottledClient::for_installs`]
 /// route through this helper so a single source of truth governs
-/// timeouts, HTTP-version, resolver, and the default User-Agent header.
-fn default_client_builder() -> reqwest::ClientBuilder {
+/// timeouts, HTTP-version, resolver, and the User-Agent header.
+///
+/// `settings.fetch_timeout` drives both the per-request response
+/// timeout and the connect timeout (matching pnpm's `AbortSignal`
+/// total deadline and undici `connectTimeout = fetchTimeout + 1`).
+/// `settings.user_agent` is sent verbatim; a value that cannot be
+/// encoded as an HTTP header falls back to [`DEFAULT_USER_AGENT`].
+fn default_client_builder(settings: &NetworkSettings) -> reqwest::ClientBuilder {
+    let user_agent = HeaderValue::from_str(&settings.user_agent)
+        .unwrap_or_else(|_| HeaderValue::from_static(DEFAULT_USER_AGENT));
     let mut default_headers = HeaderMap::with_capacity(1);
-    default_headers.insert(USER_AGENT, HeaderValue::from_static(DEFAULT_USER_AGENT));
+    default_headers.insert(USER_AGENT, user_agent);
     Client::builder()
         .http1_only()
+        // Request gzip and transparently decompress it. Packuments are the
+        // largest payloads pulled during resolution and registries serve
+        // them gzipped; tarballs are unaffected (no `Content-Encoding`, so
+        // store-integrity verification still sees the raw `.tgz`). Defaults
+        // to on with reqwest's `gzip` feature, but set explicitly so the
+        // intent is visible and survives a change to that default.
+        .gzip(true)
         .default_headers(default_headers)
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(300))
+        .connect_timeout(settings.fetch_timeout)
+        .timeout(settings.fetch_timeout)
         .pool_idle_timeout(Duration::from_secs(4))
         .hickory_dns(true)
+}
+
+/// Load the PEM bundle named by `NODE_EXTRA_CA_CERTS` as extra trust
+/// roots, to be added to every client `for_installs` builds.
+///
+/// `NODE_EXTRA_CA_CERTS` is the standard Node convention for appending
+/// a CA to the default trust store. pnpm-on-Node inherits that trust
+/// implicitly because it runs inside Node; pacquet is a native binary,
+/// so to keep real-world parity for users behind a corporate MITM proxy
+/// it reads the variable explicitly. This is the one deliberate
+/// exception to the ".npmrc-only, no env vars" TLS parity policy
+/// documented in [`tls::TlsConfig`]: the variable is a process-global
+/// Node convention rather than a pnpm setting, and Node already honors
+/// it for pnpm today — so reading it *restores* parity rather than
+/// diverging from it. The certs are added in
+/// [`ThrottledClient::for_installs`] (not [`apply_tls`]) so the
+/// `.npmrc`-derived [`TlsConfig`] stays env-free.
+///
+/// Read and parsed once per [`ThrottledClient::for_installs`] call —
+/// that constructor builds one client per per-registry override, so
+/// loading here (rather than inside the per-client builder) avoids
+/// re-reading and re-parsing the bundle N times during startup.
+///
+/// The resulting certs are additive and lowest-priority: layered under
+/// the `.npmrc` `ca` / `cafile` roots that [`apply_tls`] adds afterward
+/// and under the built-in webpki roots (ordering is immaterial — the
+/// rustls root store is a union). A missing, unreadable, or malformed
+/// file yields an empty list, matching pnpm's silent treatment of a
+/// missing `cafile` rather than failing the client build.
+fn load_node_extra_ca_certs() -> Vec<Certificate> {
+    let Some(path) = std::env::var_os("NODE_EXTRA_CA_CERTS").filter(|value| !value.is_empty())
+    else {
+        return Vec::new();
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    Certificate::from_pem_bundle(&bytes).unwrap_or_default()
 }
 
 /// Apply [`TlsConfig`] onto a [`reqwest::ClientBuilder`]: register each
@@ -435,6 +583,14 @@ pub enum ForInstallsError {
 
     #[diagnostic(transparent)]
     Tls(#[error(source)] TlsError),
+
+    /// `network_concurrency` resolved to `0`. A zero-permit semaphore
+    /// would make every `acquire` block forever, hanging the install.
+    /// pnpm rejects the same value — its `p-queue` throws
+    /// `Expected concurrency to be a number from 1 and up` — so pacquet
+    /// fails fast rather than deadlock.
+    #[display("networkConcurrency must be at least 1")]
+    ZeroNetworkConcurrency,
 }
 
 impl From<ProxyError> for ForInstallsError {
@@ -482,12 +638,16 @@ fn build_scheme_proxy(
 /// [`worker/src/index.ts`](https://github.com/pnpm/pnpm/blob/1819226b51/worker/src/index.ts#L63-L72):
 ///
 /// ```ts
-/// networkConcurrency = Math.min(64, Math.max(calcMaxWorkers() * 3, 16))
+/// networkConcurrency = Math.min(96, Math.max(calcMaxWorkers() * 3, 64))
 /// // calcMaxWorkers() = Math.max(1, availableParallelism() - 1)
 /// ```
 ///
-/// Concretely: 16 on a 4-core machine, 21 on 8-core, 27 on 10-core,
-/// 45 on 16-core, capped at 64.
+/// Concretely: 64 up to a 22-core machine, scaling with cores beyond
+/// that, capped at 96. The floor matters more than the scaling:
+/// downloads are I/O-bound, not CPU-bound, and a low-latency registry
+/// only saturates when enough requests are in flight — a CPU-derived
+/// floor left 4-core CI runners draining 600-tarball installs 16 at a
+/// time, several times slower than the same network could serve.
 ///
 /// Uses [`std::thread::available_parallelism`] rather than
 /// `num_cpus::get()` so cgroup / CPU-quota limits in containers and
@@ -497,10 +657,9 @@ fn build_scheme_proxy(
 /// schedule (matching the convention `crates/cli` already uses for
 /// rayon pool sizing, see `crates/cli/src/lib.rs`).
 pub fn default_network_concurrency() -> usize {
-    let available_parallelism =
-        std::thread::available_parallelism().map(NonZeroUsize::get).unwrap_or(1);
+    let available_parallelism = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
     let max_workers = available_parallelism.saturating_sub(1).max(1);
-    max_workers.saturating_mul(3).clamp(16, 64)
+    max_workers.saturating_mul(3).clamp(64, 96)
 }
 
 /// This is only necessary for tests.

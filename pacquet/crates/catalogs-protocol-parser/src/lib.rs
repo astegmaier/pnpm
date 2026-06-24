@@ -13,11 +13,9 @@ const CATALOG_PROTOCOL: &str = "catalog:";
 /// Parse a package.json dependency specifier using the `catalog:`
 /// protocol.
 ///
-/// Returns `None` if the specifier does not start with `catalog:`.
-/// An empty `catalog:` is shorthand for [`DEFAULT_CATALOG_NAME`].
-///
 /// Mirrors upstream's `parseCatalogProtocol`
 /// ([source](https://github.com/pnpm/pnpm/blob/a8a8cbce6d/catalogs/protocol-parser/src/parseCatalogProtocol.ts#L3-L16)).
+#[must_use]
 pub fn parse_catalog_protocol(bare_specifier: &str) -> Option<&str> {
     let raw = bare_specifier.strip_prefix(CATALOG_PROTOCOL)?.trim();
     Some(if raw.is_empty() { DEFAULT_CATALOG_NAME } else { raw })

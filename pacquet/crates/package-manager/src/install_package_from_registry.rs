@@ -52,7 +52,7 @@ pub struct InstallPackageFromRegistry<'a> {
     /// Arc<cas_paths>`. When `Some`, the
     /// `DownloadTarballToStore::run_without_mem_cache` cache-lookup
     /// branch reads from here before falling back to the per-snapshot
-    /// SQLite lookup, avoiding `Arc<Mutex<StoreIndex>>` contention on
+    /// `SQLite` lookup, avoiding `Arc<Mutex<StoreIndex>>` contention on
     /// the resolve hot path.
     pub prefetched_cas_paths: Option<&'a pacquet_tarball::PrefetchedCasPaths>,
     /// Install-scoped dedupe state for `pnpm:package-import-method`.
@@ -103,7 +103,7 @@ pub enum InstallPackageFromRegistryError {
     },
 }
 
-impl<'a> InstallPackageFromRegistry<'a> {
+impl InstallPackageFromRegistry<'_> {
     /// Execute the subroutine.
     pub async fn run<Reporter: self::Reporter>(
         self,
@@ -125,17 +125,15 @@ impl<'a> InstallPackageFromRegistry<'a> {
             first_visit,
         } = self;
 
-        let name_ver = resolution.name_ver.as_ref().ok_or_else(|| {
+        let (real_name, version) = real_name_version(resolution).ok_or_else(|| {
             InstallPackageFromRegistryError::UnsupportedResolution {
                 detail: format!(
                     "resolver {resolved_via} produced a resolution without a structured \
-                     name@version; the npm install path needs both (alias={alias})",
+                     name@version and no manifest name/version to fall back to (alias={alias})",
                     resolved_via = resolution.resolved_via,
                 ),
             }
         })?;
-        let real_name = name_ver.name.to_string();
-        let version = name_ver.suffix.to_string();
         let package_id = format!("{real_name}@{version}");
 
         // The exposed symlink under `node_modules/` uses the manifest
@@ -149,13 +147,8 @@ impl<'a> InstallPackageFromRegistry<'a> {
         if first_visit {
             let (tarball_url, integrity) = extract_tarball(&resolution.resolution)?;
             let unpacked_size = manifest_unpacked_size(resolution.manifest.as_deref());
+            let file_count = manifest_file_count(resolution.manifest.as_deref());
 
-            // `pnpm:progress resolved` mirrors pnpm's emit at
-            // <https://github.com/pnpm/pnpm/blob/086c5e91e8/installing/deps-resolver/src/resolveDependencies.ts#L1586>:
-            // one event per package once the resolver has picked a
-            // version. Emit before the tarball download so consumers
-            // see resolved → fetched/found_in_store → imported in
-            // order.
             Reporter::emit(&LogEvent::Progress(ProgressLog {
                 level: LogLevel::Debug,
                 message: ProgressMessage::Resolved {
@@ -174,6 +167,7 @@ impl<'a> InstallPackageFromRegistry<'a> {
                 verified_files_cache: SharedVerifiedFilesCache::clone(verified_files_cache),
                 package_integrity: &integrity,
                 package_unpacked_size: unpacked_size,
+                package_file_count: file_count,
                 package_url: tarball_url,
                 package_id: &package_id,
                 requester,
@@ -182,6 +176,10 @@ impl<'a> InstallPackageFromRegistry<'a> {
                 auth_headers: &config.auth_headers,
                 ignore_file_pattern: None,
                 offline: config.offline,
+                // This recursive install path owns its package-status
+                // progress directly; no resolve-time prefetch shares a
+                // dedupe set with it.
+                progress_reported: None,
             }
             .run_with_mem_cache::<Reporter>(tarball_mem_cache)
             .await
@@ -213,14 +211,28 @@ impl<'a> InstallPackageFromRegistry<'a> {
             }));
         }
 
-        // The per-parent symlink is the only step that runs on every
-        // visit. Mirrors pnpm: one `pnpm:progress` sequence per
-        // package, plus one symlink per direct edge.
         symlink_package(&save_path, &symlink_path)
             .map_err(InstallPackageFromRegistryError::SymlinkPackage)?;
 
         Ok(())
     }
+}
+
+/// The package's canonical `(name, version)`. Prefers the resolver's
+/// structured `name_ver` (npm registry); falls back to the name/version
+/// read from the fetched manifest for resolvers that learn them only
+/// after the fetch — remote (non-registry) tarball, git, and file deps,
+/// whose name/version live in `package.json`. Mirrors pnpm's
+/// [`getManifestFromResponse`](https://github.com/pnpm/pnpm/blob/df990fdb51/installing/deps-resolver/src/resolveDependencies.ts)
+/// fallback.
+fn real_name_version(resolution: &ResolveResult) -> Option<(String, String)> {
+    if let Some(name_ver) = resolution.name_ver.as_ref() {
+        return Some((name_ver.name.to_string(), name_ver.suffix.to_string()));
+    }
+    let manifest = resolution.manifest.as_deref()?;
+    let name = manifest.get("name")?.as_str()?.to_string();
+    let version = manifest.get("version")?.as_str()?.to_string();
+    Some((name, version))
 }
 
 /// Pull the tarball URL + integrity hash out of the resolver-produced
@@ -253,14 +265,21 @@ pub(crate) fn extract_tarball(
 /// `None` when missing or non-numeric — the tarball extractor treats it
 /// as a hint, not a hard requirement.
 pub(crate) fn manifest_unpacked_size(manifest: Option<&Value>) -> Option<usize> {
+    manifest_dist_field(manifest, "unpackedSize")
+}
+
+/// Read `dist.fileCount` off the resolver-fetched manifest. Feeds the
+/// download priority's per-file pipeline-cost term; `None` when the
+/// registry never published one.
+pub(crate) fn manifest_file_count(manifest: Option<&Value>) -> Option<usize> {
+    manifest_dist_field(manifest, "fileCount")
+}
+
+fn manifest_dist_field(manifest: Option<&Value>, field: &str) -> Option<usize> {
     // `usize::try_from` so a `u64` value larger than the host's
     // `usize` (32-bit targets) degrades to "no hint" rather than
     // truncating silently and producing an undersized pre-allocation.
-    manifest?
-        .get("dist")?
-        .get("unpackedSize")?
-        .as_u64()
-        .and_then(|value| usize::try_from(value).ok())
+    manifest?.get("dist")?.get(field)?.as_u64().and_then(|value| usize::try_from(value).ok())
 }
 
 #[cfg(test)]

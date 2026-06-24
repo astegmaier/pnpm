@@ -1,13 +1,10 @@
-use crate::{HashEncoding, hash_object, hash_object_with_encoding, hash_object_without_sorting};
+use crate::{
+    HashEncoding, hash_object, hash_object_nullable_with_prefix, hash_object_with_encoding,
+    hash_object_without_sorting,
+};
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
-/// Ports `hashObject` `creates a hash` from
-/// <https://github.com/pnpm/pnpm/blob/b4f8f47ac2/crypto/object-hasher/test/index.ts#L6>.
-/// Pinning the exact base64 output keeps pacquet's hash byte-for-byte
-/// compatible with pnpm's `@pnpm/crypto.object-hasher` — required
-/// because the side-effects cache key is shared on disk between the
-/// two implementations.
 #[test]
 fn hash_object_known_base64_value() {
     assert_eq!(
@@ -16,19 +13,11 @@ fn hash_object_known_base64_value() {
     );
 }
 
-/// Ports `hashObject` `sorts` from
-/// <https://github.com/pnpm/pnpm/blob/b4f8f47ac2/crypto/object-hasher/test/index.ts#L10-L12>.
-/// Two objects with the same keys in a different declared order
-/// must produce the same hash.
 #[test]
 fn hash_object_sorts_object_keys() {
     assert_eq!(hash_object(&json!({ "b": 1, "a": 2 })), hash_object(&json!({ "a": 2, "b": 1 })));
 }
 
-/// Ports `hashObjectWithoutSorting` `creates a hash` from
-/// <https://github.com/pnpm/pnpm/blob/b4f8f47ac2/crypto/object-hasher/test/index.ts#L18>.
-/// Different exact value from the sorted variant — different key
-/// order produces different bytes.
 #[test]
 fn hash_object_without_sorting_known_base64_value() {
     assert_eq!(
@@ -37,9 +26,6 @@ fn hash_object_without_sorting_known_base64_value() {
     );
 }
 
-/// Ports `hashObjectWithoutSorting` `does not sort` from
-/// <https://github.com/pnpm/pnpm/blob/b4f8f47ac2/crypto/object-hasher/test/index.ts#L22-L24>.
-///
 /// `serde_json::json!` macro preserves insertion order on its
 /// `Map`-backed objects, so `{b:1,a:2}` and `{a:2,b:1}` are distinct
 /// inputs here.
@@ -52,14 +38,11 @@ fn hash_object_without_sorting_distinguishes_key_order() {
 
 /// Hex encoding is what `calcGraphNodeHash` uses for the GVS path
 /// at <https://github.com/pnpm/pnpm/blob/b4f8f47ac2/deps/graph-hasher/src/index.ts#L145>.
-/// Spot-check that the same input under the same options yields
-/// the hex repr of the base64 digest.
 #[test]
 fn hash_object_with_encoding_hex_matches_decoded_base64() {
     let value = json!({ "b": 1, "a": 2 });
     let base64 = hash_object(&value);
     let hex = hash_object_with_encoding(&value, HashEncoding::Hex, /* sort */ true);
-    // base64 → bytes; hex → bytes; must match.
     let from_b64 =
         base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64.as_bytes())
             .expect("decode base64");
@@ -67,8 +50,6 @@ fn hash_object_with_encoding_hex_matches_decoded_base64() {
     assert_eq!(from_b64, from_hex);
 }
 
-/// The empty object hashes to a stable, non-empty value (the
-/// bytestream is literally `object:0:`).
 #[test]
 fn hash_object_empty_object_is_stable() {
     let h1 = hash_object(&json!({}));
@@ -79,20 +60,18 @@ fn hash_object_empty_object_is_stable() {
 
 /// Nested-object case that matches the shape pacquet's
 /// `calcDepGraphHash` actually feeds into `hash_object`:
-/// `{ id: <string>, deps: <Record<string, string>> }`. Two
-/// equivalent inputs (deps in different declared order) must
-/// hash identically.
+/// `{ id: <string>, deps: <Record<string, string>> }`.
 #[test]
 fn hash_object_dep_state_shape_sorts_nested_keys() {
-    let a = hash_object(&json!({
+    let first = hash_object(&json!({
         "id": "foo@1.0.0:sha512-AAA",
         "deps": { "b": "h-b", "a": "h-a" },
     }));
-    let b = hash_object(&json!({
+    let second = hash_object(&json!({
         "deps": { "a": "h-a", "b": "h-b" },
         "id": "foo@1.0.0:sha512-AAA",
     }));
-    assert_eq!(a, b);
+    assert_eq!(first, second);
 }
 
 /// Non-ASCII string lengths must be counted in UTF-16 code units
@@ -127,26 +106,41 @@ fn hash_object_handles_null_bool_and_array_variants() {
     let false_hash = hash_object(&json!({ "v": false }));
     let array_hash = hash_object(&json!({ "v": [1, 2, 3] }));
 
-    // Each variant produces a non-empty, distinct hash. Collisions
-    // across variants would mean the discriminator prefixes were
-    // lost.
+    // Collisions across variants would mean the discriminator prefixes
+    // were lost.
     let all = [&null_hash, &true_hash, &false_hash, &array_hash];
-    for a in all {
-        assert!(!a.is_empty());
+    for first in all {
+        assert!(!first.is_empty());
     }
-    for (i, a) in all.iter().enumerate() {
-        for (j, b) in all.iter().enumerate() {
+    for (i, first) in all.iter().enumerate() {
+        for (j, second) in all.iter().enumerate() {
             if i != j {
-                assert_ne!(a, b, "variant prefixes must distinguish hashes");
+                assert_ne!(first, second, "variant prefixes must distinguish hashes");
             }
         }
     }
 
-    // Stable across calls.
     assert_eq!(null_hash, hash_object(&json!({ "v": null })));
     assert_eq!(array_hash, hash_object(&json!({ "v": [1, 2, 3] })));
-    // Array element order matters: `[1,2,3]` and `[3,2,1]` differ.
     assert_ne!(array_hash, hash_object(&json!({ "v": [3, 2, 1] })));
+}
+
+#[test]
+fn hash_object_nullable_with_prefix_known_value() {
+    assert_eq!(
+        hash_object_nullable_with_prefix(&json!({ "b": 1, "a": 2 })).as_deref(),
+        Some("sha256-48AVoXIXcTKcnHt8qVKp5vNw4gyOB5VfztHwtYBRcAQ="),
+    );
+    assert_eq!(hash_object_nullable_with_prefix(&json!({})), None);
+    assert_eq!(hash_object_nullable_with_prefix(&json!(null)), None);
+}
+
+#[test]
+fn hash_object_nullable_with_prefix_sorts() {
+    assert_eq!(
+        hash_object_nullable_with_prefix(&json!({ "b": 1, "a": 2 })),
+        hash_object_nullable_with_prefix(&json!({ "a": 2, "b": 1 })),
+    );
 }
 
 fn hex_decode(hex: &str) -> Vec<u8> {

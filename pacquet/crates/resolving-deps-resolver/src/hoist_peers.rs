@@ -50,26 +50,9 @@ pub struct HoistPeersOptions<'a> {
 /// `peer_name → specifier` that the caller will add to the importer's
 /// wanted deps. Mirrors upstream's
 /// [`hoistPeers`](https://github.com/pnpm/pnpm/blob/097983fbca/installing/deps-resolver/src/hoistPeers.ts#L7-L65).
-///
-/// The decision cascade per peer:
-///
-/// 1. Workspace root dep with a matching `alias` → its
-///    `normalized_bare_specifier`.
-/// 2. Workspace root dep with a matching `pkg_name` (tie-break by
-///    lex-sort on alias) → its `normalized_bare_specifier`.
-/// 3. Entry in `all_preferred_versions`:
-///    - exact-version range + a satisfying preferred version → join
-///      `[satisfying, ...non-versions]` with `||`.
-///    - exact-version range + no satisfying preferred version +
-///      `auto_install_peers` → the range itself (resolver fetches
-///      from the registry).
-///    - non-exact range → highest preferred version overall (for
-///      dedup), joined with non-version selectors via `||`.
-/// 4. No preferred-version entry + `auto_install_peers` → the range
-///    itself.
-/// 5. Otherwise → omit (caller leaves the missing peer alone).
+#[must_use]
 pub fn hoist_peers(
-    opts: HoistPeersOptions<'_>,
+    opts: &HoistPeersOptions<'_>,
     missing_required_peers: &[(String, MissingPeerInfo)],
 ) -> BTreeMap<String, String> {
     let mut dependencies = BTreeMap::new();
@@ -140,18 +123,16 @@ pub fn hoist_peers(
 
 /// Pick an installable version for each missing optional peer, but only
 /// when at least one preferred version satisfies *every* recorded range.
-/// Returns `peer_name → version`. Mirrors upstream's
-/// [`getHoistableOptionalPeers`](https://github.com/pnpm/pnpm/blob/097983fbca/installing/deps-resolver/src/hoistPeers.ts#L67-L90).
+/// Returns `peer_name → version`. Mirrors pnpm's
+/// [`getHoistableOptionalPeers`](https://github.com/pnpm/pnpm/blob/a1bda24c4f/installing/deps-resolver/src/hoistPeers.ts#L67-L91).
 ///
-/// Upstream's loop checks `specType === 'version'` against the raw map
-/// value, which is true only for the *string* selector form (`'version'`)
-/// produced by the resolver as packages are walked
-/// ([`resolveDependencies.ts:1440`](https://github.com/pnpm/pnpm/blob/097983fbca/installing/deps-resolver/src/resolveDependencies.ts#L1440)),
-/// **not** the weighted form
-/// `getPreferredVersionsFromLockfileAndManifests` produces. Pacquet
-/// mirrors that filter exactly — weighted entries are skipped — so
-/// optional peer hoisting only sees versions added to the preferred
-/// map during the in-flight walk, matching upstream behavior.
+/// Version selectors may be plain entries
+/// [produced while resolving](https://github.com/pnpm/pnpm/blob/a1bda24c4f/installing/deps-resolver/src/resolveDependencies.ts#L1439-L1444)
+/// or weighted entries
+/// [seeded from the wanted lockfile](https://github.com/pnpm/pnpm/blob/a1bda24c4f/lockfile/preferred-versions/src/index.ts#L35-L55).
+/// Both are eligible so an already locked optional peer is not discarded
+/// during re-resolution.
+#[must_use]
 pub fn get_hoistable_optional_peers(
     all_missing_optional_peers: &BTreeMap<String, Vec<String>>,
     all_preferred_versions: &PreferredVersions,
@@ -161,17 +142,18 @@ pub fn get_hoistable_optional_peers(
         let Some(selectors) = all_preferred_versions.get(peer_name) else { continue };
         let mut max_satisfying_version: Option<Version> = None;
         for (version_str, entry) in selectors {
-            let is_plain_version =
-                matches!(entry, VersionSelectorEntry::Plain(VersionSelectorType::Version));
-            if !is_plain_version {
+            let selector_type = match entry {
+                VersionSelectorEntry::Plain(selector_type) => *selector_type,
+                VersionSelectorEntry::Weighted(weighted) => weighted.selector_type,
+            };
+            if selector_type != VersionSelectorType::Version {
                 continue;
             }
             let Ok(version) = version_str.parse::<Version>() else { continue };
             if !ranges.iter().all(|range| {
                 range
                     .parse::<Range>()
-                    .map(|parsed| satisfies_including_prerelease(&parsed, &version))
-                    .unwrap_or(false)
+                    .is_ok_and(|parsed| satisfies_including_prerelease(&parsed, &version))
             }) {
                 continue;
             }
@@ -211,7 +193,7 @@ fn max_satisfying<'a>(versions: &'a [&'a str], range: &str) -> Option<&'a str> {
 /// semver semantics); the retry with the prerelease tag stripped
 /// recovers the candidates upstream accepts. Matches the
 /// `satisfies_with_prereleases` pattern in the `resolve_peers` module.
-fn satisfies_including_prerelease(range: &Range, version: &Version) -> bool {
+pub(crate) fn satisfies_including_prerelease(range: &Range, version: &Version) -> bool {
     if range.satisfies(version) {
         return true;
     }

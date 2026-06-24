@@ -23,15 +23,15 @@
 use std::{
     env,
     ffi::{OsStr, OsString},
-    sync::{Mutex, MutexGuard, OnceLock},
+    sync::{LazyLock, Mutex, MutexGuard},
 };
 
 /// Serialization mutex for env-mutating tests. A single `Mutex<()>` —
 /// uncontended outside the handful of tests that need it, cheap when
 /// held.
 fn env_mutex() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    &LOCK
 }
 
 /// Restore a named set of env vars on drop and hold the env-mutation
@@ -61,7 +61,7 @@ impl EnvGuard {
     where
         Iter: IntoIterator<Item = &'static str>,
     {
-        let lock = env_mutex().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lock = env_mutex().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let saved = vars.into_iter().map(|name| (name, env::var_os(name))).collect();
         EnvGuard { saved, _lock: lock }
     }

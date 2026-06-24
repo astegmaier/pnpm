@@ -3,10 +3,13 @@
 # typos
 
 [files]
-extend-exclude = []
+extend-exclude = [
+  "pacquet/crates/crypto-shasums-file/src/node_release_keys.rs",
+]
 
 [default.extend-words]
 cafs = "cafs"
+ect  = "ect"
 pn   = "pn"
 
 [default.extend-identifiers]

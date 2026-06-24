@@ -12,6 +12,7 @@ use std::path::Path;
 /// the key into `Lockfile::importers` so both the lockfile writer and
 /// `symlink_direct_dependencies::importer_root_dir` (the reverse
 /// direction) agree on the spelling.
+#[must_use]
 pub fn importer_id_from_root_dir(lockfile_dir: &Path, project_dir: &Path) -> String {
     if project_dir == lockfile_dir {
         return ".".to_string();
@@ -30,25 +31,4 @@ pub fn importer_id_from_root_dir(lockfile_dir: &Path, project_dir: &Path) -> Str
 }
 
 #[cfg(test)]
-mod tests {
-    use super::importer_id_from_root_dir;
-    use std::path::Path;
-
-    #[test]
-    fn returns_dot_for_root() {
-        assert_eq!(importer_id_from_root_dir(Path::new("/ws"), Path::new("/ws")), ".");
-    }
-
-    #[test]
-    fn returns_posix_relative_for_subproject() {
-        assert_eq!(
-            importer_id_from_root_dir(Path::new("/ws"), Path::new("/ws/packages/a")),
-            "packages/a",
-        );
-    }
-
-    #[test]
-    fn nested_subproject() {
-        assert_eq!(importer_id_from_root_dir(Path::new("/ws"), Path::new("/ws/a/b/c")), "a/b/c");
-    }
-}
+mod tests;

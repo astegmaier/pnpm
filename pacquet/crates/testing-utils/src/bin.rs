@@ -1,6 +1,6 @@
+use crate::registry::TestRegistry;
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
-use pacquet_registry_mock::AutoMockInstance;
 use std::{fs, path::PathBuf, process::Command};
 use tempfile::{TempDir, tempdir};
 use text_block_macros::text_block_fnl;
@@ -23,6 +23,7 @@ pub struct CommandTempCwd<NpmrcInfo> {
 impl CommandTempCwd<()> {
     /// Create a temporary directory, a `workspace` sub-directory, a `pacquet` command,
     /// and a `pnpm` command with current dir set to the `workspace` sub-directory.
+    #[must_use]
     pub fn init() -> Self {
         let root = tempdir().expect("create temporary directory");
         let workspace = root.path().join("workspace");
@@ -44,8 +45,8 @@ pub struct AddMockedRegistry {
     pub store_dir: PathBuf,
     /// Absolute path to the cache directory as defined by the `.npmrc` file.
     pub cache_dir: PathBuf,
-    /// Anchor to a mocked registry instance. The server will be stop when [dropped](Drop).
-    pub mock_instance: AutoMockInstance,
+    /// Handle to the process-scoped mocked registry used by this test.
+    pub mock_instance: TestRegistry,
 }
 
 impl CommandTempCwd<()> {
@@ -53,6 +54,7 @@ impl CommandTempCwd<()> {
     ///
     /// Also writes a `pnpm-workspace.yaml` with `storeDir` / `cacheDir` because
     /// pnpm 11 reads those from the workspace YAML rather than `.npmrc`.
+    #[must_use]
     pub fn add_mocked_registry(self) -> CommandTempCwd<AddMockedRegistry> {
         let store_dir = self.root.path().join("pacquet-store");
         let cache_dir = self.root.path().join("pacquet-cache");
@@ -61,7 +63,7 @@ impl CommandTempCwd<()> {
             "store-dir=../pacquet-store"
             "cache-dir=../pacquet-cache"
         };
-        let mock_instance = AutoMockInstance::load_or_init();
+        let mock_instance = TestRegistry::start();
         let mocked_registry = mock_instance.url();
         let npmrc_text = format!("registry={mocked_registry}\n{npmrc_text}");
         fs::write(&npmrc_path, npmrc_text).expect("write to .npmrc");

@@ -3,20 +3,7 @@
 //!
 //! Splits each `pnpm.overrides` entry from `pnpm-workspace.yaml`
 //! (or the root manifest's `pnpm.overrides`) into the structured shape
-//! the resolver / read-package hook can act on:
-//!
-//! ```text
-//! "foo"                 → target foo (any version)
-//! "foo@2"               → target foo where parent dep declares ^2
-//! "bar>foo"             → target foo only when nested under parent bar
-//! "bar@1>foo@1"         → both halves narrowed by a semver range
-//! "foo@3 || >=2"        → multi-range version constraint on the target
-//! ```
-//!
-//! The `>` between parent and child is disambiguated from semver `>`/
-//! `>=` operators by the upstream regex `/[^ |@]>/` — the byte before
-//! the `>` must not be ` `, `|`, or `@`, so ranges like `>2` or
-//! `3 || >=2` are not mistaken for a parent>child split.
+//! the resolver / read-package hook can act on.
 //!
 //! Catalog protocol: when the override value uses the `catalog:` form
 //! it is resolved against the workspace's named catalogs before being
@@ -66,8 +53,6 @@ pub struct VersionOverride {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageSelector {
     pub name: String,
-    /// `Some("1")` for `foo@1`, `Some(">2")` for `foo@>2`, `None` for
-    /// the bare `foo` shape (applies to any version).
     pub bare_specifier: Option<String>,
 }
 
@@ -149,6 +134,7 @@ where
 /// The resulting map's values are post-catalog-resolution, so it
 /// compares apples-to-apples against `lockfile.overrides`, which pnpm
 /// writes out with `catalog:` already expanded.
+#[must_use]
 pub fn create_overrides_map_from_parsed(
     parsed_overrides: &[VersionOverride],
 ) -> HashMap<String, String> {

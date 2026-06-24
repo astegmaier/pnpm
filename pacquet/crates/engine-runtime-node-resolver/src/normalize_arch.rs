@@ -4,16 +4,10 @@
 /// Translate the `(platform, arch)` pair pnpm sees at install time into
 /// the directory-name shape nodejs.org actually publishes for.
 ///
-/// Three quirks worth calling out — each is exercised by an upstream
-/// test:
-/// - `darwin` / `arm64` on Node ≤ 15 has no Apple-Silicon build, so
-///   pnpm falls back to the `x64` (Rosetta) tarball.
-/// - `win32` / `ia32` is published as `win-x86`.
-/// - Linux `arm` is published as `armv7l` (Raspberry Pi 4 et al.).
-///
 /// `node_version` is optional because the macOS Apple-Silicon rule
 /// only matters when a concrete version is in hand; callers that
 /// haven't picked one yet pass `None` and accept the default mapping.
+#[must_use]
 pub fn get_normalized_arch(platform: &str, arch: &str, node_version: Option<&str>) -> String {
     if let Some(version) = node_version
         && let Some(major) = node_major(version)

@@ -6,18 +6,18 @@ use serde_json::Value;
 
 use crate::{
     AddedRoot, BrokenModulesLog, ContextLog, DependencyType, Envelope, FetchingProgressLog,
-    FetchingProgressMessage, GetHostName, Host, IgnoredScriptsLog, LifecycleLog, LifecycleMessage,
-    LifecycleStdio, LockfileVerificationLog, LockfileVerificationMessage, LogEvent, LogLevel,
-    PackageImportMethod, PackageImportMethodLog, PackageManifestLog, PackageManifestMessage,
-    PnpmLog, ProgressLog, ProgressMessage, RemovedRoot, Reporter, RequestRetryError,
-    RequestRetryLog, RootLog, RootMessage, SilentReporter, SkippedOptionalDependencyLog,
-    SkippedOptionalPackage, SkippedOptionalReason, Stage, StageLog, StatsLog, StatsMessage,
-    SummaryLog,
+    FetchingProgressMessage, GetHostName, HookLog, Host, IgnoredScriptsLog, LifecycleLog,
+    LifecycleMessage, LifecycleStdio, LockfileVerificationLog, LockfileVerificationMessage,
+    LogEvent, LogLevel, PackageImportMethod, PackageImportMethodLog, PackageManifestLog,
+    PackageManifestMessage, PnpmLog, ProgressLog, ProgressMessage, RemovedRoot, Reporter,
+    RequestRetryError, RequestRetryLog, RootLog, RootMessage, SilentReporter,
+    SkippedOptionalDependencyLog, SkippedOptionalPackage, SkippedOptionalReason, Stage, StageLog,
+    StatsLog, StatsMessage, SummaryLog,
 };
 
 /// Context log serializes with the camelCase field names
 /// `@pnpm/cli.default-reporter` expects (`currentLockfileExists`,
-/// `storeDir`, `virtualStoreDir`); snake_case names would silently
+/// `storeDir`, `virtualStoreDir`); `snake_case` names would silently
 /// fail to render even though the JSON is structurally valid.
 #[test]
 fn context_event_matches_pnpm_wire_shape() {
@@ -118,6 +118,35 @@ fn pnpm_event_matches_pnpm_wire_shape() {
     assert_eq!(json["name"], "pnpm");
     assert_eq!(json["level"], "info");
     assert_eq!(json["message"], "Lockfile is up to date, resolution step is skipped");
+    assert_eq!(json["prefix"], "/some/project");
+}
+
+/// Hook log (`name: "pnpm:hook"`) carries the `from` / `hook` /
+/// `message` / `prefix` fields pnpm's `hookLogger` emits, at the
+/// `debug` level the hook-context logger uses. `@pnpm/cli.default-reporter`
+/// dispatches on these to attribute the message to its pnpmfile.
+#[test]
+fn hook_event_matches_pnpm_wire_shape() {
+    let event = LogEvent::Hook(HookLog {
+        level: LogLevel::Debug,
+        from: "/some/project/.pnpmfile.cjs".to_string(),
+        hook: "readPackage".to_string(),
+        message: "is-positive pinned to 1.0.0".to_string(),
+        prefix: "/some/project".to_string(),
+    });
+    let envelope = Envelope { time: 1_700_000_000_000, hostname: "host", pid: 4242, event: &event };
+
+    let json: Value = envelope
+        .pipe_ref(serde_json::to_string)
+        .expect("serialize envelope")
+        .pipe_as_ref(serde_json::from_str)
+        .expect("parse JSON");
+
+    assert_eq!(json["name"], "pnpm:hook");
+    assert_eq!(json["level"], "debug");
+    assert_eq!(json["from"], "/some/project/.pnpmfile.cjs");
+    assert_eq!(json["hook"], "readPackage");
+    assert_eq!(json["message"], "is-positive pinned to 1.0.0");
     assert_eq!(json["prefix"], "/some/project");
 }
 
@@ -591,6 +620,7 @@ fn ignored_scripts_event_matches_pnpm_wire_shape() {
     let event = LogEvent::IgnoredScripts(IgnoredScriptsLog {
         level: LogLevel::Debug,
         package_names: vec!["foo@1.0.0".to_string(), "bar@2.0.0".to_string()],
+        strict_dep_builds: true,
     });
     let envelope = Envelope { time: 1_700_000_000_000, hostname: "host", pid: 4242, event: &event };
     let json: Value = envelope
@@ -602,11 +632,12 @@ fn ignored_scripts_event_matches_pnpm_wire_shape() {
     assert_eq!(json["name"], "pnpm:ignored-scripts");
     assert_eq!(json["level"], "debug");
     assert_eq!(json["packageNames"], serde_json::json!(["foo@1.0.0", "bar@2.0.0"]));
+    assert!(json.get("strictDepBuilds").is_none());
 }
 
 /// `pnpm:skipped-optional-dependency` matches upstream's wire
 /// shape: top-level `details`, `package: { id, name, version }`,
-/// `prefix`, and `reason` (snake_case). Mirrors
+/// `prefix`, and `reason` (`snake_case`). Mirrors
 /// `SkippedOptionalDependencyMessage` at
 /// <https://github.com/pnpm/pnpm/blob/b4f8f47ac2/core/core-loggers/src/skippedOptionalDependencyLogger.ts>.
 #[test]
@@ -748,7 +779,7 @@ fn skipped_optional_resolution_failure_omits_absent_name_and_version() {
     assert_eq!(json["package"]["bareSpecifier"], "git+ssh://broken-url");
 }
 
-/// All four reason variants serialize as the snake_case strings
+/// All four reason variants serialize as the `snake_case` strings
 /// pnpm's reporter dispatches on.
 #[test]
 fn skipped_optional_reason_serializes_in_pnpm_form() {
@@ -764,7 +795,7 @@ fn skipped_optional_reason_serializes_in_pnpm_form() {
     }
 }
 
-/// Phase markers serialize as the snake_case strings pnpm uses.
+/// Phase markers serialize as the `snake_case` strings pnpm uses.
 #[test]
 fn stage_phases_serialize_in_pnpm_form() {
     let cases = [
@@ -783,8 +814,6 @@ fn stage_phases_serialize_in_pnpm_form() {
 /// to write than just calling it.
 #[test]
 fn silent_reporter_drops_events() {
-    // The point is that no panic, no I/O, and no observable side
-    // effect happens. The test passes by virtue of the call returning.
     SilentReporter::emit(&LogEvent::Stage(StageLog {
         level: LogLevel::Debug,
         prefix: String::new(),
@@ -905,6 +934,55 @@ fn lockfile_verification_failed_event_matches_pnpm_wire_shape() {
     assert_eq!(json["entries"], 12);
     assert_eq!(json["elapsedMs"], 999);
     assert_eq!(json["lockfilePath"], "/proj/pnpm-lock.yaml");
+}
+
+/// `pnpm:lockfile-verification` `cached` carries the discriminator,
+/// the camelCase `verifiedAt` of the reused verdict, and the optional
+/// camelCase `lockfilePath` — no `entries` or `elapsedMs`, because
+/// the cache short-circuit happens before candidates are collected.
+#[test]
+fn lockfile_verification_cached_event_matches_pnpm_wire_shape() {
+    let event = LogEvent::LockfileVerification(LockfileVerificationLog {
+        level: LogLevel::Debug,
+        message: LockfileVerificationMessage::Cached {
+            verified_at: Some("2026-06-11T10:00:00.000Z".to_string()),
+            lockfile_path: Some("/proj/pnpm-lock.yaml".to_string()),
+        },
+    });
+    let envelope = Envelope { time: 1_700_000_000_000, hostname: "host", pid: 4242, event: &event };
+    let json: Value = envelope
+        .pipe_ref(serde_json::to_string)
+        .expect("serialize envelope")
+        .pipe_as_ref(serde_json::from_str)
+        .expect("parse JSON");
+    assert_eq!(json["name"], "pnpm:lockfile-verification");
+    assert_eq!(json["status"], "cached");
+    assert_eq!(json["verifiedAt"], "2026-06-11T10:00:00.000Z");
+    assert_eq!(json["lockfilePath"], "/proj/pnpm-lock.yaml");
+    assert!(json.get("entries").is_none(), "entries must be absent on cached");
+    assert!(json.get("elapsedMs").is_none(), "elapsedMs must be absent on cached");
+}
+
+/// A cached record written before `verifiedAt` existed surfaces as
+/// `None` and must be omitted from the wire rather than rendered as
+/// `null` — pnpm's reporter falls back to a timeless message on
+/// absence.
+#[test]
+fn lockfile_verification_cached_omits_absent_verified_at() {
+    let event = LogEvent::LockfileVerification(LockfileVerificationLog {
+        level: LogLevel::Debug,
+        message: LockfileVerificationMessage::Cached { verified_at: None, lockfile_path: None },
+    });
+    let envelope = Envelope { time: 1_700_000_000_000, hostname: "host", pid: 4242, event: &event };
+    let json: Value = envelope
+        .pipe_ref(serde_json::to_string)
+        .expect("serialize envelope")
+        .pipe_as_ref(serde_json::from_str)
+        .expect("parse JSON");
+    assert!(
+        json.get("verifiedAt").is_none(),
+        "verifiedAt must be omitted when absent, got {json:?}",
+    );
 }
 
 /// `lockfilePath` is upstream-optional (undefined in test paths that

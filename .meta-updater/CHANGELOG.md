@@ -1,5 +1,70 @@
 # @pnpm-private/updater
 
+## 1100.0.21
+
+### Patch Changes
+
+- @pnpm/lockfile.fs@1100.1.7
+- @pnpm/workspace.projects-reader@1101.0.13
+- @pnpm/workspace.workspace-manifest-reader@1100.0.9
+
+## 1100.0.20
+
+### Patch Changes
+
+- Updated dependencies [61969fb]
+  - @pnpm/lockfile.fs@1100.1.6
+
+## 1100.0.19
+
+### Patch Changes
+
+- Updated dependencies [681b593]
+- Updated dependencies [d50d691]
+- Updated dependencies [a31faa7]
+  - @pnpm/types@1101.3.2
+  - @pnpm/lockfile.fs@1100.1.5
+  - @pnpm/object.key-sorting@1100.0.1
+  - @pnpm/workspace.projects-reader@1101.0.12
+  - @pnpm/workspace.workspace-manifest-reader@1100.0.8
+
+## 1100.0.18
+
+### Patch Changes
+
+- @pnpm/workspace.projects-reader@1101.0.11
+
+## 1100.0.17
+
+### Patch Changes
+
+- Updated dependencies [bf1b731]
+  - @pnpm/types@1101.3.1
+  - @pnpm/lockfile.fs@1100.1.4
+  - @pnpm/workspace.projects-reader@1101.0.10
+  - @pnpm/workspace.workspace-manifest-reader@1100.0.7
+
+## 1100.0.16
+
+### Patch Changes
+
+- Updated dependencies [a017bf3]
+  - @pnpm/types@1101.3.0
+  - @pnpm/lockfile.fs@1100.1.3
+  - @pnpm/workspace.projects-reader@1101.0.9
+  - @pnpm/workspace.workspace-manifest-reader@1100.0.6
+
+## 1100.0.15
+
+### Patch Changes
+
+- Updated dependencies [e8b3ae1]
+- Updated dependencies [35d2355]
+  - @pnpm/workspace.projects-reader@1101.0.8
+  - @pnpm/types@1101.2.0
+  - @pnpm/lockfile.fs@1100.1.2
+  - @pnpm/workspace.workspace-manifest-reader@1100.0.5
+
 ## 1100.0.14
 
 ### Patch Changes

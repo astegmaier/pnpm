@@ -21,16 +21,18 @@ fn fake_resolution() -> LockfileResolution {
 /// per-policy constants can flow through without allocation.
 #[test]
 fn resolution_verification_err_round_trip() {
-    let v = ResolutionVerification::Err {
+    let verification = ResolutionVerification::Err {
         code: "MINIMUM_RELEASE_AGE_VIOLATION",
         reason: "was published yesterday".to_string(),
     };
-    match v {
+    match verification {
         ResolutionVerification::Err { code, reason } => {
             assert_eq!(code, "MINIMUM_RELEASE_AGE_VIOLATION");
             assert_eq!(reason, "was published yesterday");
         }
-        ResolutionVerification::Ok => panic!("expected Err"),
+        ResolutionVerification::Ok | ResolutionVerification::FetchFailed { .. } => {
+            panic!("expected Err")
+        }
     }
 }
 
@@ -77,7 +79,7 @@ impl ResolutionVerifier for StubVerifier {
         &self,
         cached_policy: &serde_json::Map<String, serde_json::Value>,
     ) -> bool {
-        cached_policy.get("stub").and_then(|value| value.as_bool()).unwrap_or(false)
+        cached_policy.get("stub").and_then(serde_json::Value::as_bool).unwrap_or(false)
     }
 }
 
@@ -110,8 +112,6 @@ async fn resolution_verifier_dispatches_through_dyn() {
 /// range doesn't churn the lockfile.
 const _: () = assert!(EXISTING_VERSION_SELECTOR_WEIGHT > DIRECT_DEP_SELECTOR_WEIGHT);
 
-/// [`UpdateBehavior::default`] mirrors upstream's `update?: false`
-/// default — keep the lockfile pin.
 #[test]
 fn update_behavior_defaults_off() {
     assert_eq!(UpdateBehavior::default(), UpdateBehavior::Off);

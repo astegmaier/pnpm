@@ -28,7 +28,6 @@ fn writes_child_bins_into_slot_own_package_node_modules() {
     let tmp = tempdir().unwrap();
     let virtual_dir = tmp.path().join(".pacquet");
 
-    // The slot for `parent@1.0.0`. pnpm uses `+` for scope separator.
     let slot = virtual_dir.join("parent@1.0.0");
     let modules = slot.join("node_modules");
     let parent_dir = modules.join("parent");
@@ -55,7 +54,7 @@ fn writes_child_bins_into_slot_own_package_node_modules() {
         ),
         snapshots: None,
         packages: None,
-        package_manifests: &Default::default(),
+        package_manifests: &HashMap::default(),
         skipped: &SkippedSnapshots::default(),
     }
     .run()
@@ -64,14 +63,6 @@ fn writes_child_bins_into_slot_own_package_node_modules() {
     let shim_path = parent_dir.join("node_modules/.bin/child");
     assert!(shim_path.exists(), "expected shim at {shim_path:?}");
     let body = read_to_string(&shim_path).unwrap();
-    // Layout, with shim at A and target at B, relative path `A → B`:
-    //
-    //   <slot>/node_modules/parent/node_modules/.bin/child   (shim, A)
-    //   <slot>/node_modules/child/cli.js                     (target, B)
-    //
-    // Common prefix is `<slot>/node_modules`. A has three extra
-    // segments after that (`parent`, `node_modules`, `.bin`); B has
-    // two (`child`, `cli.js`). Relative = `../../../child/cli.js`.
     assert!(
         body.contains(r#""$basedir/../../../child/cli.js""#),
         "shim must reference the sibling child via the right number of `..`s, got:\n{body}",
@@ -82,17 +73,6 @@ fn writes_child_bins_into_slot_own_package_node_modules() {
 /// linked into its own `node_modules/.bin`. pnpm only links *children*
 /// of a slot, so a tsc slot does not redundantly produce a shim for
 /// its own tsc binary.
-///
-/// To distinguish the exclusion logic from "the slot wasn't processed
-/// at all," the slot has a real child (`other`) whose bin SHOULD be
-/// linked. The assertions then check both directions:
-///
-/// 1. The child bin appears in `<slot>/node_modules/<own>/node_modules/.bin/`.
-/// 2. The slot's own bin does NOT appear there.
-///
-/// If [`super::find_slot_own_package_dir`] returns `None` (slot skipped),
-/// (1) fails. If the exclusion logic is dropped, (2) fails. Either
-/// failure surfaces the regression.
 #[test]
 fn skips_slot_own_package_when_walking_children() {
     let tmp = tempdir().unwrap();
@@ -126,7 +106,7 @@ fn skips_slot_own_package_when_walking_children() {
         ),
         snapshots: None,
         packages: None,
-        package_manifests: &Default::default(),
+        package_manifests: &HashMap::default(),
         skipped: &SkippedSnapshots::default(),
     }
     .run()
@@ -154,7 +134,7 @@ fn link_virtual_store_bins_no_op_when_dir_missing() {
         ),
         snapshots: None,
         packages: None,
-        package_manifests: &Default::default(),
+        package_manifests: &HashMap::default(),
         skipped: &SkippedSnapshots::default(),
     }
     .run()
@@ -195,7 +175,7 @@ fn link_virtual_store_bins_handles_scoped_slot_name() {
         ),
         snapshots: None,
         packages: None,
-        package_manifests: &Default::default(),
+        package_manifests: &HashMap::default(),
         skipped: &SkippedSnapshots::default(),
     }
     .run()
@@ -214,7 +194,6 @@ fn link_virtual_store_bins_handles_scoped_slot_name() {
 ///
 /// Slot name shape verified against
 /// `pacquet_lockfile::pkg_name_ver_peer::tests::to_virtual_store_name`.
-/// Pins review finding #5.
 #[test]
 fn link_virtual_store_bins_handles_peer_resolved_slot_name() {
     let tmp = tempdir().unwrap();
@@ -249,7 +228,7 @@ fn link_virtual_store_bins_handles_peer_resolved_slot_name() {
         ),
         snapshots: None,
         packages: None,
-        package_manifests: &Default::default(),
+        package_manifests: &HashMap::default(),
         skipped: &SkippedSnapshots::default(),
     }
     .run()
@@ -302,7 +281,7 @@ fn link_virtual_store_bins_handles_unscoped_name_with_plus() {
         ),
         snapshots: None,
         packages: None,
-        package_manifests: &Default::default(),
+        package_manifests: &HashMap::default(),
         skipped: &SkippedSnapshots::default(),
     }
     .run()
@@ -330,7 +309,7 @@ fn link_virtual_store_bins_skips_slot_without_node_modules() {
         ),
         snapshots: None,
         packages: None,
-        package_manifests: &Default::default(),
+        package_manifests: &HashMap::default(),
         skipped: &SkippedSnapshots::default(),
     }
     .run()
@@ -360,7 +339,7 @@ fn link_virtual_store_bins_skips_slot_without_own_package_dir() {
         ),
         snapshots: None,
         packages: None,
-        package_manifests: &Default::default(),
+        package_manifests: &HashMap::default(),
         skipped: &SkippedSnapshots::default(),
     }
     .run()
@@ -499,7 +478,10 @@ fn link_virtual_store_bins_propagates_read_error_via_di() {
     impl FsWalkFiles for DenyVirtualStore {
         fn walk_files(_: &Path) -> io::Result<impl Iterator<Item = PathBuf>> {
             unreachable!("directories.bin not exercised by this test");
-            #[expect(unreachable_code)]
+            #[expect(
+                unreachable_code,
+                reason = "kept so the method returns its declared type after the `unreachable!()` above"
+            )]
             Ok(empty())
         }
     }
@@ -511,7 +493,7 @@ fn link_virtual_store_bins_propagates_read_error_via_di() {
         ),
         snapshots: None,
         packages: None,
-        package_manifests: &Default::default(),
+        package_manifests: &HashMap::default(),
         skipped: &SkippedSnapshots::default(),
     }
     .run_with::<DenyVirtualStore>()
@@ -528,6 +510,7 @@ fn metadata_with_resolution(
 ) -> PackageMetadata {
     PackageMetadata {
         resolution,
+        version: None,
         engines: None,
         cpu: None,
         os: None,
@@ -559,8 +542,7 @@ fn dummy_binary_resolution() -> BinaryResolution {
 /// `has_bin == Some(true)` filter would drop runtime slots from
 /// the bin-link dispatch and the synthesized `package.json`
 /// (from `install_package_by_snapshot::synthesize_runtime_manifest_bytes`)
-/// would go unread. Verified by removing the runtime-arm match —
-/// the test fails as expected.
+/// would go unread.
 #[test]
 fn build_has_bin_set_includes_runtime_resolutions_even_when_has_bin_is_absent() {
     let registry_with_bin: PackageKey = "react@18.0.0".parse().expect("parse react key");

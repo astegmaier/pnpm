@@ -37,9 +37,7 @@ pub fn symlink_dir(original: &Path, link: &Path) -> io::Result<()> {
 /// `resolveSrcOnTrueSymlink(src, dest) = path.relative(path.dirname(dest), src)`.
 ///
 /// Returns an absolute path when no relative form exists between the
-/// two arguments. This matches Node.js's `path.win32.relative`, which
-/// returns the absolute `to` argument when the paths share no common
-/// root (different drives, different UNC shares).
+/// two arguments.
 fn relative_target_for(original: &Path, link: &Path) -> PathBuf {
     let parent = link.parent().unwrap_or_else(|| Path::new(""));
     relative_target_inner(original, parent)
@@ -157,25 +155,10 @@ pub struct ForceSymlinkOutcome {
 /// pnpm's [`symlinkDir`](https://github.com/pnpm/symlink-dir/blob/v10.0.1/src/index.ts#L22)
 /// with its default `{ overwrite: true }` semantics.
 ///
-/// Behavior:
-///
-/// - **Parent missing** (`NotFound` on the underlying symlink call) →
-///   `create_dir_all` the parent and retry. Matches upstream's
-///   `fs.mkdir(dirname(path), { recursive: true })` arm.
-/// - **A symlink already exists at `link`**:
-///   - Pointing at `target` → return `{ reused: true }` (no-op).
-///   - Pointing elsewhere → `remove_symlink_dir` and retry.
-/// - **A regular file or non-empty directory occupies `link`** →
-///   rename it to `<parent>/.ignored_<basename>` and retry. If the
-///   rename fails because the source disappeared between the
-///   `AlreadyExists` and the rename, surface the initial
-///   `AlreadyExists` error rather than the rename's `NotFound`.
-///   The `warning` field carries upstream's "moved" message so a
-///   reporter can tell the user what happened.
-///
-/// Returns the same `(reused, warning)` shape upstream's TypeScript
-/// `forceSymlink` returns, so reporters can mirror the pnpm warning
-/// surface.
+/// When a regular file or directory occupies `link` and the rename
+/// that moves it aside fails because the source disappeared between
+/// the `AlreadyExists` and the rename, the initial `AlreadyExists`
+/// error is surfaced rather than the rename's `NotFound`.
 pub fn force_symlink_dir(target: &Path, link: &Path) -> io::Result<ForceSymlinkOutcome> {
     force_symlink_inner(target, link, false)
 }
@@ -192,7 +175,6 @@ fn force_symlink_inner(
 
     match initial_err.kind() {
         io::ErrorKind::NotFound => {
-            // Parent directory missing — `create_dir_all` and retry.
             // Wrap the mkdir failure so callers see *which* step
             // tripped, the same way pnpm's `forceSymlink` does.
             if let Some(parent) = link.parent() {
@@ -213,56 +195,52 @@ fn force_symlink_inner(
         _ => return Err(initial_err),
     }
 
-    // Path exists. Is it already a symlink pointing where we want?
-    match read_symlink_dir(link) {
-        Ok(existing) => {
-            if existing_symlink_up_to_date(target, link, &existing) {
-                return Ok(ForceSymlinkOutcome { reused: true, warning: None });
-            }
-            // Stale link — unlink and retry. Ignore `NotFound` in
-            // case a parallel installer beat us to the unlink.
-            match remove_symlink_dir(link) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-            force_symlink_inner(target, link, rename_tried)
+    if let Ok(existing) = read_symlink_dir(link) {
+        if existing_symlink_up_to_date(target, link, &existing) {
+            return Ok(ForceSymlinkOutcome { reused: true, warning: None });
         }
-        Err(_) => {
-            // `link` is occupied by a regular file or directory.
-            // Move it out of the way, then retry. On the second
-            // attempt (`rename_tried`) drop down to a plain unlink
-            // — pnpm carries the same fallback for an intermittent
-            // macOS bug, see
-            // <https://github.com/pnpm/pnpm/issues/5909#issuecomment-1400066890>.
-            let parent = link.parent().unwrap_or_else(|| Path::new(""));
-            let basename = link.file_name().unwrap_or_default().to_string_lossy().into_owned();
-            let warning = if rename_tried {
-                remove_occupant(link)?;
-                format!(
-                    "Symlink wanted name was occupied by directory or file. \
-                     Old entity removed: {parent:?}{sep}{basename}",
-                    sep = std::path::MAIN_SEPARATOR,
-                )
-            } else {
-                let ignore_name = format!(".ignored_{basename}");
-                let ignore_path = parent.join(&ignore_name);
-                if let Err(rename_err) = rename_overwrite(link, &ignore_path) {
-                    if rename_err.kind() == io::ErrorKind::NotFound {
-                        return Err(initial_err);
-                    }
-                    return Err(rename_err);
+        // Stale link — unlink and retry. Ignore `NotFound` in
+        // case a parallel installer beat us to the unlink.
+        match remove_symlink_dir(link) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        force_symlink_inner(target, link, rename_tried)
+    } else {
+        // `link` is occupied by a regular file or directory.
+        // Move it out of the way, then retry. On the second
+        // attempt (`rename_tried`) drop down to a plain unlink
+        // — pnpm carries the same fallback for an intermittent
+        // macOS bug, see
+        // <https://github.com/pnpm/pnpm/issues/5909#issuecomment-1400066890>.
+        let parent = link.parent().unwrap_or_else(|| Path::new(""));
+        let basename = link.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let warning = if rename_tried {
+            remove_occupant(link)?;
+            format!(
+                "Symlink wanted name was occupied by directory or file. \
+                 Old entity removed: {parent:?}{sep}{basename}",
+                sep = std::path::MAIN_SEPARATOR,
+            )
+        } else {
+            let ignore_name = format!(".ignored_{basename}");
+            let ignore_path = parent.join(&ignore_name);
+            if let Err(rename_err) = rename_overwrite(link, &ignore_path) {
+                if rename_err.kind() == io::ErrorKind::NotFound {
+                    return Err(initial_err);
                 }
-                format!(
-                    "Symlink wanted name was occupied by directory or file. \
-                     Old entity moved: {parent:?}{sep}{basename} => {ignore_name}",
-                    sep = std::path::MAIN_SEPARATOR,
-                )
-            };
-            let mut outcome = force_symlink_inner(target, link, true)?;
-            outcome.warning = Some(warning);
-            Ok(outcome)
-        }
+                return Err(rename_err);
+            }
+            format!(
+                "Symlink wanted name was occupied by directory or file. \
+                 Old entity moved: {parent:?}{sep}{basename} => {ignore_name}",
+                sep = std::path::MAIN_SEPARATOR,
+            )
+        };
+        let mut outcome = force_symlink_inner(target, link, true)?;
+        outcome.warning = Some(warning);
+        Ok(outcome)
     }
 }
 
@@ -272,16 +250,20 @@ fn force_symlink_inner(
 /// existing link's contents to an absolute path (using `link`'s
 /// parent dir when the contents are relative), then compare lexically
 /// against `wanted`. Single-level — does not follow chained symlinks.
+///
+/// Both sides pass through [`fn@crate::lexical_normalize`] before comparing.
+/// Node's `path.relative` resolves its arguments, so the `..`
+/// segments in the relative link contents [`symlink_dir`] writes
+/// collapse on the upstream side; without the same collapse here,
+/// every up-to-date relative symlink reads as stale and pays an
+/// unlink + recreate.
 fn existing_symlink_up_to_date(wanted: &Path, link: &Path, existing_link_string: &Path) -> bool {
     let existing_absolute = if existing_link_string.is_absolute() {
         existing_link_string.to_path_buf()
     } else {
         link.parent().unwrap_or_else(|| Path::new("")).join(existing_link_string)
     };
-    // `path.relative(a, b) === ''` returns true iff lexically equal,
-    // so a direct PathBuf equality check is the right Rust analogue
-    // once both sides are absolute.
-    existing_absolute == wanted
+    crate::lexical_normalize(&existing_absolute) == crate::lexical_normalize(wanted)
 }
 
 /// Remove a regular file or directory that's occupying a symlink

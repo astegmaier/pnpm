@@ -174,12 +174,6 @@ fn variant_url(variant: &PlatformAssetResolution) -> &str {
 
 /// Parse `deno-<cpu>-<vendor-os>.zip.sha256sum` into the
 /// [`PlatformAssetTarget`]s the variant covers.
-///
-/// Two architectures (`aarch64`, `x86_64`) × three vendor-os pairs
-/// (`apple-darwin`, `unknown-linux-gnu`, `pc-windows-msvc`) — anything
-/// else falls through unmatched. Windows x64 also lists `arm64` in
-/// its targets because the Windows x64 build runs natively on arm64
-/// hosts under emulation.
 fn parse_asset_name(name: &str) -> Option<Vec<PlatformAssetTarget>> {
     let stem = name.strip_suffix(".zip.sha256sum")?;
     let body = stem.strip_prefix("deno-")?;
@@ -234,7 +228,7 @@ fn extract_sha256(body: &str) -> Option<String> {
     let bytes = body.as_bytes();
     bytes
         .windows(64)
-        .find(|window| window.iter().all(|byte| byte.is_ascii_hexdigit()))
+        .find(|window| window.iter().all(u8::is_ascii_hexdigit))
         .map(|window| String::from_utf8_lossy(window).to_ascii_lowercase())
 }
 

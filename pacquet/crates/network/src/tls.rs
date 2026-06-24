@@ -16,11 +16,17 @@
 //! internally), emits no `ERR_PNPM_*` codes for malformed TLS
 //! material, silently ignores a missing `cafile`, and consults no
 //! environment variables. Pacquet mirrors each of those choices.
-
-use std::collections::HashMap;
-use std::net::IpAddr;
+//!
+//! One deliberate exception sits *outside* this struct: pacquet honors
+//! the `NODE_EXTRA_CA_CERTS` environment variable as an additional
+//! trust root (see `load_node_extra_ca_certs` in `lib.rs`). pnpm-on-
+//! Node already trusts that bundle implicitly via Node's TLS runtime,
+//! so a native port must read it explicitly to preserve real-world
+//! parity. It is applied at the client-builder layer, never folded
+//! into this `.npmrc`-only `TlsConfig`.
 
 use crate::auth::nerf_dart;
+use std::{collections::HashMap, net::IpAddr};
 
 /// Resolved TLS + local-address configuration.
 ///
@@ -163,6 +169,7 @@ pub struct RegistryTls {
 impl RegistryTls {
     /// `true` when no field is set. Used by callers that want to skip
     /// building a per-registry client for an empty override.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.ca.is_none() && self.cert.is_none() && self.key.is_none()
     }
@@ -170,8 +177,8 @@ impl RegistryTls {
 
 impl PerRegistryTls {
     /// Build from a nerf-darted → [`RegistryTls`] map. Drops empty
-    /// entries (matches pnpm — an empty `tls` object is the same as
-    /// no entry at all).
+    /// entries.
+    #[must_use]
     pub fn from_map(by_uri: HashMap<String, RegistryTls>) -> Self {
         let by_uri: HashMap<_, _> = by_uri.into_iter().filter(|(_, v)| !v.is_empty()).collect();
         let max_parts = by_uri.keys().map(|key| key.split('/').count()).max().unwrap_or(0);
@@ -180,6 +187,7 @@ impl PerRegistryTls {
 
     /// `true` when there are no per-registry overrides. Lets the
     /// network layer skip the per-registry-client construction path.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.by_uri.is_empty()
     }
@@ -204,6 +212,7 @@ impl PerRegistryTls {
     /// Returns the **nerf-darted key** that matched (so the network
     /// layer can index into its pre-built per-registry client map),
     /// not the `RegistryTls` itself.
+    #[must_use]
     pub fn pick_for_url(&self, url: &str) -> Option<&str> {
         if self.by_uri.is_empty() {
             return None;
@@ -248,6 +257,7 @@ impl PerRegistryTls {
 
     /// Borrow the inner [`RegistryTls`] for a nerf-darted key. Returns
     /// `None` when the key wasn't registered.
+    #[must_use]
     pub fn get(&self, key: &str) -> Option<&RegistryTls> {
         self.by_uri.get(key)
     }
@@ -273,7 +283,7 @@ fn strip_port(url: &str) -> String {
     };
     // Skip past any `user[:pw]@` userinfo. The port-bearing colon is
     // the one in the host segment, not in the userinfo.
-    let host_segment = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let host_segment = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     let userinfo = authority.strip_suffix(host_segment).unwrap_or("");
     // IPv6 literals like `[::1]:8080` have `:` inside the brackets;
     // find the port colon only *after* a closing `]` when present.

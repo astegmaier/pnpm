@@ -13,7 +13,17 @@ use std::collections::HashMap;
 pub struct PackageMetadata {
     pub resolution: LockfileResolution,
 
+    /// Emitted only for non-registry packages (depPath contains `:`) whose
+    /// manifest carries a version and whose resolution isn't a directory —
+    /// matching pnpm's `toLockfileDependency`. Registry packages omit it
+    /// because the version is already the depPath suffix.
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::serialize_yaml::sorted_map_opt"
+    )]
     pub engines: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<Vec<String>>,
@@ -34,15 +44,20 @@ pub struct PackageMetadata {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bundled_dependencies: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::serialize_yaml::sorted_map_opt"
+    )]
     pub peer_dependencies: Option<HashMap<String, String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::serialize_yaml::sorted_map_opt"
+    )]
     pub peer_dependencies_meta: Option<HashMap<String, PeerDependencyMeta>>,
 }
 
 // Some packages declare `libc` as a plain string in `package.json`; pnpm writes
-// that string as-is into the lockfile. Accepts both string and array forms,
-// normalizing to `Vec<Value>`.
+// that string as-is into the lockfile.
 fn deserialize_string_or_vec<'de, Value, Deser>(
     deserializer: Deser,
 ) -> Result<Option<Vec<Value>>, Deser::Error>

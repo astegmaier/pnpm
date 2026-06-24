@@ -1,6 +1,12 @@
-use super::{AllowBuildPolicy, BuildModules, parse_name_version_from_key};
-use crate::{SkippedSnapshots, VirtualStoreLayout};
-use pacquet_config::Config;
+use super::{
+    AllowBuildPolicy, BuildModules, allow_build_key_from_ignored_build, parse_name_version_from_key,
+};
+// Only the `#[cfg(unix)]` rebuild-selection test uses this; importing it
+// unconditionally would be an unused import on Windows.
+#[cfg(unix)]
+use super::RebuildOptions;
+use crate::{RequiresBuildBySnapshot, SkippedSnapshots, VirtualStoreLayout};
+use pacquet_config::{Config, PackageImportMethod};
 use pacquet_executor::ScriptsPrependNodePath;
 use pacquet_lockfile::{
     PackageKey, PkgName, PkgVerPeer, ProjectSnapshot, ResolvedDependencyMap,
@@ -18,29 +24,28 @@ use std::{
 };
 use tempfile::tempdir;
 
+/// Install-scoped `pnpm:package-import-method` dedupe state shared by
+/// the `BuildModules` constructions below. The build phase only writes
+/// to it through the side-effects re-materialization path; tests don't
+/// assert on it, so one shared static is enough.
+static TEST_LOGGED_METHODS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 /// Build an [`AllowBuildPolicy`] from a list of `(spec, allowed)`
 /// pairs, mirroring how `pnpm-workspace.yaml`'s `allowBuilds` map
 /// would arrive at the policy. Each spec is parsed through
-/// [`crate::expand_package_version_specs`] so version unions
-/// (`foo@1.0.0 || 2.0.0`) work the same way they do at runtime.
+/// [`AllowBuildPolicy::from_config`] so version unions and depPath
+/// keys work the same way they do at runtime.
 /// Panics on any parse failure — test inputs must be valid.
-fn policy_from_specs<const N: usize>(
-    entries: [(&str, bool); N],
+fn policy_from_specs<const LEN: usize>(
+    entries: [(&str, bool); LEN],
     dangerously_allow_all: bool,
 ) -> AllowBuildPolicy {
-    use crate::expand_package_version_specs;
-    let mut allowed_specs: Vec<&str> = Vec::new();
-    let mut disallowed_specs: Vec<&str> = Vec::new();
+    let mut config = Config::new();
+    config.dangerously_allow_all_builds = dangerously_allow_all;
     for (spec, value) in entries {
-        if value {
-            allowed_specs.push(spec);
-        } else {
-            disallowed_specs.push(spec);
-        }
+        config.allow_builds.insert(spec.to_string(), value);
     }
-    let expanded_allowed = expand_package_version_specs(allowed_specs).expect("valid specs");
-    let expanded_disallowed = expand_package_version_specs(disallowed_specs).expect("valid specs");
-    AllowBuildPolicy::new(expanded_allowed, expanded_disallowed, dangerously_allow_all)
+    AllowBuildPolicy::from_config(&config).expect("valid specs")
 }
 
 #[test]
@@ -74,38 +79,67 @@ fn parse_key_without_leading_slash() {
 #[test]
 fn default_policy_denies_all() {
     let policy = AllowBuildPolicy::default();
-    assert_eq!(policy.check("any-package", "1.0.0"), None);
+    assert_eq!(policy.check("any-package@1.0.0"), None);
 }
 
 #[test]
 fn explicit_allow() {
     let policy = policy_from_specs([("@pnpm.e2e/install-script-example", true)], false);
-    assert_eq!(policy.check("@pnpm.e2e/install-script-example", "1.0.0"), Some(true));
+    assert_eq!(policy.check("@pnpm.e2e/install-script-example@1.0.0"), Some(true));
+}
+
+#[test]
+fn explicit_allow_requires_registry_style_dep_path() {
+    let policy = policy_from_specs([("@pnpm.e2e/install-script-example", true)], false);
+    assert_eq!(
+        policy.check("@pnpm.e2e/install-script-example@git+https://example.com/x.git#abc123"),
+        None,
+    );
+    assert_eq!(policy.check("@pnpm.e2e/install-script-example@1.0.0"), Some(true));
+}
+
+#[test]
+fn explicit_allow_by_dep_path_allows_untrusted_package_identity() {
+    let policy = policy_from_specs(
+        [("foo@git+https://github.com/org/foo.git#abc123", true), ("foo", true)],
+        false,
+    );
+    assert_eq!(
+        policy.check("foo@git+https://github.com/org/foo.git#abc123(react@19.0.0)"),
+        Some(true),
+    );
+    assert_eq!(policy.check("foo@git+https://github.com/attacker/foo.git#abc123"), None);
+}
+
+#[test]
+fn explicit_allow_by_tarball_dep_path_allows_untrusted_package_identity() {
+    let policy = policy_from_specs([("foo@https://example.com/foo.tgz", true)], false);
+
+    assert_eq!(policy.check("foo@https://example.com/foo.tgz"), Some(true));
 }
 
 #[test]
 fn explicit_deny() {
     let policy = policy_from_specs([("@pnpm.e2e/bad-package", false)], false);
-    assert_eq!(policy.check("@pnpm.e2e/bad-package", "1.0.0"), Some(false));
+    assert_eq!(policy.check("@pnpm.e2e/bad-package@1.0.0"), Some(false));
 }
 
 #[test]
 fn unlisted_returns_none() {
     let policy = policy_from_specs([("@pnpm.e2e/allowed", true)], false);
-    assert_eq!(policy.check("@pnpm.e2e/not-listed", "1.0.0"), None);
+    assert_eq!(policy.check("@pnpm.e2e/not-listed@1.0.0"), None);
 }
 
 /// Upstream checks `expandedDisallowed` before `expandedAllowed`
 /// in [`createAllowBuildFunction`](https://github.com/pnpm/pnpm/blob/b4f8f47ac2/building/policy/src/index.ts#L36-L43),
 /// so a bare-name disallow wins over an exact-version allow.
-/// Pacquet matches that order — pre-#397-item-5, the matcher
-/// checked exact-version first, which diverged from upstream.
+/// Pacquet matches that order.
 #[test]
 fn disallow_bare_name_wins_over_allow_exact_version() {
     let policy =
         policy_from_specs([("@pnpm.e2e/pkg@1.0.0", true), ("@pnpm.e2e/pkg", false)], false);
-    assert_eq!(policy.check("@pnpm.e2e/pkg", "1.0.0"), Some(false));
-    assert_eq!(policy.check("@pnpm.e2e/pkg", "2.0.0"), Some(false));
+    assert_eq!(policy.check("@pnpm.e2e/pkg@1.0.0"), Some(false));
+    assert_eq!(policy.check("@pnpm.e2e/pkg@2.0.0"), Some(false));
 }
 
 /// The converse: a bare-name allow combined with an exact-version
@@ -115,27 +149,33 @@ fn disallow_bare_name_wins_over_allow_exact_version() {
 fn disallow_exact_version_with_allow_bare_name() {
     let policy =
         policy_from_specs([("@pnpm.e2e/pkg", true), ("@pnpm.e2e/pkg@1.0.0", false)], false);
-    assert_eq!(policy.check("@pnpm.e2e/pkg", "1.0.0"), Some(false));
-    assert_eq!(policy.check("@pnpm.e2e/pkg", "2.0.0"), Some(true));
+    assert_eq!(policy.check("@pnpm.e2e/pkg@1.0.0"), Some(false));
+    assert_eq!(policy.check("@pnpm.e2e/pkg@2.0.0"), Some(true));
 }
 
 #[test]
 fn empty_rules_denies_all() {
     let policy = policy_from_specs([], false);
-    assert_eq!(policy.check("any-package", "1.0.0"), None);
+    assert_eq!(policy.check("any-package@1.0.0"), None);
 }
 
 #[test]
 fn dangerously_allow_all_builds() {
     let policy = policy_from_specs([], true);
-    assert_eq!(policy.check("any-package", "1.0.0"), Some(true));
-    assert_eq!(policy.check("other-package", "2.0.0"), Some(true));
+    assert_eq!(policy.check("any-package@1.0.0"), Some(true));
+    assert_eq!(policy.check("other-package@2.0.0"), Some(true));
+}
+
+#[test]
+fn dangerously_allow_all_allows_artifact_dep_paths() {
+    let policy = policy_from_specs([], true);
+    assert_eq!(policy.check("anything@git+https://example.com/x.git#abc123"), Some(true));
 }
 
 #[test]
 fn dangerously_allow_all_overrides_deny() {
     let policy = policy_from_specs([("@pnpm.e2e/pkg", false)], true);
-    assert_eq!(policy.check("@pnpm.e2e/pkg", "1.0.0"), Some(true));
+    assert_eq!(policy.check("@pnpm.e2e/pkg@1.0.0"), Some(true));
 }
 
 /// Mirrors upstream's
@@ -146,11 +186,11 @@ fn dangerously_allow_all_overrides_deny() {
 #[test]
 fn allow_via_version_union() {
     let policy = policy_from_specs([("foo", true), ("qar@1.0.0 || 2.0.0", true)], false);
-    assert_eq!(policy.check("foo", "1.0.0"), Some(true));
-    assert_eq!(policy.check("bar", "1.0.0"), None);
-    assert_eq!(policy.check("qar", "1.0.0"), Some(true));
-    assert_eq!(policy.check("qar", "2.0.0"), Some(true));
-    assert_eq!(policy.check("qar", "1.1.0"), None);
+    assert_eq!(policy.check("foo@1.0.0"), Some(true));
+    assert_eq!(policy.check("bar@1.0.0"), None);
+    assert_eq!(policy.check("qar@1.0.0"), Some(true));
+    assert_eq!(policy.check("qar@2.0.0"), Some(true));
+    assert_eq!(policy.check("qar@1.1.0"), None);
 }
 
 /// Mirrors upstream's
@@ -163,8 +203,8 @@ fn allow_via_version_union() {
 #[test]
 fn wildcard_name_in_allow_builds_does_not_match_real_package() {
     let policy = policy_from_specs([("is-*", true)], false);
-    assert_eq!(policy.check("is-odd", "1.0.0"), None);
-    assert_eq!(policy.check("is-positive", "1.0.0"), None);
+    assert_eq!(policy.check("is-odd@1.0.0"), None);
+    assert_eq!(policy.check("is-positive@1.0.0"), None);
 }
 
 /// `from_config` propagates `expand_package_version_specs` errors —
@@ -190,16 +230,10 @@ fn from_config_propagates_name_pattern_in_version_union() {
     );
 }
 
-// The next two tests exercise `from_config` end-to-end: an empty Config
-// folds to the default policy (deny everything), and a Config populated by
-// `pnpm-workspace.yaml` round-trips through the same logic the in-memory
-// tests above cover. The `package.json` reader was removed in pacquet
-// pnpm/pacquet#397 item 5 — settings come from `pnpm-workspace.yaml` only.
-
 #[test]
 fn empty_config_denies_all() {
     let policy = AllowBuildPolicy::from_config(&Config::new()).expect("empty config never errors");
-    assert_eq!(policy.check("anything", "1.0.0"), None);
+    assert_eq!(policy.check("anything@1.0.0"), None);
 }
 
 #[test]
@@ -210,9 +244,9 @@ fn from_config_consumes_allow_builds_and_dangerously_allow_all_builds() {
     config.allow_builds.insert("@pnpm.e2e/bad-package".to_string(), false);
 
     let policy = AllowBuildPolicy::from_config(&config).expect("valid specs");
-    assert_eq!(policy.check("@pnpm.e2e/install-script-example", "1.0.0"), Some(true));
-    assert_eq!(policy.check("@pnpm.e2e/bad-package", "1.0.0"), Some(false));
-    assert_eq!(policy.check("@pnpm.e2e/unrelated", "1.0.0"), None);
+    assert_eq!(policy.check("@pnpm.e2e/install-script-example@1.0.0"), Some(true));
+    assert_eq!(policy.check("@pnpm.e2e/bad-package@1.0.0"), Some(false));
+    assert_eq!(policy.check("@pnpm.e2e/unrelated@1.0.0"), None);
 }
 
 fn name(text: &str) -> PkgName {
@@ -301,6 +335,7 @@ fn build_modules_collects_ignored_builds() {
         packages: None,
         allow_build_policy: &policy,
         side_effects_maps_by_snapshot: None,
+        requires_build_by_snapshot: None,
         engine_name: None,
         side_effects_cache: true,
         side_effects_cache_write: false,
@@ -309,11 +344,17 @@ fn build_modules_collects_ignored_builds() {
         patches: None,
 
         scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        extra_env: &HashMap::new(),
         unsafe_perm: true,
         child_concurrency: 1,
         skipped: &SkippedSnapshots::default(),
         pkg_root_by_key: None,
         gather_ancestor_bin_paths: false,
+        frozen_store: false,
+        ignore_scripts: false,
+        import_method: PackageImportMethod::Auto,
+        logged_methods: &TEST_LOGGED_METHODS,
+        rebuild: None,
     }
     .run::<SilentReporter>()
     .expect("run BuildModules");
@@ -324,6 +365,121 @@ fn build_modules_collects_ignored_builds() {
         vec!["aaa@2.0.0".to_string(), "zzz@1.0.0".to_string()],
         "ignored set must be sorted lexicographically: {ignored:?}",
     );
+}
+
+/// Under `ignore_scripts`, the same default-deny build candidates that
+/// `build_modules_collects_ignored_builds` reports as ignored are
+/// instead silently skipped: no script runs and the returned set is
+/// empty, so the install does not fail with `ERR_PNPM_IGNORED_BUILDS`.
+/// Mirrors pnpm leaving `ignoredBuilds` empty when `ignoreScripts` is
+/// set.
+#[test]
+fn ignore_scripts_skips_build_without_collecting_ignored() {
+    let snapshots = HashMap::from([
+        (key("zzz", "1.0.0"), SnapshotEntry::default()),
+        (key("aaa", "2.0.0"), SnapshotEntry::default()),
+    ]);
+    let importers = root_importers(&[("zzz", "1.0.0"), ("aaa", "2.0.0")]);
+    let policy = AllowBuildPolicy::default(); // empty → default-deny
+
+    let virtual_store_dir = tempdir().expect("create temp dir");
+    let modules_dir = tempdir().expect("create temp dir");
+    let lockfile_dir = tempdir().expect("create temp dir");
+
+    create_buildable_pkg(virtual_store_dir.path(), &key("zzz", "1.0.0"));
+    create_buildable_pkg(virtual_store_dir.path(), &key("aaa", "2.0.0"));
+
+    let ignored = BuildModules {
+        layout: &VirtualStoreLayout::legacy(
+            virtual_store_dir.path(),
+            pacquet_config::default_virtual_store_dir_max_length() as usize,
+        ),
+        modules_dir: modules_dir.path(),
+        lockfile_dir: lockfile_dir.path(),
+        snapshots: Some(&snapshots),
+        importers: &importers,
+        packages: None,
+        allow_build_policy: &policy,
+        side_effects_maps_by_snapshot: None,
+        requires_build_by_snapshot: None,
+        engine_name: None,
+        side_effects_cache: true,
+        side_effects_cache_write: false,
+        store_dir: None,
+        store_index_writer: None,
+        patches: None,
+
+        scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        extra_env: &HashMap::new(),
+        unsafe_perm: true,
+        child_concurrency: 1,
+        skipped: &SkippedSnapshots::default(),
+        pkg_root_by_key: None,
+        gather_ancestor_bin_paths: false,
+        frozen_store: false,
+        ignore_scripts: true,
+        import_method: PackageImportMethod::Auto,
+        logged_methods: &TEST_LOGGED_METHODS,
+        rebuild: None,
+    }
+    .run::<SilentReporter>()
+    .expect("run BuildModules");
+    dbg!(&ignored);
+
+    assert!(ignored.is_empty(), "ignore_scripts must not collect ignored builds: {ignored:?}");
+}
+
+#[test]
+fn cached_requires_build_false_skips_package_dir_probe() {
+    let pkg_key = key("aaa", "1.0.0");
+    let snapshots = HashMap::from([(pkg_key.clone(), SnapshotEntry::default())]);
+    let importers = root_importers(&[("aaa", "1.0.0")]);
+    let policy = AllowBuildPolicy::default();
+
+    let virtual_store_dir = tempdir().expect("create temp dir");
+    let modules_dir = tempdir().expect("create temp dir");
+    let lockfile_dir = tempdir().expect("create temp dir");
+
+    create_buildable_pkg(virtual_store_dir.path(), &pkg_key);
+    let requires_build_by_snapshot = RequiresBuildBySnapshot::from([(pkg_key, false)]);
+
+    let ignored = BuildModules {
+        layout: &VirtualStoreLayout::legacy(
+            virtual_store_dir.path(),
+            pacquet_config::default_virtual_store_dir_max_length() as usize,
+        ),
+        modules_dir: modules_dir.path(),
+        lockfile_dir: lockfile_dir.path(),
+        snapshots: Some(&snapshots),
+        importers: &importers,
+        packages: None,
+        allow_build_policy: &policy,
+        side_effects_maps_by_snapshot: None,
+        requires_build_by_snapshot: Some(&requires_build_by_snapshot),
+        engine_name: None,
+        side_effects_cache: true,
+        side_effects_cache_write: false,
+        store_dir: None,
+        store_index_writer: None,
+        patches: None,
+
+        scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        extra_env: &HashMap::new(),
+        unsafe_perm: true,
+        child_concurrency: 1,
+        skipped: &SkippedSnapshots::default(),
+        pkg_root_by_key: None,
+        gather_ancestor_bin_paths: false,
+        frozen_store: false,
+        ignore_scripts: false,
+        import_method: PackageImportMethod::Auto,
+        logged_methods: &TEST_LOGGED_METHODS,
+        rebuild: None,
+    }
+    .run::<SilentReporter>()
+    .expect("run BuildModules");
+
+    assert!(ignored.is_empty());
 }
 
 /// Parallel-path variant of [`build_modules_collects_ignored_builds`]
@@ -373,6 +529,7 @@ fn build_modules_collects_ignored_builds_under_concurrency() {
         packages: None,
         allow_build_policy: &policy,
         side_effects_maps_by_snapshot: None,
+        requires_build_by_snapshot: None,
         engine_name: None,
         side_effects_cache: true,
         side_effects_cache_write: false,
@@ -381,11 +538,17 @@ fn build_modules_collects_ignored_builds_under_concurrency() {
         patches: None,
 
         scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        extra_env: &HashMap::new(),
         unsafe_perm: true,
         child_concurrency: 2,
         skipped: &SkippedSnapshots::default(),
         pkg_root_by_key: None,
         gather_ancestor_bin_paths: false,
+        frozen_store: false,
+        ignore_scripts: false,
+        import_method: PackageImportMethod::Auto,
+        logged_methods: &TEST_LOGGED_METHODS,
+        rebuild: None,
     }
     .run::<SilentReporter>()
     .expect("run BuildModules under concurrency");
@@ -433,6 +596,7 @@ fn build_modules_excludes_explicit_deny_from_ignored() {
         packages: None,
         allow_build_policy: &policy,
         side_effects_maps_by_snapshot: None,
+        requires_build_by_snapshot: None,
         engine_name: None,
         side_effects_cache: true,
         side_effects_cache_write: false,
@@ -441,11 +605,17 @@ fn build_modules_excludes_explicit_deny_from_ignored() {
         patches: None,
 
         scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        extra_env: &HashMap::new(),
         unsafe_perm: true,
         child_concurrency: 1,
         skipped: &SkippedSnapshots::default(),
         pkg_root_by_key: None,
         gather_ancestor_bin_paths: false,
+        frozen_store: false,
+        ignore_scripts: false,
+        import_method: PackageImportMethod::Auto,
+        logged_methods: &TEST_LOGGED_METHODS,
+        rebuild: None,
     }
     .run::<SilentReporter>()
     .expect("run BuildModules");
@@ -516,6 +686,7 @@ fn do_not_fail_on_optional_dep_with_failing_postinstall() {
         packages: None,
         allow_build_policy: &policy,
         side_effects_maps_by_snapshot: None,
+        requires_build_by_snapshot: None,
         engine_name: None,
         side_effects_cache: true,
         side_effects_cache_write: false,
@@ -524,11 +695,17 @@ fn do_not_fail_on_optional_dep_with_failing_postinstall() {
         patches: None,
 
         scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        extra_env: &HashMap::new(),
         unsafe_perm: true,
         child_concurrency: 1,
         skipped: &SkippedSnapshots::default(),
         pkg_root_by_key: None,
         gather_ancestor_bin_paths: false,
+        frozen_store: false,
+        ignore_scripts: false,
+        import_method: PackageImportMethod::Auto,
+        logged_methods: &TEST_LOGGED_METHODS,
+        rebuild: None,
     }
     .run::<RecordingReporter>()
     .expect("optional build failure must NOT abort the install");
@@ -557,7 +734,7 @@ fn do_not_fail_on_optional_dep_with_failing_postinstall() {
 ///
 /// Upstream runs the install twice — first to populate the cache
 /// via the WRITE path, then to consume it. Pacquet doesn't have a
-/// WRITE path yet (#421's slice (B)), so we hand-craft the same
+/// WRITE path yet ([#421]'s slice (B)), so we hand-craft the same
 /// state directly: a `side_effects_maps_by_snapshot` entry whose
 /// cache key matches what `BuildModules` will compute via
 /// `calc_dep_state`. With that in place, the gate skips the build
@@ -570,6 +747,8 @@ fn do_not_fail_on_optional_dep_with_failing_postinstall() {
 /// own tests use; if the gate were broken the build would run and
 /// the install would propagate the exit-1 failure (cf.
 /// `fail_when_failing_postinstall_is_required` below).
+///
+/// [#421]: https://github.com/pnpm/pacquet/issues/421
 #[cfg(unix)]
 #[test]
 fn using_side_effects_cache_skips_rebuild() {
@@ -596,6 +775,7 @@ fn using_side_effects_cache_skips_rebuild() {
                             .expect("parse integrity"),
                     },
                 ),
+                version: None,
                 engines: None,
                 cpu: None,
                 os: None,
@@ -619,8 +799,12 @@ fn using_side_effects_cache_skips_rebuild() {
 
     // Compute the cache key the same way `BuildModules` will, then
     // pre-populate `side_effects_maps_by_snapshot` with a matching
-    // entry. The inner FilesMap value is irrelevant for this
-    // assertion — only presence of the key matters for the gate.
+    // entry. The overlay's FilesMap is the post-build file set
+    // (resolved to CAS paths); the gate re-materializes it into the
+    // already-linked slot, so it carries both the pristine
+    // `package.json` and a side-effect file the build would have
+    // produced — proving the cached build output lands on disk
+    // without the script re-running.
     let engine = "darwin;arm64;node20";
     let dep_graph = crate::build_deps_graph(&snapshots, &packages);
     let mut state_cache = pacquet_graph_hasher::DepsStateCache::new();
@@ -634,8 +818,22 @@ fn using_side_effects_cache_skips_rebuild() {
             include_dep_graph_hash: true,
         },
     );
+    let pkg_dir = virtual_store_dir
+        .path()
+        .join("@pnpm.e2e+failing-postinstall@1.0.0")
+        .join("node_modules")
+        .join("@pnpm.e2e/failing-postinstall");
+    let cas_source = tempdir().expect("create temp dir");
+    let side_effect_blob = cas_source.path().join("generated-by-postinstall");
+    fs::write(&side_effect_blob, b"built").expect("write side-effect blob");
     let mut overlay = std::collections::HashMap::new();
-    overlay.insert(expected_cache_key, std::collections::HashMap::new());
+    overlay.insert(
+        expected_cache_key,
+        std::collections::HashMap::from([
+            ("package.json".to_string(), pkg_dir.join("package.json")),
+            ("generated-by-postinstall.js".to_string(), side_effect_blob),
+        ]),
+    );
     let mut side_effects_maps = std::collections::HashMap::new();
     side_effects_maps.insert(pkg_key.clone(), std::sync::Arc::new(overlay));
 
@@ -651,6 +849,7 @@ fn using_side_effects_cache_skips_rebuild() {
         importers: &importers,
         allow_build_policy: &policy,
         side_effects_maps_by_snapshot: Some(&side_effects_maps),
+        requires_build_by_snapshot: None,
         engine_name: Some(engine),
         side_effects_cache: true,
         side_effects_cache_write: false,
@@ -659,11 +858,17 @@ fn using_side_effects_cache_skips_rebuild() {
         patches: None,
 
         scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        extra_env: &HashMap::new(),
         unsafe_perm: true,
         child_concurrency: 1,
         skipped: &SkippedSnapshots::default(),
         pkg_root_by_key: None,
         gather_ancestor_bin_paths: false,
+        frozen_store: false,
+        ignore_scripts: false,
+        import_method: PackageImportMethod::Auto,
+        logged_methods: &TEST_LOGGED_METHODS,
+        rebuild: None,
     }
     .run::<RecordingReporter>()
     .expect("install must succeed when the cache hit skips the rebuild");
@@ -677,6 +882,243 @@ fn using_side_effects_cache_skips_rebuild() {
     let captured = EVENTS.lock().expect("lock").clone();
     let any_lifecycle = captured.iter().any(|e| matches!(e, LogEvent::Lifecycle(_)));
     assert!(!any_lifecycle, "side-effects cache hit must skip lifecycle scripts: {captured:#?}");
+
+    // The script was skipped, but the cached build output still has to
+    // be materialized — the overlay's side-effect file must land in the
+    // slot so the warm reinstall isn't left in its pre-build state.
+    assert!(
+        pkg_dir.join("generated-by-postinstall.js").exists(),
+        "cached side-effect file must be materialized when the gate skips the rebuild",
+    );
+}
+
+/// A cache hit whose overlay can't be materialized (e.g. a side-effects
+/// `added` blob deleted out from under the store — those aren't
+/// re-verified) must not abort the install. It degrades to a cache miss:
+/// the build re-runs over the pristine files and re-seeds the cache,
+/// instead of propagating the import error past the optional-dependency
+/// swallow below.
+#[cfg(unix)]
+#[test]
+fn corrupt_side_effects_cache_falls_back_to_rebuild() {
+    let pkg_key = key("@pnpm.e2e/postinstall-modifies-source", "1.0.0");
+    let snapshots = HashMap::from([(pkg_key.clone(), SnapshotEntry::default())]);
+    let packages: HashMap<pacquet_lockfile::PackageKey, pacquet_lockfile::PackageMetadata> =
+        HashMap::from([(
+            pkg_key.without_peer(),
+            pacquet_lockfile::PackageMetadata {
+                resolution: pacquet_lockfile::LockfileResolution::Registry(
+                    pacquet_lockfile::RegistryResolution {
+                        integrity: "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                            .parse()
+                            .expect("parse integrity"),
+                    },
+                ),
+                version: None,
+                engines: None,
+                cpu: None,
+                os: None,
+                libc: None,
+                deprecated: None,
+                has_bin: None,
+                prepare: None,
+                bundled_dependencies: None,
+                peer_dependencies: None,
+                peer_dependencies_meta: None,
+            },
+        )]);
+    let importers = root_importers(&[("@pnpm.e2e/postinstall-modifies-source", "1.0.0")]);
+    let policy = policy_from_specs([], true);
+
+    let virtual_store_dir = tempdir().expect("create temp dir");
+    let modules_dir = tempdir().expect("create temp dir");
+    let lockfile_dir = tempdir().expect("create temp dir");
+
+    let (pkg_dir, _mode) =
+        create_postinstall_modifies_source_fixture(virtual_store_dir.path(), &pkg_key);
+
+    let engine = "darwin;arm64;node20";
+    let dep_graph = crate::build_deps_graph(&snapshots, &packages);
+    let mut state_cache = pacquet_graph_hasher::DepsStateCache::new();
+    let expected_cache_key = pacquet_graph_hasher::calc_dep_state(
+        &dep_graph,
+        &mut state_cache,
+        &pkg_key,
+        &pacquet_graph_hasher::CalcDepStateOptions {
+            engine_name: engine,
+            patch_file_hash: None,
+            include_dep_graph_hash: true,
+        },
+    );
+    // The overlay points `generated.txt` at a CAS path that doesn't
+    // exist, so `materialize_side_effects` fails — standing in for a
+    // store whose side-effects blob went missing.
+    let overlay = std::collections::HashMap::from([
+        ("package.json".to_string(), pkg_dir.join("package.json")),
+        ("generated.txt".to_string(), virtual_store_dir.path().join("missing-cas-blob")),
+    ]);
+    let mut side_effects_maps = std::collections::HashMap::new();
+    side_effects_maps.insert(
+        pkg_key.clone(),
+        std::sync::Arc::new(HashMap::from([(expected_cache_key, overlay)])),
+    );
+
+    BuildModules {
+        layout: &VirtualStoreLayout::legacy(
+            virtual_store_dir.path(),
+            pacquet_config::default_virtual_store_dir_max_length() as usize,
+        ),
+        modules_dir: modules_dir.path(),
+        lockfile_dir: lockfile_dir.path(),
+        snapshots: Some(&snapshots),
+        packages: Some(&packages),
+        importers: &importers,
+        allow_build_policy: &policy,
+        side_effects_maps_by_snapshot: Some(&side_effects_maps),
+        requires_build_by_snapshot: None,
+        engine_name: Some(engine),
+        side_effects_cache: true,
+        side_effects_cache_write: false,
+        store_dir: None,
+        store_index_writer: None,
+        patches: None,
+
+        scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        extra_env: &HashMap::new(),
+        unsafe_perm: true,
+        child_concurrency: 1,
+        skipped: &SkippedSnapshots::default(),
+        pkg_root_by_key: None,
+        gather_ancestor_bin_paths: false,
+        frozen_store: false,
+        ignore_scripts: false,
+        import_method: PackageImportMethod::Auto,
+        logged_methods: &TEST_LOGGED_METHODS,
+        rebuild: None,
+    }
+    .run::<SilentReporter>()
+    .expect("a corrupt cache overlay must degrade to a rebuild, not abort the install");
+
+    assert!(
+        pkg_dir.join("generated.txt").exists(),
+        "rebuild must run when the cached overlay can't be materialized",
+    );
+}
+
+/// If a failed materialization left the slot without its manifest (a
+/// stage-and-swap that failed mid-replace), the install must not finish
+/// with a silently broken package: a non-optional snapshot surfaces a
+/// hard error rather than falling through to a no-op "rebuild" over the
+/// incomplete directory.
+#[cfg(unix)]
+#[test]
+fn materialization_failure_on_incomplete_slot_is_fatal() {
+    let pkg_key = key("@pnpm.e2e/postinstall-modifies-source", "1.0.0");
+    let snapshots = HashMap::from([(pkg_key.clone(), SnapshotEntry::default())]);
+    let packages: HashMap<pacquet_lockfile::PackageKey, pacquet_lockfile::PackageMetadata> =
+        HashMap::from([(
+            pkg_key.without_peer(),
+            pacquet_lockfile::PackageMetadata {
+                resolution: pacquet_lockfile::LockfileResolution::Registry(
+                    pacquet_lockfile::RegistryResolution {
+                        integrity: "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                            .parse()
+                            .expect("parse integrity"),
+                    },
+                ),
+                version: None,
+                engines: None,
+                cpu: None,
+                os: None,
+                libc: None,
+                deprecated: None,
+                has_bin: None,
+                prepare: None,
+                bundled_dependencies: None,
+                peer_dependencies: None,
+                peer_dependencies_meta: None,
+            },
+        )]);
+    let importers = root_importers(&[("@pnpm.e2e/postinstall-modifies-source", "1.0.0")]);
+    let policy = policy_from_specs([], true);
+
+    let virtual_store_dir = tempdir().expect("create temp dir");
+    let modules_dir = tempdir().expect("create temp dir");
+    let lockfile_dir = tempdir().expect("create temp dir");
+
+    // A slot directory that exists but has lost its manifest — the state a
+    // stage-and-swap failure would leave behind.
+    let (pkg_dir, _mode) =
+        create_postinstall_modifies_source_fixture(virtual_store_dir.path(), &pkg_key);
+    fs::remove_file(pkg_dir.join("package.json")).expect("remove manifest");
+
+    let engine = "darwin;arm64;node20";
+    let dep_graph = crate::build_deps_graph(&snapshots, &packages);
+    let mut state_cache = pacquet_graph_hasher::DepsStateCache::new();
+    let expected_cache_key = pacquet_graph_hasher::calc_dep_state(
+        &dep_graph,
+        &mut state_cache,
+        &pkg_key,
+        &pacquet_graph_hasher::CalcDepStateOptions {
+            engine_name: engine,
+            patch_file_hash: None,
+            include_dep_graph_hash: true,
+        },
+    );
+    // Overlay points at a non-existent CAS blob, so materialization fails.
+    let overlay = std::collections::HashMap::from([(
+        "generated.txt".to_string(),
+        virtual_store_dir.path().join("missing-cas-blob"),
+    )]);
+    let mut side_effects_maps = std::collections::HashMap::new();
+    side_effects_maps.insert(
+        pkg_key.clone(),
+        std::sync::Arc::new(HashMap::from([(expected_cache_key, overlay)])),
+    );
+    // `requires_build` must be forced on: the gate is only reached for a
+    // build candidate, and the manifest-less slot would otherwise probe as
+    // not-requiring-build.
+    let requires_build: RequiresBuildBySnapshot = HashMap::from([(pkg_key.clone(), true)]);
+
+    let result = BuildModules {
+        layout: &VirtualStoreLayout::legacy(
+            virtual_store_dir.path(),
+            pacquet_config::default_virtual_store_dir_max_length() as usize,
+        ),
+        modules_dir: modules_dir.path(),
+        lockfile_dir: lockfile_dir.path(),
+        snapshots: Some(&snapshots),
+        packages: Some(&packages),
+        importers: &importers,
+        allow_build_policy: &policy,
+        side_effects_maps_by_snapshot: Some(&side_effects_maps),
+        requires_build_by_snapshot: Some(&requires_build),
+        engine_name: Some(engine),
+        side_effects_cache: true,
+        side_effects_cache_write: false,
+        store_dir: None,
+        store_index_writer: None,
+        patches: None,
+
+        scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        extra_env: &HashMap::new(),
+        unsafe_perm: true,
+        child_concurrency: 1,
+        skipped: &SkippedSnapshots::default(),
+        pkg_root_by_key: None,
+        gather_ancestor_bin_paths: false,
+        frozen_store: false,
+        ignore_scripts: false,
+        import_method: PackageImportMethod::Auto,
+        logged_methods: &TEST_LOGGED_METHODS,
+        rebuild: None,
+    }
+    .run::<SilentReporter>();
+
+    assert!(
+        result.is_err(),
+        "a non-optional package whose slot lost its manifest must fail the install, not finish broken",
+    );
 }
 
 /// Negative pair: with `side_effects_cache = false`, even a
@@ -718,6 +1160,7 @@ fn side_effects_cache_disabled_bypasses_the_gate() {
         importers: &importers,
         allow_build_policy: &policy,
         side_effects_maps_by_snapshot: Some(&side_effects_maps),
+        requires_build_by_snapshot: None,
         engine_name: Some("darwin;arm64;node20"),
         side_effects_cache: false,
         side_effects_cache_write: false,
@@ -726,11 +1169,17 @@ fn side_effects_cache_disabled_bypasses_the_gate() {
         patches: None,
 
         scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        extra_env: &HashMap::new(),
         unsafe_perm: true,
         child_concurrency: 1,
         skipped: &SkippedSnapshots::default(),
         pkg_root_by_key: None,
         gather_ancestor_bin_paths: false,
+        frozen_store: false,
+        ignore_scripts: false,
+        import_method: PackageImportMethod::Auto,
+        logged_methods: &TEST_LOGGED_METHODS,
+        rebuild: None,
     }
     .run::<SilentReporter>()
     .expect_err("with cache disabled, the failing postinstall must run and the install must fail");
@@ -778,6 +1227,7 @@ fn fail_when_failing_postinstall_is_required() {
         packages: None,
         allow_build_policy: &policy,
         side_effects_maps_by_snapshot: None,
+        requires_build_by_snapshot: None,
         engine_name: None,
         side_effects_cache: true,
         side_effects_cache_write: false,
@@ -786,16 +1236,175 @@ fn fail_when_failing_postinstall_is_required() {
         patches: None,
 
         scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        extra_env: &HashMap::new(),
         unsafe_perm: true,
         child_concurrency: 1,
         skipped: &SkippedSnapshots::default(),
         pkg_root_by_key: None,
         gather_ancestor_bin_paths: false,
+        frozen_store: false,
+        ignore_scripts: false,
+        import_method: PackageImportMethod::Auto,
+        logged_methods: &TEST_LOGGED_METHODS,
+        rebuild: None,
     }
     .run::<SilentReporter>()
     .expect_err("required build failure must propagate");
     eprintln!("ERR: {err}");
     assert!(matches!(err, crate::build_modules::BuildModulesError::LifecycleScript(_)));
+}
+
+// --- frozen-store build backstop ---------------------------------------
+
+/// A `pnpm-workspace.yaml`-shaped patch entry for one package. The
+/// `patch_file_path` is left `None` because the frozen-store backstop
+/// fires before any patch application — the entry only has to make
+/// `has_patch` true and land the snapshot in the build sequence.
+fn single_patch(key: &PackageKey) -> HashMap<PackageKey, pacquet_patching::ExtendedPatchInfo> {
+    HashMap::from([(
+        key.without_peer(),
+        pacquet_patching::ExtendedPatchInfo {
+            hash: "deadbeef".to_string(),
+            patch_file_path: None,
+            key: key.without_peer().to_string(),
+        },
+    )])
+}
+
+/// Build a global-virtual-store [`VirtualStoreLayout`] for a backstop
+/// test. `snapshots: None` short-circuits [`VirtualStoreLayout::new`]
+/// to an empty `gvs_suffixes` map, which is all the backstop needs —
+/// it queries [`VirtualStoreLayout::enable_global_virtual_store`]
+/// (true iff `gvs_suffixes.is_some()`) and fires before any slot-dir
+/// lookup.
+fn gvs_layout(dir: &Path) -> &'static VirtualStoreLayout {
+    let mut config = Config::new();
+    config.enable_global_virtual_store = true;
+    config.store_dir = dir.join("store").into();
+    config.global_virtual_store_dir = dir.join("store/links");
+    config.virtual_store_dir = dir.join("node_modules/.pacquet");
+    let config = config.leak();
+    Box::leak(Box::new(VirtualStoreLayout::new(config, None, None, None, None)))
+}
+
+/// Run [`BuildModules`] over a single patched `is-positive@1.0.0`
+/// snapshot, varying only `layout`, `frozen_store`, and the snapshot's
+/// `optional` flag — the three backstop inputs. No on-disk fixture: the
+/// snapshot's slot never materializes, so on paths that skip the
+/// backstop the run no-ops at the `!pkg_dir.exists()` guard rather than
+/// touching the (absent) patch file.
+fn frozen_backstop_run(
+    layout: &VirtualStoreLayout,
+    frozen_store: bool,
+    optional: bool,
+) -> Result<Vec<String>, crate::build_modules::BuildModulesError> {
+    let pkg_key = key("is-positive", "1.0.0");
+    let snapshots =
+        HashMap::from([(pkg_key.clone(), SnapshotEntry { optional, ..SnapshotEntry::default() })]);
+    let patches = single_patch(&pkg_key);
+    let importers = root_importers(&[("is-positive", "1.0.0")]);
+    let policy = policy_from_specs([], false);
+    let modules_dir = tempdir().expect("create temp dir");
+    let lockfile_dir = tempdir().expect("create temp dir");
+
+    BuildModules {
+        layout,
+        modules_dir: modules_dir.path(),
+        lockfile_dir: lockfile_dir.path(),
+        snapshots: Some(&snapshots),
+        packages: None,
+        importers: &importers,
+        allow_build_policy: &policy,
+        side_effects_maps_by_snapshot: None,
+        requires_build_by_snapshot: None,
+        engine_name: None,
+        side_effects_cache: false,
+        side_effects_cache_write: false,
+        store_dir: None,
+        store_index_writer: None,
+        patches: Some(&patches),
+
+        scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        extra_env: &HashMap::new(),
+        unsafe_perm: true,
+        child_concurrency: 1,
+        skipped: &SkippedSnapshots::default(),
+        pkg_root_by_key: None,
+        gather_ancestor_bin_paths: false,
+        frozen_store,
+        ignore_scripts: false,
+        import_method: PackageImportMethod::Auto,
+        logged_methods: &TEST_LOGGED_METHODS,
+        rebuild: None,
+    }
+    .run::<SilentReporter>()
+}
+
+/// Positive: under the global virtual store, a patched package whose
+/// build output is missing from the read-only store refuses up front
+/// with `ERR_PNPM_FROZEN_STORE_NEEDS_BUILD` rather than crashing on a
+/// raw `EROFS` when `apply_patch_to_dir` tries to write into the store.
+/// Mirrors the TS unit test
+/// `frozenStore + GVS: a patched package that is not cached refuses up front`.
+#[test]
+fn frozen_store_gvs_patch_not_seeded_refuses() {
+    let store_dir = tempdir().expect("create temp dir");
+    let layout = gvs_layout(store_dir.path());
+
+    let err = frozen_backstop_run(layout, true, false)
+        .expect_err("a missing patched build under a frozen GVS store must refuse up front");
+    assert!(
+        matches!(err, crate::build_modules::BuildModulesError::FrozenStoreNeedsBuild { .. }),
+        "expected FrozenStoreNeedsBuild, got {err:?}",
+    );
+}
+
+/// An optional patched snapshot must not block the install: a build or
+/// patch failure on an optional dependency is non-fatal at runtime, so
+/// the backstop skips its build (emitting the skipped-optional log)
+/// instead of refusing. Mirrors the TS unit test
+/// `frozenStore + GVS: an optional patched package that is not cached is skipped, not blocked`.
+#[test]
+fn frozen_store_gvs_optional_not_seeded_skips() {
+    let store_dir = tempdir().expect("create temp dir");
+    let layout = gvs_layout(store_dir.path());
+
+    let ignored = frozen_backstop_run(layout, true, true)
+        .expect("an optional un-seeded build must be skipped, not refused");
+    assert!(ignored.is_empty(), "no scripts to ignore for a patched-only snapshot: {ignored:?}");
+}
+
+/// Negative control: the same patched, un-seeded snapshot does NOT trip
+/// the backstop when `frozen_store` is off — proving the flag is
+/// load-bearing. With no fixture on disk the run no-ops at the
+/// `!pkg_dir.exists()` guard, so it returns `Ok` rather than attempting
+/// to apply the (absent) patch file.
+#[test]
+fn gvs_without_frozen_store_does_not_trip_backstop() {
+    let store_dir = tempdir().expect("create temp dir");
+    let layout = gvs_layout(store_dir.path());
+
+    let ignored = frozen_backstop_run(layout, false, false)
+        .expect("without frozen_store the backstop must not fire");
+    assert!(ignored.is_empty(), "no scripts to ignore for a patched-only snapshot: {ignored:?}");
+}
+
+/// Negative control: under the legacy (non-GVS) layout, package
+/// directories live under the writable project-local virtual store, so
+/// the backstop is correctly inert even with `frozen_store` enabled —
+/// builds and patches there never touch the read-only store. Mirrors
+/// the TS unit test `frozenStore without GVS: ... is not blocked`.
+#[test]
+fn frozen_store_without_gvs_does_not_trip_backstop() {
+    let virtual_store_dir = tempdir().expect("create temp dir");
+    let layout = VirtualStoreLayout::legacy(
+        virtual_store_dir.path(),
+        pacquet_config::default_virtual_store_dir_max_length() as usize,
+    );
+
+    let ignored = frozen_backstop_run(&layout, true, false)
+        .expect("the non-GVS layout writes to the project store, so the backstop must not fire");
+    assert!(ignored.is_empty(), "no scripts to ignore for a patched-only snapshot: {ignored:?}");
 }
 
 /// Materialize a package fixture whose contents are byte-identical
@@ -828,7 +1437,7 @@ fn create_failing_postinstall_fixture(virtual_store_dir: &Path, key: &PackageKey
 /// for the package list. The frozen-install path emits this once after
 /// `BuildModules::run` returns; this test exercises the equivalent
 /// emit shape directly so `LogEvent::IgnoredScripts` stays connected
-/// to the BuildModules return value.
+/// to the `BuildModules` return value.
 #[test]
 fn ignored_scripts_event_carries_returned_names() {
     static EVENTS: Mutex<Vec<LogEvent>> = Mutex::new(Vec::new());
@@ -845,6 +1454,7 @@ fn ignored_scripts_event_carries_returned_names() {
     RecordingReporter::emit(&LogEvent::IgnoredScripts(IgnoredScriptsLog {
         level: pacquet_reporter::LogLevel::Debug,
         package_names: names.clone(),
+        strict_dep_builds: false,
     }));
 
     let captured = EVENTS.lock().expect("lock").clone();
@@ -868,7 +1478,7 @@ fn ignored_scripts_event_carries_returned_names() {
 /// Returns the package directory path and the actual file mode of
 /// `index.js`. The mode is read from disk because `fs::write()`
 /// assigns permissions according to the process umask (typically
-/// 0022 → 0o644, but 0002 → 0o664 when pam_umask's `usergroups`
+/// 0022 → 0o644, but 0002 → 0o664 when `pam_umask`'s `usergroups`
 /// logic matches UID to group name, the default on Debian for
 /// non-root users). Callers that pre-seed store rows should use
 /// this returned mode so `calculate_diff()` doesn't flag a
@@ -940,6 +1550,7 @@ async fn write_path_populates_side_effects_row() {
                         integrity: integrity_str.parse().expect("parse integrity"),
                     },
                 ),
+                version: None,
                 engines: None,
                 cpu: None,
                 os: None,
@@ -1030,6 +1641,7 @@ async fn write_path_populates_side_effects_row() {
         importers: &importers,
         allow_build_policy: &policy,
         side_effects_maps_by_snapshot: None,
+        requires_build_by_snapshot: None,
         engine_name: Some(engine),
         side_effects_cache: true,
         side_effects_cache_write: true,
@@ -1038,11 +1650,17 @@ async fn write_path_populates_side_effects_row() {
         patches: None,
 
         scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        extra_env: &HashMap::new(),
         unsafe_perm: true,
         child_concurrency: 1,
         skipped: &SkippedSnapshots::default(),
         pkg_root_by_key: None,
         gather_ancestor_bin_paths: false,
+        frozen_store: false,
+        ignore_scripts: false,
+        import_method: PackageImportMethod::Auto,
+        logged_methods: &TEST_LOGGED_METHODS,
+        rebuild: None,
     }
     .run::<SilentReporter>()
     .expect("build modules must complete cleanly");
@@ -1090,6 +1708,7 @@ async fn write_path_disabled_skips_upload() {
                         integrity: integrity_str.parse().expect("parse integrity"),
                     },
                 ),
+                version: None,
                 engines: None,
                 cpu: None,
                 os: None,
@@ -1143,6 +1762,7 @@ async fn write_path_disabled_skips_upload() {
         importers: &importers,
         allow_build_policy: &policy,
         side_effects_maps_by_snapshot: None,
+        requires_build_by_snapshot: None,
         engine_name: Some("darwin;arm64;node20"),
         side_effects_cache: true,
         side_effects_cache_write: false,
@@ -1151,11 +1771,17 @@ async fn write_path_disabled_skips_upload() {
         patches: None,
 
         scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        extra_env: &HashMap::new(),
         unsafe_perm: true,
         child_concurrency: 1,
         skipped: &SkippedSnapshots::default(),
         pkg_root_by_key: None,
         gather_ancestor_bin_paths: false,
+        frozen_store: false,
+        ignore_scripts: false,
+        import_method: PackageImportMethod::Auto,
+        logged_methods: &TEST_LOGGED_METHODS,
+        rebuild: None,
     }
     .run::<SilentReporter>()
     .expect("build modules must complete cleanly");
@@ -1173,7 +1799,7 @@ async fn write_path_disabled_skips_upload() {
 ///
 /// Upstream stubs `opts.storeController.upload` to throw and
 /// asserts the install completes (the postinstall ran, the
-/// generated file is on disk) but the SQLite row's `side_effects`
+/// generated file is on disk) but the `SQLite` row's `side_effects`
 /// stays empty.
 ///
 /// Pacquet has no DI seam for the upload, but the WRITE path's
@@ -1204,6 +1830,7 @@ async fn upload_error_does_not_interrupt_install() {
                         integrity: integrity_str.parse().expect("parse integrity"),
                     },
                 ),
+                version: None,
                 engines: None,
                 cpu: None,
                 os: None,
@@ -1264,6 +1891,7 @@ async fn upload_error_does_not_interrupt_install() {
         importers: &importers,
         allow_build_policy: &policy,
         side_effects_maps_by_snapshot: None,
+        requires_build_by_snapshot: None,
         engine_name: Some("darwin;arm64;node20"),
         side_effects_cache: true,
         side_effects_cache_write: true,
@@ -1272,11 +1900,17 @@ async fn upload_error_does_not_interrupt_install() {
         patches: None,
 
         scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        extra_env: &HashMap::new(),
         unsafe_perm: true,
         child_concurrency: 1,
         skipped: &SkippedSnapshots::default(),
         pkg_root_by_key: None,
         gather_ancestor_bin_paths: false,
+        frozen_store: false,
+        ignore_scripts: false,
+        import_method: PackageImportMethod::Auto,
+        logged_methods: &TEST_LOGGED_METHODS,
+        rebuild: None,
     }
     .run::<SilentReporter>()
     .expect("upload failure must not propagate; install continues");
@@ -1284,9 +1918,6 @@ async fn upload_error_does_not_interrupt_install() {
     drop(writer);
     writer_task.await.expect("await writer").expect("writer succeeds");
 
-    // The postinstall-generated artifact is on disk — proves the
-    // build ran end-to-end and the swallowed upload error didn't
-    // short-circuit the loop.
     assert!(
         pkg_dir.join("generated.txt").exists(),
         "postinstall-created file must be present after a swallowed upload failure",
@@ -1384,6 +2015,7 @@ async fn write_path_cache_key_includes_patch_hash() {
                         integrity: integrity_str.parse().expect("parse integrity"),
                     },
                 ),
+                version: None,
                 engines: None,
                 cpu: None,
                 os: None,
@@ -1496,6 +2128,7 @@ new file mode 100644
         importers: &importers,
         allow_build_policy: &policy,
         side_effects_maps_by_snapshot: None,
+        requires_build_by_snapshot: None,
         engine_name: Some(engine),
         side_effects_cache: true,
         side_effects_cache_write: true,
@@ -1504,11 +2137,17 @@ new file mode 100644
         patches: Some(&patches),
 
         scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        extra_env: &HashMap::new(),
         unsafe_perm: true,
         child_concurrency: 1,
         skipped: &SkippedSnapshots::default(),
         pkg_root_by_key: None,
         gather_ancestor_bin_paths: false,
+        frozen_store: false,
+        ignore_scripts: false,
+        import_method: PackageImportMethod::Auto,
+        logged_methods: &TEST_LOGGED_METHODS,
+        rebuild: None,
     }
     .run::<SilentReporter>()
     .expect("build modules must complete cleanly");
@@ -1605,6 +2244,7 @@ new file mode 100644
         importers: &importers,
         allow_build_policy: &policy,
         side_effects_maps_by_snapshot: None,
+        requires_build_by_snapshot: None,
         engine_name: None,
         side_effects_cache: false,
         side_effects_cache_write: false,
@@ -1613,11 +2253,17 @@ new file mode 100644
         patches: Some(&patches),
 
         scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        extra_env: &HashMap::new(),
         unsafe_perm: true,
         child_concurrency: 1,
         skipped: &SkippedSnapshots::default(),
         pkg_root_by_key: None,
         gather_ancestor_bin_paths: false,
+        frozen_store: false,
+        ignore_scripts: false,
+        import_method: PackageImportMethod::Auto,
+        logged_methods: &TEST_LOGGED_METHODS,
+        rebuild: None,
     }
     .run::<SilentReporter>()
     .expect("build modules must complete cleanly");
@@ -1685,6 +2331,7 @@ async fn missing_patch_file_path_errors_with_diagnostic() {
         importers: &importers,
         allow_build_policy: &policy,
         side_effects_maps_by_snapshot: None,
+        requires_build_by_snapshot: None,
         engine_name: None,
         side_effects_cache: false,
         side_effects_cache_write: false,
@@ -1693,11 +2340,17 @@ async fn missing_patch_file_path_errors_with_diagnostic() {
         patches: Some(&patches),
 
         scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        extra_env: &HashMap::new(),
         unsafe_perm: true,
         child_concurrency: 1,
         skipped: &SkippedSnapshots::default(),
         pkg_root_by_key: None,
         gather_ancestor_bin_paths: false,
+        frozen_store: false,
+        ignore_scripts: false,
+        import_method: PackageImportMethod::Auto,
+        logged_methods: &TEST_LOGGED_METHODS,
+        rebuild: None,
     }
     .run::<SilentReporter>()
     .expect_err("missing patch_file_path must surface as PatchFilePathMissing");
@@ -1851,4 +2504,120 @@ fn pkg_root_for_key_hoisted_missing_returns_none() {
 
     let result = super::pkg_root_for_key(&layout, Some(&map), &key);
     assert!(result.is_none(), "absent key surfaces None, got {result:?}");
+}
+
+#[test]
+fn allow_build_key_strips_version_for_registry_packages() {
+    // Registry depPaths reduce to the bare package name — the
+    // `allowBuilds` key a user would approve them under.
+    assert_eq!(allow_build_key_from_ignored_build("esbuild@0.17.0"), "esbuild");
+    assert_eq!(
+        allow_build_key_from_ignored_build("@pnpm.e2e/install-script-example@1.0.0"),
+        "@pnpm.e2e/install-script-example",
+    );
+}
+
+#[test]
+fn allow_build_key_ignores_patch_hash_when_deriving_name() {
+    // A `(patch_hash=...)` segment is dropped before the version is checked,
+    // so a patched registry package still reduces to its name.
+    assert_eq!(allow_build_key_from_ignored_build("esbuild@0.17.0(patch_hash=abcdef)"), "esbuild");
+}
+
+#[test]
+fn allow_build_key_keeps_full_id_for_non_semver_artifacts() {
+    // Git / tarball artifacts have a non-semver "version", so the whole
+    // pkgId is the key — the name alone must not approve their builds.
+    let git = "foo@github.com/foo/bar#0123456789";
+    assert_eq!(allow_build_key_from_ignored_build(git), git);
+
+    // Ignored-build entries are depPath-shaped (`name@<resolution>`); a
+    // tarball's non-semver resolution keeps the whole pkgId as the key.
+    let tarball = "foo@https://example.com/foo.tgz";
+    assert_eq!(allow_build_key_from_ignored_build(tarball), tarball);
+}
+
+/// Like [`create_buildable_pkg`], but the postinstall writes a `built-marker`
+/// file into the package directory so a test can observe whether the script
+/// actually ran.
+#[cfg(unix)]
+fn create_marker_pkg(virtual_store_dir: &Path, key: &PackageKey) -> PathBuf {
+    let key_str = key.without_peer().to_string();
+    let name_version = key_str.strip_prefix('/').unwrap_or(&key_str);
+    let at_idx = name_version.rfind('@').unwrap_or(name_version.len());
+    let pkg_name = &name_version[..at_idx];
+    let store_name = name_version.replace('/', "+");
+    let pkg_dir = virtual_store_dir.join(&store_name).join("node_modules").join(pkg_name);
+    fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+    let manifest = serde_json::json!({
+        "scripts": { "postinstall": "echo ran > built-marker" },
+    });
+    fs::write(pkg_dir.join("package.json"), manifest.to_string()).expect("write manifest");
+    pkg_dir
+}
+
+/// A `pacquet rebuild <pkg>` with a selection runs scripts ONLY for the
+/// selected package, even with the side-effects cache disabled (so its
+/// `is_built` short-circuit cannot fire). Both packages are allowed to
+/// build, so without the rebuild-selection gate `zzz` would also run.
+#[cfg(unix)]
+#[test]
+fn rebuild_selection_runs_only_selected_scripts() {
+    let snapshots = HashMap::from([
+        (key("aaa", "1.0.0"), SnapshotEntry::default()),
+        (key("zzz", "1.0.0"), SnapshotEntry::default()),
+    ]);
+    let importers = root_importers(&[("aaa", "1.0.0"), ("zzz", "1.0.0")]);
+    let policy = policy_from_specs([("aaa", true), ("zzz", true)], false);
+
+    let virtual_store_dir = tempdir().expect("create temp dir");
+    let modules_dir = tempdir().expect("create temp dir");
+    let lockfile_dir = tempdir().expect("create temp dir");
+
+    let aaa_dir = create_marker_pkg(virtual_store_dir.path(), &key("aaa", "1.0.0"));
+    let zzz_dir = create_marker_pkg(virtual_store_dir.path(), &key("zzz", "1.0.0"));
+
+    let rebuild =
+        RebuildOptions { selected_names: Some(std::iter::once("aaa".to_string()).collect()) };
+
+    BuildModules {
+        layout: &VirtualStoreLayout::legacy(
+            virtual_store_dir.path(),
+            pacquet_config::default_virtual_store_dir_max_length() as usize,
+        ),
+        modules_dir: modules_dir.path(),
+        lockfile_dir: lockfile_dir.path(),
+        snapshots: Some(&snapshots),
+        importers: &importers,
+        packages: None,
+        allow_build_policy: &policy,
+        side_effects_maps_by_snapshot: None,
+        requires_build_by_snapshot: None,
+        engine_name: None,
+        side_effects_cache: false,
+        side_effects_cache_write: false,
+        store_dir: None,
+        store_index_writer: None,
+        patches: None,
+        scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        extra_env: &HashMap::new(),
+        unsafe_perm: true,
+        child_concurrency: 1,
+        skipped: &SkippedSnapshots::default(),
+        pkg_root_by_key: None,
+        gather_ancestor_bin_paths: false,
+        frozen_store: false,
+        ignore_scripts: false,
+        import_method: PackageImportMethod::Auto,
+        logged_methods: &TEST_LOGGED_METHODS,
+        rebuild: Some(&rebuild),
+    }
+    .run::<SilentReporter>()
+    .expect("rebuild runs");
+
+    assert!(aaa_dir.join("built-marker").exists(), "the selected package's script ran");
+    assert!(
+        !zzz_dir.join("built-marker").exists(),
+        "the non-selected package's script must not run",
+    );
 }

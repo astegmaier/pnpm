@@ -6,33 +6,60 @@ use crate::error::PreparePackageError;
 use pacquet_executor::ScriptsPrependNodePath;
 use pacquet_reporter::SilentReporter;
 use serde_json::json;
-use std::{collections::HashMap, fs, path::Path, sync::OnceLock};
+use std::{collections::HashMap, fs, path::Path, sync::LazyLock};
 use tempfile::tempdir;
 
 /// A single process-wide empty env map shared across every test
-/// invocation. `OnceLock` avoids the per-call `Box::leak(Box::new(...))`
-/// that an earlier version of this helper used — the leak was benign
-/// because the test binary exits quickly, but accumulating one fresh
-/// allocation per test isn't necessary when every site wants the same
-/// value.
+/// invocation.
 fn empty_env() -> &'static HashMap<String, String> {
-    static M: OnceLock<HashMap<String, String>> = OnceLock::new();
-    M.get_or_init(HashMap::new)
+    static EMPTY_ENV: LazyLock<HashMap<String, String>> = LazyLock::new(HashMap::new);
+    &EMPTY_ENV
 }
 
 fn write_manifest(dir: &Path, manifest: &serde_json::Value) {
     fs::write(dir.join("package.json"), serde_json::to_string(manifest).unwrap()).unwrap();
 }
 
-/// Build an `Options` value whose `allow_build` closure routes through
-/// the bool the test specifies. Other knobs default to "noop, no
-/// scripts run" so the test doesn't actually spawn anything unless we
-/// want it to.
 fn opts<'a>(allow: bool, ignore_scripts: bool) -> PreparePackageOptions<'a> {
     static EMPTY_BIN_PATHS: &[std::path::PathBuf] = &[];
     PreparePackageOptions {
-        allow_build: Box::new(move |_name, _version| allow),
+        allow_build: Box::new(move |_dep_path| allow),
+        dep_path: "x@https://example.com/x.tgz",
         ignore_scripts,
+        unsafe_perm: true,
+        user_agent: None,
+        scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        script_shell: None,
+        node_execpath: None,
+        npm_execpath: None,
+        extra_bin_paths: EMPTY_BIN_PATHS,
+        extra_env: empty_env(),
+    }
+}
+
+fn opts_allow_registry_artifacts_only<'a>() -> PreparePackageOptions<'a> {
+    static EMPTY_BIN_PATHS: &[std::path::PathBuf] = &[];
+    PreparePackageOptions {
+        allow_build: Box::new(move |dep_path| !dep_path.contains("://")),
+        dep_path: "x@https://example.com/x.tgz",
+        ignore_scripts: false,
+        unsafe_perm: true,
+        user_agent: None,
+        scripts_prepend_node_path: ScriptsPrependNodePath::Never,
+        script_shell: None,
+        node_execpath: None,
+        npm_execpath: None,
+        extra_bin_paths: EMPTY_BIN_PATHS,
+        extra_env: empty_env(),
+    }
+}
+
+fn opts_allow_dep_path(dep_path: &str) -> PreparePackageOptions<'_> {
+    static EMPTY_BIN_PATHS: &[std::path::PathBuf] = &[];
+    PreparePackageOptions {
+        allow_build: Box::new(move |actual_dep_path| actual_dep_path == dep_path),
+        dep_path,
+        ignore_scripts: false,
         unsafe_perm: true,
         user_agent: None,
         scripts_prepend_node_path: ScriptsPrependNodePath::Never,
@@ -69,7 +96,6 @@ fn package_should_be_built_false_when_main_exists_and_prepare_absent() {
         "name": "x", "version": "0.0.0",
         "scripts": { "prepublish": "true" },
     });
-    // Prepublish is set, main exists → upstream says "don't build".
     assert!(!package_should_be_built(&manifest, dir.path()));
 }
 
@@ -144,10 +170,53 @@ fn prepare_rejects_when_allow_build_returns_false() {
 }
 
 #[test]
+fn prepare_rejects_untrusted_manifest_identity() {
+    let dir = tempdir().unwrap();
+    write_manifest(
+        dir.path(),
+        &json!({
+            "name": "naughty", "version": "1.0.0",
+            "scripts": { "prepare": "tsc" },
+        }),
+    );
+
+    let err =
+        prepare_package::<SilentReporter>(&opts_allow_registry_artifacts_only(), dir.path(), None)
+            .unwrap_err();
+    match err {
+        PreparePackageError::NotAllowed { name, version } => {
+            assert_eq!(name, "naughty");
+            assert_eq!(version, "1.0.0");
+        }
+        other => panic!("expected NotAllowed, got {other:?}"),
+    }
+}
+
+#[test]
+fn prepare_allows_untrusted_manifest_identity_by_dep_path() {
+    let dir = tempdir().unwrap();
+    write_manifest(
+        dir.path(),
+        &json!({
+            "name": "trusted-name",
+            "version": "1.0.0",
+            "scripts": { "prepack": r#"node -e "require('fs').writeFileSync('built.txt', 'ok')""# },
+        }),
+    );
+
+    let dep_path = "trusted-name@git+https://example.com/org/repo.git#abc123";
+    let result =
+        prepare_package::<SilentReporter>(&opts_allow_dep_path(dep_path), dir.path(), None)
+            .expect("depPath-specific allow should permit prepare");
+
+    assert!(result.should_be_built);
+    assert!(dir.path().join("built.txt").exists());
+}
+
+#[test]
 fn safe_join_path_rejects_escapes() {
     let dir = tempdir().unwrap();
     let root = dir.path();
-    // `..` escape — canonical form lives outside `root`.
     let err = safe_join_path(root, Some("../escape")).unwrap_err();
     assert!(matches!(err, PreparePackageError::InvalidPath { .. }));
 }

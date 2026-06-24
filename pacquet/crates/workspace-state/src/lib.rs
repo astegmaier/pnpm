@@ -4,7 +4,7 @@
 //! <https://github.com/pnpm/pnpm/blob/7ff112bac6/workspace/state/src/index.ts>.
 //!
 //! The file records what an install actually used (project list,
-//! resolved settings, pnpmfiles, …) so the next `pnpm run` invocation
+//! resolved settings, pnpmfiles, ...) so the next `pnpm run` invocation
 //! can decide whether `node_modules` is still up to date without
 //! re-resolving anything. Mirroring the on-disk shape byte-for-byte
 //! lets pnpm read state written by pacquet — that's what closes the
@@ -17,10 +17,12 @@ use pacquet_diagnostics::miette::{self, Diagnostic};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs, io,
+    fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+use tempfile::NamedTempFile;
 
 /// Basename of the workspace-state file, written inside `node_modules/`.
 ///
@@ -30,6 +32,7 @@ pub const WORKSPACE_STATE_FILENAME: &str = ".pnpm-workspace-state-v1.json";
 
 /// `<workspace_dir>/node_modules/.pnpm-workspace-state-v1.json`. Same
 /// resolution as upstream's [`getFilePath`](https://github.com/pnpm/pnpm/blob/7ff112bac6/workspace/state/src/filePath.ts).
+#[must_use]
 pub fn get_file_path(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join("node_modules").join(WORKSPACE_STATE_FILENAME)
 }
@@ -43,6 +46,27 @@ pub struct ProjectEntry {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+}
+
+/// A single `configDependencies` value. Mirrors pnpm's
+/// `VersionWithIntegrity | { tarball?, integrity }` at
+/// <https://github.com/pnpm/pnpm/blob/7ff112bac6/core/types/src/package.ts>.
+/// Untagged so it round-trips both shapes verbatim; pnpm compares the
+/// recorded value against the live config with a deep, order-independent
+/// equality check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ConfigDependency {
+    VersionWithIntegrity(String),
+    Detailed(ConfigDependencyDetail),
+}
+
+/// The `{ tarball?, integrity }` form of a [`ConfigDependency`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigDependencyDetail {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tarball: Option<String>,
+    pub integrity: String,
 }
 
 /// Typed view of `.pnpm-workspace-state-v1.json`.
@@ -59,7 +83,7 @@ pub struct WorkspaceState {
     pub pnpmfiles: Vec<String>,
     pub filtered_install: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config_dependencies: Option<BTreeMap<String, String>>,
+    pub config_dependencies: Option<BTreeMap<String, ConfigDependency>>,
     pub settings: WorkspaceStateSettings,
 }
 
@@ -68,10 +92,11 @@ pub struct WorkspaceState {
 /// <https://github.com/pnpm/pnpm/blob/7ff112bac6/workspace/state/src/types.ts>.
 ///
 /// Every field is `Option` so pacquet can omit settings it does not
-/// track yet; missing keys round-trip as JSON `undefined`, which pnpm's
-/// `Object.entries(workspaceState.settings)` loop simply skips. Match
-/// what the install actually used — if pacquet's resolved value differs
-/// from pnpm's, pnpm correctly reinstalls.
+/// track yet. pnpm iterates the full `WORKSPACE_STATE_SETTING_KEYS`
+/// list and reads an omitted key as `undefined`, so a key pacquet omits
+/// stays compatible only while pnpm's resolved value for it is also
+/// `undefined`. Match what the install actually used — if pacquet's
+/// resolved value differs from pnpm's, pnpm correctly reinstalls.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceStateSettings {
@@ -91,6 +116,13 @@ pub struct WorkspaceStateSettings {
     pub dedupe_peers: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dev: Option<bool>,
+    /// `None` and `Some(false)` both mean "global virtual store off" —
+    /// pnpm omits the key for its `undefined` default and only writes a
+    /// concrete value when `--global` (always `true`) or CI (`false`)
+    /// forces one. The freshness check coerces the two off-forms before
+    /// comparing (see `enable_global_virtual_store_match`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_global_virtual_store: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude_links_from_lockfile: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,6 +135,17 @@ pub struct WorkspaceStateSettings {
     pub inject_workspace_packages: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link_workspace_packages: Option<serde_json::Value>,
+    /// Minutes a published version must age before it may be installed.
+    /// pnpm resolves this to a concrete `24 * 60` default, so it must be
+    /// recorded for pnpm's all-key freshness check to stay on the fast
+    /// path after a pacquet install.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_release_age: Option<u64>,
+    /// Whether versions whose registry metadata lacks a `time` field
+    /// pass the maturity check. pnpm defaults this to `true`, so it is
+    /// recorded for the same reason as [`Self::minimum_release_age`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_release_age_ignore_missing_time: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_linker: Option<NodeLinker>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -156,10 +199,17 @@ pub enum UpdateWorkspaceStateError {
 
 /// Write `state` to `<workspace_dir>/node_modules/.pnpm-workspace-state-v1.json`.
 ///
-/// Mirrors upstream's [`updateWorkspaceState`](https://github.com/pnpm/pnpm/blob/7ff112bac6/workspace/state/src/updateWorkspaceState.ts):
-/// `JSON.stringify(state, undefined, 2) + '\n'`. `serde_json`'s pretty
-/// printer uses the same 2-space indent and `": "` separator as JS, so
-/// the on-disk bytes round-trip cleanly between the two writers.
+/// Writes to a temporary file in the same directory, then atomically
+/// renames it into place, so a concurrent reader — pnpm or pacquet —
+/// never observes a half-written file. Mirrors upstream's
+/// [`updateWorkspaceState`](https://github.com/pnpm/pnpm/blob/7ff112bac6/workspace/state/src/updateWorkspaceState.ts),
+/// which writes through `write-file-atomic` for the same reason
+/// ([#12020](https://github.com/pnpm/pnpm/issues/12020)).
+///
+/// The serialized bytes are `JSON.stringify(state, undefined, 2) + '\n'`:
+/// `serde_json`'s pretty printer uses the same 2-space indent and `": "`
+/// separator as JS, so the on-disk bytes round-trip cleanly between the
+/// two writers.
 pub fn update_workspace_state(
     workspace_dir: &Path,
     state: &WorkspaceState,
@@ -173,8 +223,17 @@ pub fn update_workspace_state(
     let mut serialized =
         serde_json::to_string_pretty(state).map_err(UpdateWorkspaceStateError::SerializeJson)?;
     serialized.push('\n');
-    fs::write(&file_path, serialized.as_bytes())
-        .map_err(|source| UpdateWorkspaceStateError::WriteFile { path: file_path, source })
+    let mut temp = NamedTempFile::new_in(parent).map_err(|source| {
+        UpdateWorkspaceStateError::WriteFile { path: file_path.clone(), source }
+    })?;
+    temp.write_all(serialized.as_bytes()).map_err(|source| {
+        UpdateWorkspaceStateError::WriteFile { path: file_path.clone(), source }
+    })?;
+    temp.persist(&file_path).map_err(|error| UpdateWorkspaceStateError::WriteFile {
+        path: file_path,
+        source: error.error,
+    })?;
+    Ok(())
 }
 
 /// Read the workspace state file at `<workspace_dir>/node_modules/.pnpm-workspace-state-v1.json`.
@@ -216,11 +275,9 @@ pub enum LoadWorkspaceStateError {
 ///
 /// Truncates to `i64` because the JSON field is signed and the year
 /// 2038-pre-292277026596 range is the only one that matters.
+#[must_use]
 pub fn now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |duration| duration.as_millis() as i64)
 }
 
 #[cfg(test)]

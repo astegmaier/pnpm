@@ -23,11 +23,14 @@ use pacquet_config::{
     Config, TrustPolicy,
     version_policy::{PackageVersionPolicy, VersionPolicyError, create_package_version_policy},
 };
-use pacquet_network::ThrottledClient;
+use pacquet_network::{AuthHeaders, ThrottledClient};
 use pacquet_resolving_npm_resolver::{
-    CreateNpmResolutionVerifierOptions, PackageMetaCache, create_npm_resolution_verifier,
+    CreateNpmResolutionVerifierOptions, ObservedDistStats, PackageMetaCache,
+    create_npm_resolution_verifier,
 };
 use pacquet_resolving_resolver_base::ResolutionVerifier;
+
+use crate::retry_config::retry_opts_from_config;
 
 /// Error from [`build_resolution_verifiers`]. Today the only thing
 /// that can fail is `create_package_version_policy` rejecting an
@@ -55,9 +58,9 @@ pub enum BuildVerifiersError {
     },
 }
 
-/// Assemble the verifier list for this install. Returns an empty
-/// `Vec` when neither policy is active — the runner short-circuits
-/// on an empty list, so the caller doesn't need a separate guard.
+/// Assemble the verifier list for this install. The npm verifier is
+/// always included — it enforces the tarball-URL binding regardless of
+/// policy configuration — so the list is non-empty.
 ///
 /// `meta_cache` is the optional per-install packument cache shared
 /// with the resolver. When provided, the verifier reads it before
@@ -65,10 +68,16 @@ pub enum BuildVerifiersError {
 /// during the same install yields the cached document instead of a
 /// fresh round-trip. Pass `None` from contexts where no resolver
 /// runs alongside (the frozen-install path, unit tests).
+///
+/// `observed_dist_stats` is the optional [`ObservedDistStats`] sink
+/// the npm verifier fills with each verified entry's `dist` work
+/// statistics; pass `None` when the caller has no use for them.
 pub fn build_resolution_verifiers(
     config: &Config,
     http_client: Arc<ThrottledClient>,
     meta_cache: Option<Arc<dyn PackageMetaCache>>,
+    auth_override: Option<Arc<AuthHeaders>>,
+    observed_dist_stats: Option<ObservedDistStats>,
 ) -> Result<Vec<Arc<dyn ResolutionVerifier>>, BuildVerifiersError> {
     let mut verifiers: Vec<Arc<dyn ResolutionVerifier>> = Vec::new();
 
@@ -81,15 +90,10 @@ pub fn build_resolution_verifiers(
         BuildVerifiersError::invalid_trust_policy_exclude,
     )?;
 
-    // Pacquet's `Config` carries a single registry URL; multi-scope
-    // routing lives in `.npmrc` parsing pacquet doesn't surface here
-    // yet. Build the minimal `{"default": registry}` map the verifier
-    // expects, so scope routing degrades to "always default".
-    let mut registries = HashMap::with_capacity(1);
-    registries.insert("default".to_string(), config.registry.clone());
+    let registries: HashMap<String, String> = config.resolved_registries().into_iter().collect();
 
     let opts = CreateNpmResolutionVerifierOptions {
-        minimum_release_age: config.minimum_release_age,
+        minimum_release_age: config.resolved_minimum_release_age(),
         minimum_release_age_exclude: min_age_exclude,
         minimum_release_age_exclude_patterns: config
             .minimum_release_age_exclude
@@ -117,15 +121,15 @@ pub fn build_resolution_verifiers(
             .map(|(name, url)| (name.clone(), url.clone()))
             .collect(),
         http_client,
-        auth_headers: Arc::clone(&config.auth_headers),
+        auth_headers: auth_override.unwrap_or_else(|| Arc::clone(&config.auth_headers)),
         cache_dir: Some(config.cache_dir.clone()),
         meta_cache,
+        retry_opts: retry_opts_from_config(config),
         now: None,
+        observed_dist_stats,
     };
 
-    if let Some(verifier) = create_npm_resolution_verifier(opts) {
-        verifiers.push(Arc::new(verifier));
-    }
+    verifiers.push(Arc::new(create_npm_resolution_verifier(opts)));
 
     Ok(verifiers)
 }

@@ -5,22 +5,16 @@ use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
 use super::{
-    ABBREVIATED_META_DIR, FULL_META_DIR, MetaHeaders, encode_pkg_name, get_pkg_mirror_path,
-    get_registry_name, load_meta, load_meta_headers, prepare_json_for_disk, save_meta,
+    ABBREVIATED_META_DIR, FULL_FILTERED_META_DIR, FULL_META_DIR, encode_pkg_name,
+    get_pkg_mirror_path, get_registry_name, load_meta, load_meta_headers, save_meta_indexed,
 };
 
-/// Lower-case names pass through unchanged. Matches upstream's
-/// `pkgName !== pkgName.toLowerCase()` short-circuit.
 #[test]
 fn encode_pkg_name_passes_lowercase_through() {
     assert_eq!(encode_pkg_name("lodash"), "lodash");
     assert_eq!(encode_pkg_name("@scope/foo"), "@scope/foo");
 }
 
-/// Names containing any uppercase letter get a `_<sha256-hex>` suffix
-/// so case-insensitive filesystems can't collide them with a lowercase
-/// sibling. The prefix is the original name; the suffix is the sha256
-/// hex of the original name.
 #[test]
 fn encode_pkg_name_hash_suffix_for_mixed_case() {
     let got = encode_pkg_name("LRUCache");
@@ -30,39 +24,32 @@ fn encode_pkg_name_hash_suffix_for_mixed_case() {
     assert!(suffix.chars().all(|ch| ch.is_ascii_hexdigit()));
 }
 
-/// `https://registry.npmjs.org/` → `registry.npmjs.org`. No port,
-/// no escaping needed.
 #[test]
 fn get_registry_name_default_scheme() {
     let got = get_registry_name("https://registry.npmjs.org/").expect("encode");
     assert_eq!(got, "registry.npmjs.org");
 }
 
-/// Explicit non-default port encodes as `host+port`.
 #[test]
 fn get_registry_name_with_port() {
     let got = get_registry_name("https://npm.example:8443/").expect("encode");
     assert_eq!(got, "npm.example+8443");
 }
 
-/// Default scheme port is **not** included in the slug — the URL
-/// parser strips it.
 #[test]
 fn get_registry_name_default_port_omitted() {
     let got = get_registry_name("https://npm.example:443/").expect("encode");
     assert_eq!(got, "npm.example");
 }
 
-/// Malformed registry URL surfaces as the dedicated [`super::EncodeRegistryError`]
-/// rather than panicking — callers (notably the cached fetcher) downgrade
-/// to a cache-less fetch instead of failing the install.
+/// Callers (notably the cached fetcher) downgrade to a cache-less
+/// fetch on this error instead of failing the install.
 #[test]
 fn get_registry_name_rejects_malformed_url() {
     let err = get_registry_name("not a url").expect_err("malformed url must error");
     assert!(matches!(err, super::EncodeRegistryError::ParseUrl { .. }), "got: {err:?}");
 }
 
-/// The mirror path is `<cache_dir>/<meta_dir>/<registry-slug>/<encoded-name>.jsonl`.
 #[test]
 fn get_pkg_mirror_path_composes_full_path() {
     let dir = PathBuf::from("/cache");
@@ -76,6 +63,7 @@ fn get_pkg_mirror_path_composes_full_path() {
 #[test]
 fn constants_match_upstream() {
     assert_eq!(FULL_META_DIR, "v11/metadata-full");
+    assert_eq!(FULL_FILTERED_META_DIR, "v11/metadata-full-filtered");
     assert_eq!(ABBREVIATED_META_DIR, "v11/metadata");
 }
 
@@ -101,57 +89,66 @@ fn fixture_package() -> Package {
     serde_json::from_value(body).expect("deserialize fixture Package")
 }
 
-/// `prepare_json_for_disk` produces a two-line NDJSON document. Line
-/// one is `MetaHeaders`; line two is the raw body verbatim when
-/// supplied (the fast path on a 200 response).
-#[test]
-fn prepare_json_for_disk_two_line_shape() {
-    let pkg = fixture_package();
-    let raw = r#"{"name":"acme"}"#;
-    let json = prepare_json_for_disk(&pkg, Some(r#""abc""#), Some(raw)).expect("serialize");
-    let mut lines = json.split('\n');
-    let header_line = lines.next().expect("header line present");
-    let body_line = lines.next().expect("body line present");
-    let headers: MetaHeaders = serde_json::from_str(header_line).expect("parse header");
-    assert_eq!(headers.etag.as_deref(), Some(r#""abc""#));
-    assert_eq!(headers.modified.as_deref(), Some("2025-01-15T12:00:00.000Z"));
-    assert_eq!(body_line, raw, "raw body line wins over re-serialization");
-}
-
-/// Save → load_meta_headers reads back only the first line (etag,
-/// modified) without parsing the multi-megabyte body — fast path
-/// for the conditional GET decision.
 #[test]
 fn load_meta_headers_round_trip() {
     let dir = TempDir::new().expect("tmp dir");
     let mirror = dir.path().join("nested").join("lodash.jsonl");
     let pkg = fixture_package();
-    let json =
-        prepare_json_for_disk(&pkg, Some(r#"W/"abc""#), Some(r#"{"name":"acme"}"#)).expect("ser");
-    save_meta(&mirror, &json).expect("save");
+    save_meta_indexed(&mirror, &pkg, Some(r#"W/"abc""#)).expect("save");
     let headers = load_meta_headers(&mirror).expect("read headers back");
     assert_eq!(headers.etag.as_deref(), Some(r#"W/"abc""#));
     assert_eq!(headers.modified.as_deref(), Some("2025-01-15T12:00:00.000Z"));
 }
 
-/// Save → load_meta reconstructs the full Package with the etag
-/// back-filled. The cached fetcher uses this on a 304 response.
 #[test]
-fn load_meta_round_trip_backfills_etag() {
+fn load_meta_round_trip_hydrates_versions_from_spans() {
     let dir = TempDir::new().expect("tmp dir");
     let mirror = dir.path().join("acme.jsonl");
     let pkg = fixture_package();
-    let json = prepare_json_for_disk(&pkg, Some(r#"W/"abc""#), None).expect("ser");
-    save_meta(&mirror, &json).expect("save");
+    save_meta_indexed(&mirror, &pkg, Some(r#"W/"abc""#)).expect("save");
     let loaded = load_meta(&mirror).expect("read full back");
     assert_eq!(loaded.name, "acme");
     assert_eq!(loaded.etag.as_deref(), Some(r#"W/"abc""#));
     assert_eq!(loaded.published_at("1.0.0"), Some("2025-01-10T08:30:00.000Z"));
+    assert_eq!(loaded.dist_tag("latest"), Some("1.0.0"));
+    let manifest = loaded.versions.get("1.0.0").expect("hydrate from file span");
+    assert_eq!(manifest.dist.tarball, "https://registry/acme-1.0.0.tgz");
 }
 
-/// Missing file → `None` from both readers. The fetcher's lookup
-/// chain catches `None` as "cache cold" and proceeds with an
-/// unconditional GET.
+#[test]
+fn load_meta_rejects_truncated_fragments() {
+    let dir = TempDir::new().expect("tmp dir");
+    let mirror = dir.path().join("acme.jsonl");
+    let pkg = fixture_package();
+    save_meta_indexed(&mirror, &pkg, None).expect("save");
+    let full = std::fs::read(&mirror).expect("read mirror");
+    std::fs::write(&mirror, &full[..full.len() - 10]).expect("truncate");
+    assert!(load_meta(&mirror).is_none());
+}
+
+/// pnpm and pacquet must share the same on-disk metadata mirror.
+#[test]
+fn pnpm_ndjson_format_reads_as_cache_hit() {
+    let dir = TempDir::new().expect("tmp dir");
+    let mirror = dir.path().join("acme.jsonl");
+    let mut pkg = fixture_package();
+    pkg.modified = None;
+    std::fs::write(
+        &mirror,
+        format!(
+            "{{\"etag\":\"W/abc\",\"modified\":\"2025-01-15T12:00:00.000Z\"}}\n{}",
+            serde_json::to_string(&pkg).expect("serialize fixture"),
+        ),
+    )
+    .expect("write pnpm format");
+    let headers = load_meta_headers(&mirror).expect("read headers");
+    assert_eq!(headers.etag.as_deref(), Some("W/abc"));
+    let meta = load_meta(&mirror).expect("read meta");
+    assert_eq!(meta.etag.as_deref(), Some("W/abc"));
+    assert_eq!(meta.modified.as_deref(), Some("2025-01-15T12:00:00.000Z"));
+    assert_eq!(meta.published_at("1.0.0"), Some("2025-01-10T08:30:00.000Z"));
+}
+
 #[test]
 fn load_helpers_return_none_on_missing_file() {
     let dir = TempDir::new().expect("tmp dir");
@@ -160,8 +157,6 @@ fn load_helpers_return_none_on_missing_file() {
     assert!(load_meta(&mirror).is_none());
 }
 
-/// Malformed mirror (no newline separator) → `None`. Mirrors
-/// upstream's catch-and-return-null on JSON.parse errors.
 #[test]
 fn load_helpers_return_none_on_malformed_mirror() {
     let dir = TempDir::new().expect("tmp dir");
@@ -171,22 +166,14 @@ fn load_helpers_return_none_on_malformed_mirror() {
     assert!(load_meta(&mirror).is_none());
 }
 
-/// `save_meta` overwrites an existing mirror file atomically — the
-/// observer sees either the old contents or the new ones, never a
-/// torn body.
 #[test]
 fn save_meta_overwrites_existing_mirror() {
     let dir = TempDir::new().expect("tmp dir");
     let mirror = dir.path().join("acme.jsonl");
     let pkg = fixture_package();
 
-    let first =
-        prepare_json_for_disk(&pkg, Some(r#"W/"old""#), Some(r#"{"name":"acme"}"#)).expect("ser");
-    save_meta(&mirror, &first).expect("first save");
-
-    let second =
-        prepare_json_for_disk(&pkg, Some(r#"W/"new""#), Some(r#"{"name":"acme"}"#)).expect("ser");
-    save_meta(&mirror, &second).expect("second save");
+    save_meta_indexed(&mirror, &pkg, Some(r#"W/"old""#)).expect("first save");
+    save_meta_indexed(&mirror, &pkg, Some(r#"W/"new""#)).expect("second save");
 
     let headers = load_meta_headers(&mirror).expect("read headers");
     assert_eq!(headers.etag.as_deref(), Some(r#"W/"new""#));

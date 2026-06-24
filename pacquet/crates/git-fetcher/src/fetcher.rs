@@ -16,7 +16,7 @@ use crate::{
     cas_io::{ImportedFiles, import_into_cas},
     error::{GitFetcherError, PreparePackageError},
     packlist::packlist,
-    prepare_package::{PreparePackageOptions, PreparedPackage, prepare_package},
+    prepare_package::{AllowBuildRef, PreparePackageOptions, PreparedPackage, prepare_package},
 };
 use pacquet_executor::ScriptsPrependNodePath;
 use pacquet_package_manifest::safe_read_package_json_from_dir;
@@ -44,7 +44,7 @@ pub struct GitFetcher<'a> {
     /// `allow_build`. The caller (typically the install dispatcher) is
     /// responsible for plumbing whatever policy structure it has into
     /// this closure shape.
-    pub allow_build: &'a (dyn Fn(&str, &str) -> bool + Send + Sync),
+    pub allow_build: AllowBuildRef<'a>,
     pub ignore_scripts: bool,
     pub unsafe_perm: bool,
     pub user_agent: Option<&'a str>,
@@ -76,10 +76,7 @@ pub struct GitFetcher<'a> {
     /// (matches upstream's `execa('git', …)` shape). Tests use it to
     /// inject a shim binary at an absolute path, so the test can
     /// observe the fetcher's argv without mutating process-global
-    /// state. `None` keeps the existing `Command::new("git")`
-    /// behavior; `Some(path)` runs `Command::new(path)` for every
-    /// git invocation inside `run_sync` (`init`, `clone`, `fetch`,
-    /// `checkout`, `rev-parse`).
+    /// state.
     pub git_bin: Option<&'a Path>,
 }
 
@@ -96,7 +93,7 @@ pub struct GitFetchOutput {
     pub built: bool,
 }
 
-impl<'a> GitFetcher<'a> {
+impl GitFetcher<'_> {
     /// Run the fetcher. Blocks under
     /// [`tokio::task::block_in_place`] for the git CLI invocations and
     /// the lifecycle-script-running prepare step. Returns the CAS file
@@ -106,6 +103,12 @@ impl<'a> GitFetcher<'a> {
     }
 
     fn run_sync<Reporter: self::Reporter>(self) -> Result<GitFetchOutput, GitFetcherError> {
+        if !is_valid_commit_hash(self.commit) {
+            return Err(GitFetcherError::InvalidCommit {
+                commit: self.commit.to_string(),
+                repo: self.repo.to_string(),
+            });
+        }
         let temp = tempfile::tempdir().map_err(GitFetcherError::Io)?;
         let temp_location = temp.path();
 
@@ -140,7 +143,8 @@ impl<'a> GitFetcher<'a> {
         // brittle to future expression-reshape edits in this block.
         let empty_env: HashMap<String, String> = HashMap::new();
         let prepare_opts = PreparePackageOptions {
-            allow_build: Box::new(|name, version| (self.allow_build)(name, version)),
+            allow_build: Box::new(|dep_path| (self.allow_build)(dep_path)),
+            dep_path: self.package_id,
             ignore_scripts: self.ignore_scripts,
             unsafe_perm: self.unsafe_perm,
             user_agent: self.user_agent,
@@ -216,7 +220,7 @@ impl<'a> GitFetcher<'a> {
 /// We do this via the source chain instead of mutating the message
 /// (no JS-style `err.message = ...` available), so the wrapped error
 /// shows up in `miette`'s rendered chain as "Failed to prepare git-
-/// hosted package … → Failed to prepare package → ERR_PNPM_PREPARE_PACKAGE".
+/// hosted package ... → Failed to prepare package → `ERR_PNPM_PREPARE_PACKAGE`".
 fn wrap_prepare_error(_repo: &str, err: PreparePackageError) -> GitFetcherError {
     // For the MVP we preserve `err` as the source; the install log
     // line at the dispatcher level already includes the repo URL via
@@ -224,6 +228,12 @@ fn wrap_prepare_error(_repo: &str, err: PreparePackageError) -> GitFetcherError 
     // `Prepare { repo, source }` variant once we have observed real
     // chains in the install reporter.
     GitFetcherError::Prepare(err)
+}
+
+/// True iff `commit` is exactly a 40-character hexadecimal git SHA,
+/// validated before the value reaches `git`.
+fn is_valid_commit_hash(commit: &str) -> bool {
+    commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// True iff `repo` parses to a host that pacquet should clone via the
@@ -253,7 +263,6 @@ fn extract_host(url: &str) -> Option<&str> {
     let authority_end = rest.find('/').unwrap_or(rest.len());
     let authority = &rest[..authority_end];
     let host = authority.rsplit('@').next().unwrap_or(authority);
-    // Strip port, if any.
     let host = host.split(':').next().unwrap_or(host);
     if host.is_empty() { None } else { Some(host) }
 }
@@ -271,22 +280,6 @@ fn prefix_git_args() -> &'static [&'static str] {
     {
         &[]
     }
-}
-
-/// Run `git` with `args` (prefixed with [`prefix_git_args`]) and
-/// capture stdout. Returns `Err(GitFetcherError::GitNotFound)` when
-/// the binary is missing so callers can produce a friendly install
-/// hint, and `Err(GitFetcherError::GitExec { stderr, … })` for non-
-/// zero exit codes.
-///
-/// Resolves `git` through `PATH` — convenience wrapper around
-/// [`exec_git_with`] for fixture-setup helpers and ad-hoc tests
-/// that don't need to override the binary location. Test-only
-/// because the only non-test caller now passes a `git_bin` override
-/// through `GitFetcher::run_sync`'s [`exec_git_with`] call.
-#[cfg(test)]
-fn exec_git(args: &[&str], cwd: Option<&Path>) -> Result<String, GitFetcherError> {
-    exec_git_with(Path::new("git"), args, cwd)
 }
 
 /// `exec_git` with an explicit binary path. The fetcher uses this so

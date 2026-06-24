@@ -32,14 +32,14 @@ const LOCKFILE_YAML: &str = text_block! {
     ""
     "packages:"
     ""
-    "  react@17.0.2:"
-    "    resolution: {integrity: sha512-TIE61hcgbI/SlJh/0c1sT1SZbBlpg7WiZcs65WPJhoIZQPhH1SCpcGA7LgrVXT15lwN3HV4GQM/MJ9aKEn3Qfg==}"
-    "    engines: {node: '>=0.10.0'}"
-    ""
     "  react-dom@17.0.2:"
     "    resolution: {integrity: sha512-s4h96KtLDUQlsENhMn1ar8t2bEa+q/YAtj8pPPdIjPDGBDIVNsrD9aXNWqspUe6AzKCIG0C1HZZLqLV7qpOBGA==}"
     "    peerDependencies:"
     "      react: 17.0.2"
+    ""
+    "  react@17.0.2:"
+    "    resolution: {integrity: sha512-TIE61hcgbI/SlJh/0c1sT1SZbBlpg7WiZcs65WPJhoIZQPhH1SCpcGA7LgrVXT15lwN3HV4GQM/MJ9aKEn3Qfg==}"
+    "    engines: {node: '>=0.10.0'}"
     ""
     "  typescript@5.1.6:"
     "    resolution: {integrity: sha512-zaWCozRZ6DLEWAWFrVDz1H6FVXzUSfTy5FUMWsQlU8Ym5JP9eO4xkTIROFCQvhQf61z6O/G6ugw3SgAnvvm+HA==}"
@@ -48,11 +48,11 @@ const LOCKFILE_YAML: &str = text_block! {
     ""
     "snapshots:"
     ""
-    "  react@17.0.2: {}"
-    ""
     "  react-dom@17.0.2(react@17.0.2):"
     "    dependencies:"
     "      react: 17.0.2"
+    ""
+    "  react@17.0.2: {}"
     ""
     "  typescript@5.1.6: {}"
 };
@@ -84,17 +84,25 @@ fn round_trip_parse_save_parse_preserves_lockfile() {
     assert_eq!(original, reparsed);
 }
 
-/// A workspace lockfile with multiple importers, one of which has a
-/// `workspace:` dependency, must round-trip cleanly. Guards two things
-/// at once:
-///
-/// 1. The importer map is heterogeneous — multiple keys, not just `.`.
-/// 2. `version: link:<path>` values deserialize into
-///    [`crate::ImporterDepVersion::Link`] and re-serialize back to
-///    the same wire form.
-///
-/// This is the smallest possible v9 workspace lockfile pacquet needs
-/// to load to do anything useful for #431.
+/// Byte-for-byte parity: parsing a pnpm-authored v9 lockfile and saving it
+/// reproduces the exact bytes pnpm wrote. [`LOCKFILE_YAML`] is laid out the way
+/// pnpm's `js-yaml` dumper writes it — blank lines between top-level and
+/// section entries, single-quoted ambiguous scalars, single-line
+/// `resolution` / `engines`, and priority-then-lexical key ordering — so an
+/// exact match proves pacquet's writer matches pnpm's formatting.
+#[test]
+fn save_reproduces_pnpm_authored_bytes() {
+    let original: Lockfile = serde_saphyr::from_str(LOCKFILE_YAML).expect("parse fixture lockfile");
+
+    let tmp = tempdir().expect("create tempdir");
+    let path = tmp.path().join("pnpm-lock.yaml");
+    original.save_to_path(&path).expect("save lockfile");
+
+    let saved_bytes = std::fs::read_to_string(&path).expect("read saved lockfile");
+    // `text_block!` omits the trailing newline; the writer appends one.
+    assert_eq!(saved_bytes, format!("{LOCKFILE_YAML}\n"));
+}
+
 #[test]
 fn workspace_lockfile_with_link_dep_round_trips() {
     const WORKSPACE_YAML: &str = text_block! {
@@ -136,7 +144,6 @@ fn workspace_lockfile_with_link_dep_round_trips() {
         serde_saphyr::from_str(WORKSPACE_YAML).expect("parse workspace lockfile");
     assert_eq!(original.importers.len(), 2);
 
-    // The `link:` dep landed in the typed enum's `Link` variant.
     let web = original.importers.get("packages/web").expect("web importer present");
     let shared_dep = web
         .dependencies
@@ -148,7 +155,6 @@ fn workspace_lockfile_with_link_dep_round_trips() {
         .expect("shared dep present");
     assert_eq!(shared_dep.version.as_link_target(), Some("../shared"));
 
-    // Save and reparse — the `link:` value must round-trip unchanged.
     let tmp = tempdir().expect("create tempdir");
     let path = tmp.path().join("pnpm-lock.yaml");
     original.save_to_path(&path).expect("save lockfile");
@@ -159,6 +165,120 @@ fn workspace_lockfile_with_link_dep_round_trips() {
     );
     let reparsed: Lockfile = serde_saphyr::from_str(&saved).expect("reparse");
     assert_eq!(original, reparsed);
+}
+
+#[test]
+fn patched_dependencies_block_round_trips_and_renders_in_order() {
+    const PATCHED_YAML: &str = text_block! {
+        "lockfileVersion: '9.0'"
+        ""
+        "settings:"
+        "  autoInstallPeers: true"
+        "  excludeLinksFromLockfile: false"
+        ""
+        "patchedDependencies:"
+        "  graceful-fs@4.2.11: 68ebc232025360cb3dcd3081f4067f4e9fc022ab6b6f71a3230e86c7a5b337d1"
+        ""
+        "importers:"
+        ""
+        "  .:"
+        "    dependencies:"
+        "      react:"
+        "        specifier: ^17.0.2"
+        "        version: 17.0.2"
+        ""
+        "snapshots:"
+        ""
+        "  react@17.0.2: {}"
+    };
+
+    let original: Lockfile = serde_saphyr::from_str(PATCHED_YAML).expect("parse fixture lockfile");
+    let patched = original.patched_dependencies.as_ref().expect("patchedDependencies parsed");
+    assert_eq!(
+        patched.get("graceful-fs@4.2.11").map(String::as_str),
+        Some("68ebc232025360cb3dcd3081f4067f4e9fc022ab6b6f71a3230e86c7a5b337d1"),
+    );
+
+    let tmp = tempdir().expect("create tempdir");
+    let path = tmp.path().join("pnpm-lock.yaml");
+    original.save_to_path(&path).expect("save lockfile");
+    let saved = std::fs::read_to_string(&path).expect("read saved lockfile");
+    assert_eq!(saved, format!("{PATCHED_YAML}\n"));
+}
+
+#[test]
+fn peers_suffix_max_length_omitted_from_settings_when_unset() {
+    use crate::LockfileSettings;
+
+    let lockfile = Lockfile {
+        lockfile_version: crate::LockfileVersion::<9>::try_from(crate::ComVer::new(9, 0))
+            .expect("v9 is compatible with major=9"),
+        settings: Some(LockfileSettings {
+            auto_install_peers: true,
+            dedupe_peers: None,
+            exclude_links_from_lockfile: false,
+            inject_workspace_packages: false,
+            peers_suffix_max_length: None,
+        }),
+        catalogs: None,
+        overrides: None,
+        package_extensions_checksum: None,
+        pnpmfile_checksum: None,
+        ignored_optional_dependencies: None,
+        patched_dependencies: None,
+        importers: std::collections::HashMap::default(),
+        packages: None,
+        snapshots: None,
+    };
+
+    let tmp = tempdir().expect("create tempdir");
+    let path = tmp.path().join("pnpm-lock.yaml");
+    lockfile.save_to_path(&path).expect("save lockfile");
+    let saved = std::fs::read_to_string(&path).expect("read saved lockfile");
+
+    assert!(
+        !saved.contains("peersSuffixMaxLength"),
+        "default peersSuffixMaxLength must be omitted from serialized lockfile:\n{saved}",
+    );
+}
+
+#[test]
+fn peers_suffix_max_length_serialized_when_set() {
+    use crate::LockfileSettings;
+
+    let lockfile = Lockfile {
+        lockfile_version: crate::LockfileVersion::<9>::try_from(crate::ComVer::new(9, 0))
+            .expect("v9 is compatible with major=9"),
+        settings: Some(LockfileSettings {
+            auto_install_peers: true,
+            dedupe_peers: None,
+            exclude_links_from_lockfile: false,
+            inject_workspace_packages: false,
+            peers_suffix_max_length: Some(10),
+        }),
+        catalogs: None,
+        overrides: None,
+        package_extensions_checksum: None,
+        pnpmfile_checksum: None,
+        ignored_optional_dependencies: None,
+        patched_dependencies: None,
+        importers: std::collections::HashMap::default(),
+        packages: None,
+        snapshots: None,
+    };
+
+    let tmp = tempdir().expect("create tempdir");
+    let path = tmp.path().join("pnpm-lock.yaml");
+    lockfile.save_to_path(&path).expect("save lockfile");
+    let saved = std::fs::read_to_string(&path).expect("read saved lockfile");
+
+    assert!(
+        saved.contains("peersSuffixMaxLength: 10"),
+        "non-default peersSuffixMaxLength must be serialized:\n{saved}",
+    );
+
+    let reparsed: Lockfile = serde_saphyr::from_str(&saved).expect("reparse lockfile");
+    assert_eq!(reparsed.settings.expect("settings present").peers_suffix_max_length, Some(10));
 }
 
 #[test]
@@ -176,9 +296,6 @@ fn save_fails_with_wrapped_io_error_when_path_is_invalid() {
     );
 }
 
-/// `write_current` creates the virtual-store directory if needed and
-/// reading it back yields the same lockfile. Verifies the read/write
-/// round-trip across the new `lock.yaml` path.
 #[test]
 fn write_current_round_trips_through_read_current() {
     let original: Lockfile = serde_saphyr::from_str(LOCKFILE_YAML).expect("parse fixture lockfile");
@@ -198,9 +315,6 @@ fn write_current_round_trips_through_read_current() {
     assert_eq!(original, loaded);
 }
 
-/// `load_current_from_virtual_store_dir` returns `Ok(None)` when the
-/// file does not exist — mirrors upstream's ENOENT-as-null contract
-/// for first-time installs.
 #[test]
 fn read_current_returns_none_when_file_missing() {
     let tmp = tempdir().expect("create tempdir");
@@ -211,9 +325,6 @@ fn read_current_returns_none_when_file_missing() {
     assert!(result.is_none(), "expected None for missing lock.yaml, got: {result:?}");
 }
 
-/// Empty-lockfile writes delete any existing `lock.yaml` rather than
-/// rewriting it. Mirrors upstream's `rimraf` short-circuit at
-/// <https://github.com/pnpm/pnpm/blob/94240bc046/lockfile/fs/src/write.ts#L45-L47>.
 #[test]
 fn write_current_deletes_file_when_lockfile_is_empty() {
     let tmp = tempdir().expect("create tempdir");
@@ -236,8 +347,6 @@ fn write_current_deletes_file_when_lockfile_is_empty() {
     assert!(!lock_path.exists(), "lock.yaml should be removed for empty lockfile");
 }
 
-/// Empty-lockfile writes are a no-op when the file was already
-/// absent. Mirrors `rimraf`'s ENOENT-as-OK behavior.
 #[test]
 fn write_current_is_a_noop_for_empty_lockfile_with_no_existing_file() {
     let tmp = tempdir().expect("create tempdir");
@@ -251,11 +360,6 @@ fn write_current_is_a_noop_for_empty_lockfile_with_no_existing_file() {
     assert!(!virtual_store_dir.join(Lockfile::CURRENT_FILE_NAME).exists());
 }
 
-/// `create_dir_all` failures (here, attempting to create a
-/// directory under a path that is actually a regular file)
-/// surface as the typed `CreateDir` error. Pins the error
-/// classification so a regression that bubbled the raw
-/// `io::Error` as `WriteFile` would fail this test.
 #[test]
 fn write_current_surfaces_create_dir_error_when_parent_is_a_file() {
     let tmp = tempdir().expect("create tempdir");
@@ -277,10 +381,6 @@ fn write_current_surfaces_create_dir_error_when_parent_is_a_file() {
     );
 }
 
-/// Trying to remove an existing entry that is a directory (rather
-/// than a regular file) surfaces as `RemoveFile`. Mirrors
-/// upstream's strict file/dir distinction at the rimraf-equivalent
-/// step. Tests the not-NotFound arm of the empty-lockfile branch.
 #[cfg(unix)]
 #[test]
 fn write_current_surfaces_remove_file_error_when_target_is_a_directory() {
@@ -305,11 +405,6 @@ fn write_current_surfaces_remove_file_error_when_target_is_a_directory() {
     assert!(dir_at_target.is_dir());
 }
 
-/// `write_atomic`'s rename step fails when the target is an
-/// existing non-empty directory: Unix `rename(2)` returns
-/// `ENOTEMPTY` / `EISDIR`. Pins that the error surfaces as
-/// `RenameFile`, not as a generic write failure, and that the
-/// temp blob is cleaned up on the way out.
 #[cfg(unix)]
 #[test]
 fn write_atomic_rename_failure_surfaces_as_rename_file_error() {
@@ -336,8 +431,8 @@ fn write_atomic_rename_failure_surfaces_as_rename_file_error() {
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
         .filter(|name| {
-            let s = name.to_string_lossy();
-            s != Lockfile::CURRENT_FILE_NAME
+            let name_str = name.to_string_lossy();
+            name_str != Lockfile::CURRENT_FILE_NAME
         })
         .collect();
     assert!(leftovers.is_empty(), "temp file should have been cleaned up, found: {leftovers:?}");

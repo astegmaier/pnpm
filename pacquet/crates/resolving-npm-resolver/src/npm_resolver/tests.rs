@@ -1,14 +1,16 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use chrono::TimeZone;
+use pacquet_config::TrustPolicy;
 use pacquet_lockfile::LockfileResolution;
-use pacquet_network::{AuthHeaders, ThrottledClient};
+use pacquet_network::{AuthHeaders, RetryOpts, ThrottledClient};
 use pacquet_resolving_resolver_base::{
-    LatestQuery, ResolveOptions, Resolver, UpdateBehavior, WantedDependency, WorkspacePackage,
+    LatestQuery, PackageVersionGuard, PackageVersionGuardDecision, PackageVersionGuardFuture,
+    ResolveOptions, Resolver, UpdateBehavior, WantedDependency, WorkspacePackage,
     WorkspacePackages, WorkspacePackagesByVersion,
 };
 use pretty_assertions::assert_eq;
@@ -76,8 +78,33 @@ fn build_resolver_with_registries(
         prefer_offline: false,
         ignore_missing_time_field: false,
         full_metadata: false,
+        filter_metadata: false,
+        retry_opts: RetryOpts::default(),
     };
     (resolver, cache_dir)
+}
+
+#[derive(Debug)]
+struct RejectVersions {
+    versions: HashSet<String>,
+}
+
+impl PackageVersionGuard for RejectVersions {
+    fn check<'a>(&'a self, _name: &'a str, version: &'a str) -> PackageVersionGuardFuture<'a> {
+        Box::pin(async move {
+            if self.versions.contains(version) {
+                Ok(PackageVersionGuardDecision::Reject { reason: format!("{version} is blocked") })
+            } else {
+                Ok(PackageVersionGuardDecision::Allow)
+            }
+        })
+    }
+}
+
+fn reject_versions(versions: &[&str]) -> Arc<dyn PackageVersionGuard> {
+    Arc::new(RejectVersions {
+        versions: versions.iter().map(|version| (*version).to_string()).collect(),
+    })
 }
 
 /// Packument body for `@jsr/foo__bar` — the npm-shaped name JSR
@@ -113,6 +140,48 @@ const JSR_PACKAGE_BODY: &str = r#"{
     }
 }"#;
 
+/// Packument where the earlier-published `1.0.0` carries the strongest
+/// trust evidence available here (`trustedPublisher` + provenance) and
+/// the later `1.1.0` carries none — a trust downgrade. Resolving
+/// `^1.0.0` picks `1.1.0` (the max), so the resolver-time gate must
+/// reject it under `trustPolicy='no-downgrade'`.
+const TRUST_DOWNGRADE_PACKAGE_BODY: &str = r#"{
+    "name": "acme",
+    "dist-tags": { "latest": "1.1.0" },
+    "modified": "2025-01-15T12:00:00.000Z",
+    "time": {
+        "1.0.0": "2024-01-10T08:30:00.000Z",
+        "1.1.0": "2024-12-10T08:30:00.000Z"
+    },
+    "versions": {
+        "1.0.0": {
+            "name": "acme",
+            "version": "1.0.0",
+            "_npmUser": {
+                "name": "alice",
+                "trustedPublisher": { "id": "github", "oidcConfigId": "release" }
+            },
+            "dist": {
+                "integrity": "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+                "shasum": "0000000000000000000000000000000000000000",
+                "tarball": "https://registry/acme-1.0.0.tgz",
+                "attestations": {
+                    "provenance": { "predicateType": "https://slsa.dev/provenance/v1" }
+                }
+            }
+        },
+        "1.1.0": {
+            "name": "acme",
+            "version": "1.1.0",
+            "dist": {
+                "integrity": "sha512-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB==",
+                "shasum": "1111111111111111111111111111111111111111",
+                "tarball": "https://registry/acme-1.1.0.tgz"
+            }
+        }
+    }
+}"#;
+
 #[tokio::test]
 async fn range_specifier_picks_max_in_range() {
     let mut server = mockito::Server::new_async().await;
@@ -139,14 +208,145 @@ async fn range_specifier_picks_max_in_range() {
 }
 
 #[tokio::test]
+async fn package_version_guard_excludes_rejected_versions_and_repicks() {
+    let mut server = mockito::Server::new_async().await;
+    let _mock =
+        server.mock("GET", "/acme").with_status(200).with_body(PACKAGE_BODY).create_async().await;
+    let registry = format!("{}/", server.url());
+    let (resolver, _tempdir) = build_resolver(&registry);
+
+    let opts = ResolveOptions {
+        package_version_guard: Some(reject_versions(&["1.1.0"])),
+        ..ResolveOptions::default()
+    };
+    let wanted = WantedDependency {
+        alias: Some("acme".to_string()),
+        bare_specifier: Some("^1.0.0".to_string()),
+        ..WantedDependency::default()
+    };
+
+    let result = resolver.resolve(&wanted, &opts).await.unwrap().unwrap();
+    let name_ver = result.name_ver.as_ref().expect("name_ver");
+    assert_eq!(name_ver.suffix.to_string(), "1.0.0");
+    assert_eq!(result.latest.as_deref(), Some("1.0.0"));
+}
+
+#[tokio::test]
+async fn package_version_guard_repopulates_latest_tag() {
+    let mut server = mockito::Server::new_async().await;
+    let _mock =
+        server.mock("GET", "/acme").with_status(200).with_body(PACKAGE_BODY).create_async().await;
+    let registry = format!("{}/", server.url());
+    let (resolver, _tempdir) = build_resolver(&registry);
+
+    let opts = ResolveOptions {
+        package_version_guard: Some(reject_versions(&["1.1.0"])),
+        ..ResolveOptions::default()
+    };
+    let wanted =
+        WantedDependency { alias: Some("acme".to_string()), ..WantedDependency::default() };
+
+    let result = resolver.resolve(&wanted, &opts).await.unwrap().unwrap();
+    assert_eq!(result.name_ver.as_ref().expect("name_ver").suffix.to_string(), "1.0.0");
+    assert_eq!(result.latest.as_deref(), Some("1.0.0"));
+}
+
+#[tokio::test]
+async fn package_version_guard_blocking_every_version_errors() {
+    let mut server = mockito::Server::new_async().await;
+    let _mock =
+        server.mock("GET", "/acme").with_status(200).with_body(PACKAGE_BODY).create_async().await;
+    let registry = format!("{}/", server.url());
+    let (resolver, _tempdir) = build_resolver(&registry);
+
+    let opts = ResolveOptions {
+        package_version_guard: Some(reject_versions(&["1.0.0", "1.1.0"])),
+        ..ResolveOptions::default()
+    };
+    let wanted = WantedDependency {
+        alias: Some("acme".to_string()),
+        bare_specifier: Some("^1.0.0".to_string()),
+        ..WantedDependency::default()
+    };
+
+    // Every matching version is rejected, so the resolver must surface a
+    // clear guard error rather than Ok(None) (which would read as an
+    // unsupported spec downstream).
+    let err = resolver.resolve(&wanted, &opts).await.expect_err("expected a guard error");
+    let message = err.to_string();
+    assert!(message.contains("acme"), "{message}");
+    assert!(message.contains("rejected by the resolver guard"), "{message}");
+}
+
+/// Packument whose `1.5.0+build` key carries a manifest `version` of
+/// `1.5.0` — i.e. the version-map key differs from the parsed manifest
+/// version, the case a malformed/malicious registry can produce.
+const MISMATCHED_KEY_BODY: &str = r#"{
+    "name": "acme",
+    "dist-tags": { "latest": "1.5.0+build" },
+    "modified": "2025-01-15T12:00:00.000Z",
+    "time": {
+        "1.0.0": "2024-01-10T08:30:00.000Z",
+        "1.5.0+build": "2024-12-10T08:30:00.000Z"
+    },
+    "versions": {
+        "1.0.0": {
+            "name": "acme",
+            "version": "1.0.0",
+            "dist": {
+                "integrity": "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+                "shasum": "0000000000000000000000000000000000000000",
+                "tarball": "https://registry/acme-1.0.0.tgz"
+            }
+        },
+        "1.5.0+build": {
+            "name": "acme",
+            "version": "1.5.0",
+            "dist": {
+                "integrity": "sha512-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB==",
+                "shasum": "1111111111111111111111111111111111111111",
+                "tarball": "https://registry/acme-1.5.0.tgz"
+            }
+        }
+    }
+}"#;
+
+#[tokio::test]
+async fn package_version_guard_blocks_the_packument_key_not_the_parsed_version() {
+    let mut server = mockito::Server::new_async().await;
+    let _mock = server
+        .mock("GET", "/acme")
+        .with_status(200)
+        .with_body(MISMATCHED_KEY_BODY)
+        .create_async()
+        .await;
+    let registry = format!("{}/", server.url());
+    let (resolver, _tempdir) = build_resolver(&registry);
+
+    // The guard rejects the parsed manifest version `1.5.0`, whose
+    // packument key is `1.5.0+build`. The repick must still exclude that
+    // entry and fall back to `1.0.0`, rather than wrongly reporting that
+    // every version is blocked.
+    let opts = ResolveOptions {
+        package_version_guard: Some(reject_versions(&["1.5.0"])),
+        ..ResolveOptions::default()
+    };
+    let wanted = WantedDependency {
+        alias: Some("acme".to_string()),
+        bare_specifier: Some("^1.0.0".to_string()),
+        ..WantedDependency::default()
+    };
+
+    let result = resolver.resolve(&wanted, &opts).await.unwrap().unwrap();
+    assert_eq!(result.name_ver.as_ref().expect("name_ver").suffix.to_string(), "1.0.0");
+}
+
+#[tokio::test]
 async fn workspace_path_form_falls_through_to_local_resolver() {
     let server = mockito::Server::new_async().await;
     let registry = format!("{}/", server.url());
     let (resolver, _tempdir) = build_resolver(&registry);
 
-    // `workspace:./foo` and `workspace:../foo` are owned by the local
-    // resolver in the chain — `try_resolve_from_workspace` defers on
-    // them so the dispatcher falls through.
     let wanted = WantedDependency {
         alias: Some("acme".to_string()),
         bare_specifier: Some("workspace:./acme".to_string()),
@@ -167,10 +367,6 @@ async fn workspace_version_without_workspace_packages_surfaces_error() {
         bare_specifier: Some("workspace:*".to_string()),
         ..WantedDependency::default()
     };
-    // Mirrors pnpm's
-    // [`Cannot resolve package from workspace because opts.workspacePackages is not defined`](https://github.com/pnpm/pnpm/blob/ef87f3ccff/resolving/npm-resolver/src/index.ts#L828-L830)
-    // throw when the resolver receives a `workspace:` spec but the
-    // install caller never populated `workspace_packages`.
     let err = resolver
         .resolve(&wanted, &ResolveOptions::default())
         .await
@@ -218,6 +414,52 @@ async fn surfaces_min_release_age_violation_inline() {
     let result = resolver.resolve(&wanted, &opts).await.unwrap().unwrap();
     let violation = result.policy_violation.expect("violation surfaced");
     assert_eq!(violation.code, MINIMUM_RELEASE_AGE_VIOLATION_CODE);
+}
+
+#[tokio::test]
+async fn trust_downgrade_at_resolve_time_fails_under_no_downgrade() {
+    let mut server = mockito::Server::new_async().await;
+    let _mock = server
+        .mock("GET", "/acme")
+        .with_status(200)
+        .with_body(TRUST_DOWNGRADE_PACKAGE_BODY)
+        .create_async()
+        .await;
+    let registry = format!("{}/", server.url());
+    let (resolver, _tempdir) = build_resolver(&registry);
+
+    let opts = ResolveOptions {
+        trust_policy: Some(TrustPolicy::NoDowngrade),
+        ..ResolveOptions::default()
+    };
+    let wanted = WantedDependency {
+        alias: Some("acme".to_string()),
+        bare_specifier: Some("^1.0.0".to_string()),
+        ..WantedDependency::default()
+    };
+    let err = resolver.resolve(&wanted, &opts).await.expect_err("trust downgrade should fail");
+    assert!(err.to_string().contains("trust downgrade"), "got {err}");
+}
+
+#[tokio::test]
+async fn trust_downgrade_ignored_when_trust_policy_off() {
+    let mut server = mockito::Server::new_async().await;
+    let _mock = server
+        .mock("GET", "/acme")
+        .with_status(200)
+        .with_body(TRUST_DOWNGRADE_PACKAGE_BODY)
+        .create_async()
+        .await;
+    let registry = format!("{}/", server.url());
+    let (resolver, _tempdir) = build_resolver(&registry);
+
+    let wanted = WantedDependency {
+        alias: Some("acme".to_string()),
+        bare_specifier: Some("^1.0.0".to_string()),
+        ..WantedDependency::default()
+    };
+    let result = resolver.resolve(&wanted, &ResolveOptions::default()).await.unwrap().unwrap();
+    assert_eq!(result.name_ver.as_ref().expect("name_ver").suffix.to_string(), "1.1.0");
 }
 
 #[tokio::test]
@@ -283,9 +525,6 @@ async fn jsr_specifier_routes_through_jsr_registry() {
     let (resolver, _tempdir) = build_resolver_with_registries(registries);
 
     let wanted = WantedDependency {
-        // The user-facing dependency alias is the JSR-style scoped
-        // name. The resolver folds it into `@jsr/foo__bar` for the
-        // metadata fetch but restores `@foo/bar` on the result.
         alias: Some("@foo/bar".to_string()),
         bare_specifier: Some("jsr:@foo/bar@^1.0.0".to_string()),
         ..WantedDependency::default()
@@ -426,7 +665,7 @@ async fn jsr_specifier_with_invalid_scope_propagates_parser_error() {
     assert_eq!(msg, "Package names from JSR must have a scope", "unexpected error message: {msg}");
 }
 
-/// Two NpmResolvers pointing at different registries, sharing the
+/// Two `NpmResolvers` pointing at different registries, sharing the
 /// same `picked_manifest_cache`, must not hand each other the
 /// other's manifest when both happen to pick `acme@1.0.0`. Two
 /// registries can serve different artifacts under the same
@@ -435,12 +674,6 @@ async fn jsr_specifier_with_invalid_scope_propagates_parser_error() {
 /// would propagate one registry's manifest into the other
 /// resolver's `ResolveResult`, breaking the downstream dependency
 /// graph / peer extraction / lockfile metadata.
-///
-/// The fixture for each registry serves a payload that differs by
-/// `dependencies`, so the cache leak shows up as the second
-/// resolver's `manifest.dependencies` being the *first* registry's
-/// when the bug is present. With the registry-scoped key in place
-/// each resolver gets its own manifest.
 #[tokio::test]
 async fn shared_manifest_cache_does_not_leak_across_registries() {
     fn body_with_dep(dep_name: &str, dep_range: &str) -> String {
@@ -504,6 +737,8 @@ async fn shared_manifest_cache_does_not_leak_across_registries() {
             prefer_offline: false,
             ignore_missing_time_field: false,
             full_metadata: false,
+            filter_metadata: false,
+            retry_opts: RetryOpts::default(),
         };
         (resolver, cache_dir)
     };
@@ -601,8 +836,10 @@ fn workspace_resolve_options(packages: WorkspacePackages) -> ResolveOptions {
 }
 
 /// Ports pnpm's [`index.ts#L1442-L1491`](https://github.com/pnpm/pnpm/blob/5353fcbf01/resolving/npm-resolver/test/index.ts#L1442-L1491);
-/// this is the case behind #11929 (babylon's `@dev/build-tools`
+/// this is the case behind [#11929] (babylon's `@dev/build-tools`
 /// isn't on npm, so bare-semver must resolve via the workspace).
+///
+/// [#11929]: https://github.com/pnpm/pnpm/issues/11929
 #[tokio::test]
 async fn falls_back_to_workspace_when_registry_returns_404() {
     let mut server = mockito::Server::new_async().await;
@@ -957,7 +1194,7 @@ async fn registry_error_propagates_when_workspace_has_no_matching_version() {
         .resolve(&wanted, &opts)
         .await
         .expect_err("workspace can't satisfy 2.0.0; original 404 error must surface");
-    assert!(err.to_string().contains("404"), "expected the 404 to propagate, got: {}", err);
+    assert!(err.to_string().contains("404"), "expected the 404 to propagate, got: {err}");
 }
 
 /// Ports pnpm's [`index.ts#L2154-L2183`](https://github.com/pnpm/pnpm/blob/5353fcbf01/resolving/npm-resolver/test/index.ts#L2154-L2183).

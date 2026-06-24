@@ -12,16 +12,17 @@
 //! `./foo` or `foo.tgz`). [`LocalResolver`] is the combined form
 //! kept for tests and one-off chains that don't need the split.
 
+use crate::{
+    local_resolver::{
+        LocalResolverContext, LocalResolverOptions, LocalResolverUpdate, resolve_from_local_path,
+        resolve_from_local_scheme, resolve_latest_from_local,
+    },
+    parse_bare_specifier::WantedLocalDependency,
+};
 use pacquet_resolving_resolver_base::{
     LatestQuery, ResolveError, ResolveFuture, ResolveLatestFuture, ResolveOptions, ResolveResult,
     Resolver, UpdateBehavior, WantedDependency,
 };
-
-use crate::local_resolver::{
-    LocalResolverContext, LocalResolverOptions, LocalResolverUpdate, resolve_from_local_path,
-    resolve_from_local_scheme, resolve_latest_from_local,
-};
-use crate::parse_bare_specifier::WantedLocalDependency;
 
 /// `Resolver` for the local-scheme branch (`link:` / `file:` /
 /// `workspace:`). Sits between the tarball resolver and the runtime
@@ -39,6 +40,7 @@ pub struct LocalSchemeResolver {
 }
 
 impl LocalSchemeResolver {
+    #[must_use]
     pub fn new(ctx: LocalResolverContext) -> Self {
         Self { ctx }
     }
@@ -92,6 +94,7 @@ pub struct LocalPathResolver {
 }
 
 impl LocalPathResolver {
+    #[must_use]
     pub fn new(ctx: LocalResolverContext) -> Self {
         Self { ctx }
     }
@@ -138,6 +141,7 @@ pub struct LocalResolver {
 }
 
 impl LocalResolver {
+    #[must_use]
     pub fn new(ctx: LocalResolverContext) -> Self {
         Self { ctx }
     }
@@ -221,6 +225,6 @@ fn into_chain_result(
     wanted_dependency: &WantedDependency,
 ) -> ResolveResult {
     let mut chain: ResolveResult = result.into();
-    chain.alias = wanted_dependency.alias.clone();
+    chain.alias.clone_from(&wanted_dependency.alias);
     chain
 }

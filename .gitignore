@@ -39,6 +39,10 @@ privatePackages/store
 
 ## Verdaccio storage
 storage
+# ...but not the pnpr crate's `storage` source module (the bare rule above
+# is unanchored and would otherwise swallow this source directory).
+!/pnpr/crates/pnpr/src/storage/
+!/pnpr/crates/pnpr/src/storage/**
 
 yarn.lock
 
@@ -53,11 +57,15 @@ RELEASE.md
 .pnpm-typecheck.json
 
 ## custom modules-dir fixture
-__fixtures__/custom-modules-dir/**/fake_modules/
-__fixtures__/custom-modules-dir/cache/
-__fixtures__/custom-modules-dir/patches/
+pnpm11/__fixtures__/custom-modules-dir/**/fake_modules/
+pnpm11/__fixtures__/custom-modules-dir/cache/
+pnpm11/__fixtures__/custom-modules-dir/patches/
 
 ## pacquet (Rust) artifacts
 /target
 /bench-work-env
 .pacquet
+
+## test registry auth state (written by pnpr when serving with auth)
+htpasswd
+tokens.db

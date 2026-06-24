@@ -1,6 +1,5 @@
 use crate::HashEncoding;
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -17,19 +16,48 @@ use sha2::{Digest, Sha256};
 /// short-circuit `hashUnknown(undefined)` returns 44 zero characters
 /// regardless of options. Callers who need that semantic should
 /// branch on the optional before calling.
+#[must_use]
 pub fn hash_object(value: &Value) -> String {
     hash_object_with_encoding(value, HashEncoding::Base64, /* sort */ true)
 }
 
 /// Mirrors `hashObjectWithoutSorting` at
 /// <https://github.com/pnpm/pnpm/blob/b4f8f47ac2/crypto/object-hasher/src/index.ts#L37>.
+#[must_use]
 pub fn hash_object_without_sorting(value: &Value, encoding: HashEncoding) -> String {
     hash_object_with_encoding(value, encoding, /* sort */ false)
+}
+
+/// Mirrors `hashObjectNullableWithPrefix` at
+/// <https://github.com/pnpm/pnpm/blob/39101f5e37/crypto/object-hasher/src/index.ts#L44-L48>.
+/// Returns `None` when `value` is `undefined`-like (a null JSON value)
+/// or an empty object — matching upstream's
+/// `if (!object || isEmpty(object)) return undefined`. Otherwise hashes
+/// with sorted keys + sha256 + base64 and prefixes with `sha256-`,
+/// matching the wire shape pnpm writes to `pnpm-lock.yaml#packageExtensionsChecksum`.
+///
+/// Only `Object` is checked for emptiness; non-object, non-null
+/// inputs (Bool / Number / String / Array) are unreachable in
+/// practice for this caller (`packageExtensions` is always a map),
+/// but we hash them anyway rather than panic — pacquet's hasher
+/// already handles them.
+#[must_use]
+pub fn hash_object_nullable_with_prefix(value: &Value) -> Option<String> {
+    let is_nullish = match value {
+        Value::Null => true,
+        Value::Object(map) => map.is_empty(),
+        _ => false,
+    };
+    if is_nullish {
+        return None;
+    }
+    Some(format!("sha256-{}", hash_object(value)))
 }
 
 /// General form. `sort = true` sorts object keys before serialization
 /// (the `unorderedObjects` option upstream); `sort = false` preserves
 /// insertion order.
+#[must_use]
 pub fn hash_object_with_encoding(value: &Value, encoding: HashEncoding, sort: bool) -> String {
     let mut bytes = Vec::new();
     serialize(&mut bytes, value, sort);

@@ -12,11 +12,14 @@
 //! - [`verifyLockfileResolutions.ts`](https://github.com/pnpm/pnpm/blob/2a9bd897bf/installing/deps-installer/src/install/verifyLockfileResolutions.ts)
 //!   — the fan-out runner.
 //! - [`verifyLockfileResolutionsCache.ts`](https://github.com/pnpm/pnpm/blob/2a9bd897bf/installing/deps-installer/src/install/verifyLockfileResolutionsCache.ts)
-//!   — the JSONL stat-and-skip cache (lands in a follow-up slice).
+//!   — the JSONL stat-and-skip cache.
 //!
 //! Public surface today: [`verify_lockfile_resolutions()`],
-//! [`collect_resolution_policy_violations()`], [`hash_lockfile()`], and
-//! [`VerifyError`].
+//! [`collect_resolution_policy_violations()`], [`hash_lockfile()`],
+//! [`VerifyError`], and [`RenderedViolation`] — the last lets a caller
+//! that resolved violations out-of-process (e.g. the pnpr client
+//! reconstructing them from the server's response) rebuild the same
+//! [`VerifyError`] via [`VerifyError::from_rendered`].
 //!
 //! [`ResolutionVerifier`]: pacquet_resolving_resolver_base::ResolutionVerifier
 
@@ -31,10 +34,10 @@ pub use cache::{
     CacheRecord, LockfileStat, MAX_CACHE_ENTRIES, record_verification,
     try_lockfile_verification_cache,
 };
-pub use errors::VerifyError;
+pub use errors::{RenderedViolation, VerifyError};
 pub use hash_lockfile::hash_lockfile;
 pub use record_lockfile_verified::record_lockfile_verified;
 pub use verify_lockfile_resolutions::{
-    VerifyLockfileResolutionsOptions, collect_resolution_policy_violations,
-    verify_lockfile_resolutions,
+    RESOLUTION_SHAPE_MISMATCH_VIOLATION_CODE, VerifyLockfileResolutionsOptions,
+    collect_resolution_policy_violations, verify_lockfile_resolutions,
 };

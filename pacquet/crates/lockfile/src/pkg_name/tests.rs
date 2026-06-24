@@ -1,3 +1,8 @@
+#![allow(
+    clippy::needless_pass_by_value,
+    reason = "nested test helpers take owned fixture values; by-value keeps call sites and assert ergonomics simple"
+)]
+
 use super::{ParsePkgNameError, PkgName};
 use pipe_trait::Pipe;
 use pretty_assertions::assert_eq;
@@ -33,7 +38,7 @@ fn deserialize_decodes_escape_sequences() {
     // to `@`, yielding `@foo/bar`. The deserializer must allocate a
     // fresh buffer to apply the escape, so a borrowed `&'de str`
     // source would reject this input.
-    let input = r##""\u0040foo/bar""##;
+    let input = r#""\u0040foo/bar""#;
     eprintln!("CASE: {input:?}");
     let actual: PkgName = serde_saphyr::from_str(input).unwrap();
     dbg!(&actual);
@@ -80,10 +85,6 @@ fn serialize() {
     case(PkgName { scope: None, bare: "foo-bar".to_string() }, "foo-bar\n");
 }
 
-/// `TryFrom<String>` and `TryFrom<Cow<'_, str>>` route through
-/// the validating parser. Owned and borrowed input forms must
-/// behave identically, since both back the serde deserializer
-/// and the public constructor in different contexts.
 #[test]
 fn try_from_owned_and_cow_route_through_parse() {
     let from_string = PkgName::try_from("@foo/bar".to_string()).expect("valid scoped name parses");
@@ -94,8 +95,6 @@ fn try_from_owned_and_cow_route_through_parse() {
     assert!(from_cow.scope.is_none());
     assert_eq!(from_cow.bare, "foo-bar");
 
-    // Invalid input still propagates `ParsePkgNameError` from both
-    // entry points — pin that the error type matches.
     let owned_err =
         PkgName::try_from(String::new()).expect_err("empty string must fail validation");
     assert!(matches!(owned_err, ParsePkgNameError::EmptyName));

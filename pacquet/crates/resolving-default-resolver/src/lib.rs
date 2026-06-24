@@ -8,11 +8,7 @@
 //!
 //! Today the chain is empty until the per-protocol resolvers
 //! (npm/jsr/git/tarball/local/runtimes/named-registry/workspace) land
-//! in subsequent PRs. A [`DefaultResolver`] built without any
-//! resolvers always returns [`SpecNotSupportedByAnyResolverError`],
-//! mirroring pnpm's
-//! [`SPEC_NOT_SUPPORTED_BY_ANY_RESOLVER`](https://github.com/pnpm/pnpm/blob/3687b0e180/resolving/default-resolver/src/index.ts#L152-L156)
-//! error code.
+//! in subsequent PRs.
 
 use derive_more::{Display, Error};
 use miette::Diagnostic;
@@ -25,12 +21,9 @@ use pacquet_resolving_resolver_base::{
 /// [`createResolver`](https://github.com/pnpm/pnpm/blob/3687b0e180/resolving/default-resolver/src/index.ts#L97-L173)
 /// return value. Wraps an ordered list of per-protocol resolvers.
 ///
-/// Order matters: each resolver in the chain gets the chance to claim
-/// the wanted dependency in declaration order, mirroring the `??`
-/// chain upstream uses inside `createResolver`. Wiring of the actual
-/// resolvers (npm, jsr, git, tarball, local, runtimes, named-registry,
-/// workspace) lands in subsequent PRs as each per-protocol crate is
-/// ported.
+/// Wiring of the actual resolvers (npm, jsr, git, tarball, local,
+/// runtimes, named-registry, workspace) lands in subsequent PRs as
+/// each per-protocol crate is ported.
 pub struct DefaultResolver {
     chain: Vec<Box<dyn Resolver>>,
 }
@@ -38,6 +31,7 @@ pub struct DefaultResolver {
 impl DefaultResolver {
     /// Build a dispatcher from a chain of resolvers. Order is preserved
     /// — earlier entries get the first shot at every wanted dependency.
+    #[must_use]
     pub fn new(chain: Vec<Box<dyn Resolver>>) -> Self {
         Self { chain }
     }
@@ -137,6 +131,7 @@ pub struct SpecNotSupportedByAnyResolverError {
 }
 
 impl SpecNotSupportedByAnyResolverError {
+    #[must_use]
     pub fn new(wanted_dependency: &WantedDependency) -> Self {
         let specifier = render_specifier(wanted_dependency);
         let quoted = quote_specifier(&specifier);
@@ -164,7 +159,7 @@ fn render_specifier(wanted_dependency: &WantedDependency) -> String {
 
 /// Wrap a non-empty specifier in double quotes and leave the empty
 /// case bare. Mirrors upstream's
-/// `if (specifier !== '') specifier = \`"${specifier}"\`` step.
+/// ``if (specifier !== '') specifier = `"${specifier}"` `` step.
 fn quote_specifier(specifier: &str) -> String {
     if specifier.is_empty() { String::new() } else { format!("\"{specifier}\"") }
 }

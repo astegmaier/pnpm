@@ -15,10 +15,7 @@
 //! the outer mutex is dropped before the await so unrelated keys stay
 //! unblocked.
 //!
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use pacquet_registry::Package;
 use tokio::sync::{Mutex, OnceCell};
@@ -30,20 +27,33 @@ use tokio::sync::{Mutex, OnceCell};
 /// is irrelevant to the policy.
 pub(crate) type PublishedAtTimeMap = HashMap<String, String>;
 
-/// Two fields the abbreviated-modified shortcut needs from the
-/// packument: the package-level last-modified timestamp and the set
-/// of version names the registry currently lists. Projected off the
-/// abbreviated packument so the verifier can keep the rest of the
-/// document GC-able after the lookup — the full document runs to
-/// hundreds of KB per package and OOMs CI runners on multi-thousand
-/// entry installs (see [`#11860`](https://github.com/pnpm/pnpm/issues/11860)).
+/// The fields the verifier needs from the packument: the
+/// package-level last-modified timestamp and a per-version map of
+/// `dist.tarball`. The map's keys double as the set of version names
+/// the abbreviated-modified shortcut checks; the values feed the
+/// tarball-URL binding. Projected off the abbreviated packument so the
+/// verifier can keep the rest of the document GC-able after the
+/// lookup — the full document runs to hundreds of KB per package and
+/// OOMs CI runners on multi-thousand entry installs (see
+/// [`#11860`](https://github.com/pnpm/pnpm/issues/11860)); only the
+/// short tarball-URL strings are retained.
 ///
 /// Mirrors upstream's
 /// [`AbbreviatedMetaProjection`](https://github.com/pnpm/pnpm/blob/2a9bd897bf/resolving/npm-resolver/src/createNpmResolutionVerifier.ts#L709-L712).
 #[derive(Debug, Default, Clone)]
 pub(crate) struct AbbreviatedMetaProjection {
     pub modified: Option<String>,
-    pub version_names: Option<HashSet<String>>,
+    /// version → `dist.tarball`; key presence means the version is published.
+    pub version_tarballs: Option<HashMap<String, String>>,
+    /// version → `dist` work statistics (`unpackedSize`, `fileCount`),
+    /// for the versions whose registry published either. Not part of
+    /// upstream's projection — carried so the verifier can surface
+    /// tarball work estimates to fetch scheduling (the verifier's
+    /// [`ObservedDistStats`] sink) without a second metadata
+    /// round-trip.
+    ///
+    /// [`ObservedDistStats`]: crate::ObservedDistStats
+    pub version_dist_stats: Option<HashMap<String, crate::DistStats>>,
 }
 
 /// Slot map of singleflight cells. Outer mutex guards lookup/insert;
@@ -65,7 +75,12 @@ pub(crate) struct PublishedAtLookupContext {
     pub published_at: SingleflightMap<Result<Option<String>, String>>,
     pub full_meta: SingleflightMap<Result<Option<Arc<PublishedAtTimeMap>>, String>>,
     pub full_meta_for_trust: SingleflightMap<Result<Arc<Package>, String>>,
-    pub abbreviated_meta: SingleflightMap<Option<AbbreviatedMetaProjection>>,
+    /// `Ok(projection)` on a successful fetch, `Err(reason)` on a fetch
+    /// failure (auth/network/5xx). The error is carried as a value rather than
+    /// discarded so the tarball-URL check can tell a transport failure apart
+    /// from a version genuinely absent from the metadata; the age shortcut
+    /// ignores it and falls back to per-version lookups.
+    pub abbreviated_meta: SingleflightMap<Result<AbbreviatedMetaProjection, String>>,
     pub local_meta: SingleflightMap<Option<Arc<PublishedAtTimeMap>>>,
 }
 

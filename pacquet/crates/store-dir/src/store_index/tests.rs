@@ -1,11 +1,34 @@
 use super::{
-    CafsFileInfo, GET_MANY_CHUNK, PackageFilesIndex, StoreIndex, git_hosted_store_index_key,
-    pick_store_index_key, store_index_key,
+    CafsFileInfo, GET_MANY_CHUNK, PackageFilesIndex, StoreIndex, StoreIndexError,
+    git_hosted_store_index_key, immutable_sqlite_uri, pick_store_index_key, store_index_key,
 };
 use crate::StoreDir;
 use pretty_assertions::assert_eq;
-use std::collections::HashMap;
+use std::{collections::HashMap, path::Path};
 use tempfile::tempdir;
+
+// `Url::from_file_path` only accepts a platform-absolute path: a POSIX
+// `/store/...` path is not a valid Windows file path, so these construct
+// Unix paths and are gated to Unix.
+#[cfg(unix)]
+#[test]
+fn immutable_uri_percent_encodes_sqlite_path_delimiters() {
+    assert_eq!(
+        immutable_sqlite_uri(Path::new("/store/index.db")).unwrap(),
+        "file:///store/index.db?immutable=1",
+    );
+    assert_eq!(
+        immutable_sqlite_uri(Path::new("/a?b/c#d/100%/index.db")).unwrap(),
+        "file:///a%3Fb/c%23d/100%25/index.db?immutable=1",
+    );
+}
+
+#[test]
+fn immutable_uri_absolutizes_a_relative_path() {
+    let uri = immutable_sqlite_uri(Path::new("relative-store/index.db")).unwrap();
+    assert!(uri.starts_with("file:///"), "{uri}");
+    assert!(uri.ends_with("/relative-store/index.db?immutable=1"), "{uri}");
+}
 
 fn sample_index() -> PackageFilesIndex {
     let mut files = HashMap::new();
@@ -69,9 +92,6 @@ fn pick_store_index_key_uses_git_hosted_for_flagged_tarball() {
 
 #[test]
 fn pick_store_index_key_uses_git_hosted_for_missing_integrity() {
-    // pnpm falls through to `gitHostedStoreIndexKey` for any resolution
-    // missing integrity — covers bare `type: git` resolutions and old
-    // lockfile entries that predate integrity for tarballs.
     let key = pick_store_index_key(None, false, "github.com/foo/bar/abc1234", true);
     assert_eq!(key, "github.com/foo/bar/abc1234\tbuilt");
 }
@@ -95,6 +115,26 @@ fn get_returns_none_for_missing_key() {
     let idx = StoreIndex::open(dir.path()).unwrap();
     assert!(idx.get("sha512-never\tnone@0.0.0").unwrap().is_none());
     assert!(!idx.contains_key("sha512-never\tnone@0.0.0").unwrap());
+}
+
+#[test]
+fn get_by_pkg_id_escapes_like_metacharacters() {
+    let dir = tempdir().unwrap();
+    let idx = StoreIndex::open(dir.path()).unwrap();
+    let exact_pkg_id = r"pkg%_\name@1.0.0";
+    let wildcard_neighbor_pkg_id = "pkgXYZname@1.0.0";
+
+    let neighbor_payload = sample_index();
+    idx.set(&store_index_key("sha512-neighbor", wildcard_neighbor_pkg_id), &neighbor_payload)
+        .unwrap();
+
+    assert!(idx.get_by_pkg_id(exact_pkg_id).unwrap().is_none());
+
+    let mut exact_payload = sample_index();
+    exact_payload.algo = "sha512-special".to_string();
+    idx.set(&store_index_key("sha512-exact", exact_pkg_id), &exact_payload).unwrap();
+
+    assert_eq!(idx.get_by_pkg_id(exact_pkg_id).unwrap(), Some(exact_payload));
 }
 
 #[test]
@@ -126,6 +166,24 @@ fn reopening_the_same_db_sees_prior_writes() {
     }
 
     let idx = StoreIndex::open(dir.path()).unwrap();
+    assert_eq!(idx.get(&key).unwrap().unwrap(), payload);
+}
+
+/// `?` is a legal filename byte on Unix but a `SQLite` URI delimiter, so a raw
+/// `file:{path}?immutable=1` would truncate the path here. (`?` is illegal in
+/// Windows filenames, so this case cannot arise there.)
+#[cfg(unix)]
+#[test]
+fn open_immutable_handles_a_store_path_containing_a_question_mark() {
+    let root = tempdir().unwrap();
+    let store_dir = root.path().join("weird?store");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    let key = store_index_key("sha512-q", "q-pkg@1.0.0");
+    let payload = sample_index();
+
+    StoreIndex::open(&store_dir).unwrap().set(&key, &payload).unwrap();
+
+    let idx = StoreIndex::open_immutable(&store_dir).unwrap();
     assert_eq!(idx.get(&key).unwrap().unwrap(), payload);
 }
 
@@ -217,6 +275,30 @@ fn get_many_all_hit_returns_every_row() {
 }
 
 #[test]
+fn for_each_raw_visits_every_row() {
+    let dir = tempdir().unwrap();
+    let idx = StoreIndex::open(dir.path()).unwrap();
+    let payload = sample_index();
+    let mut keys: Vec<String> =
+        (0..3).map(|index| store_index_key("sha512-x", &format!("pkg{index}@1.0.0"))).collect();
+    for key in &keys {
+        idx.set(key, &payload).unwrap();
+    }
+
+    let mut visited = Vec::new();
+    idx.for_each_raw(|key, data| {
+        assert!(!data.is_empty());
+        visited.push(key);
+        Ok::<(), StoreIndexError>(())
+    })
+    .unwrap();
+
+    keys.sort();
+    visited.sort();
+    assert_eq!(visited, keys);
+}
+
+#[test]
 fn get_many_mixed_hit_and_miss_returns_only_hits() {
     let dir = tempdir().unwrap();
     let idx = StoreIndex::open(dir.path()).unwrap();
@@ -242,6 +324,49 @@ fn get_many_mixed_hit_and_miss_returns_only_hits() {
     }
 }
 
+#[test]
+fn contains_many_returns_only_present_keys() {
+    let dir = tempdir().unwrap();
+    let idx = StoreIndex::open(dir.path()).unwrap();
+    let payload = sample_index();
+    let hit_keys: Vec<String> =
+        (0..3).map(|index| store_index_key("sha512-h", &format!("hit{index}@1.0.0"))).collect();
+    let miss_keys: Vec<String> =
+        (0..3).map(|index| store_index_key("sha512-m", &format!("miss{index}@1.0.0"))).collect();
+    for key in &hit_keys {
+        idx.set(key, &payload).unwrap();
+    }
+
+    let mut all_keys = hit_keys.clone();
+    all_keys.extend(miss_keys.clone());
+    let out = idx.contains_many(&all_keys).unwrap();
+
+    assert_eq!(out.len(), hit_keys.len());
+    for key in &hit_keys {
+        assert!(out.contains(key), "hit key missing from result: {key}");
+    }
+    for key in &miss_keys {
+        assert!(!out.contains(key), "miss key present in result: {key}");
+    }
+}
+
+#[test]
+fn contains_many_handles_empty_input_and_more_keys_than_chunk_size() {
+    let dir = tempdir().unwrap();
+    let idx = StoreIndex::open(dir.path()).unwrap();
+    assert!(idx.contains_many(&[]).unwrap().is_empty());
+
+    let payload = sample_index();
+    let keys: Vec<String> = (0..(GET_MANY_CHUNK + 7))
+        .map(|index| store_index_key("sha512-x", &format!("pkg{index}@1.0.0")))
+        .collect();
+    for key in &keys {
+        idx.set(key, &payload).unwrap();
+    }
+    let out = idx.contains_many(&keys).unwrap();
+    assert_eq!(out.len(), keys.len());
+}
+
 /// A row whose bytes don't decode (corruption, foreign writer) must
 /// be skipped without failing the batch. `load_cached_cas_paths`
 /// already does `.ok()?` on the per-key path, treating decode
@@ -258,9 +383,6 @@ fn get_many_skips_undecodable_rows() {
     idx.conn
         .execute(
             "INSERT INTO package_index (key, data) VALUES (?1, ?2)",
-            // Bytes that aren't valid msgpack — the decoder will reject
-            // these and `get_many` should drop them rather than fail
-            // the whole batch.
             rusqlite::params![&bad_key, &b"not msgpack"[..]],
         )
         .unwrap();
@@ -272,8 +394,7 @@ fn get_many_skips_undecodable_rows() {
     assert!(!out.contains_key(&bad_key));
 }
 
-/// Exercise the chunking path with more keys than `GET_MANY_CHUNK`.
-/// SQLite's `INSERT OR REPLACE` is fast enough that seeding a few
+/// `SQLite`'s `INSERT OR REPLACE` is fast enough that seeding a few
 /// thousand rows in-process stays cheap.
 #[test]
 fn get_many_handles_more_keys_than_chunk_size() {
@@ -292,5 +413,59 @@ fn get_many_handles_more_keys_than_chunk_size() {
     assert_eq!(out.len(), total);
     for key in &keys {
         assert_eq!(out.get(key), Some(&payload));
+    }
+}
+
+/// `open_immutable` must read a WAL-mode `index.db` that lives on a
+/// read-only *directory* — the `frozenStore` / read-only-store
+/// scenario (a Nix store, a read-only bind mount, an OCI layer).
+///
+/// This is the regression guard for the `immutable=1` open: a plain
+/// `SQLITE_OPEN_READ_ONLY` open of a WAL database still tries to create
+/// the `-shm` sidecar in the directory, which fails with "attempt to
+/// write a readonly database" when the directory is not writable.
+/// Revert `open_immutable` to plain `SQLITE_OPEN_READ_ONLY` and this
+/// test fails — confirming the URI is load-bearing.
+#[cfg(unix)]
+#[test]
+fn open_immutable_reads_wal_db_on_readonly_directory() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let key = store_index_key("sha512-ro", "frozen@1.0.0");
+    let payload = sample_index();
+
+    // Seed the WAL db while the directory is still writable, then close
+    // the writer connection so the on-disk file is a settled WAL db —
+    // exactly what a Nix seed-build would leave behind.
+    {
+        let idx = StoreIndex::open(dir.path()).unwrap();
+        idx.set(&key, &payload).unwrap();
+    }
+
+    // Drop the directory to read + execute only: no writes permitted,
+    // so SQLite cannot create any `-shm` / `-wal` / `-journal` sidecar.
+    let original = fs::metadata(dir.path()).unwrap().permissions();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+
+    let read_result = StoreIndex::open_immutable(dir.path()).map(|idx| idx.get(&key));
+
+    // Restore write permission before assertions so the tempdir can be
+    // cleaned up regardless of the outcome.
+    fs::set_permissions(dir.path(), original).unwrap();
+
+    let loaded = read_result
+        .expect("open_immutable must succeed on a read-only directory")
+        .expect("get must not error")
+        .expect("the seeded row must be readable");
+    assert_eq!(loaded, payload);
+
+    // No sidecar may have been created under the read-only directory.
+    for sidecar in ["index.db-shm", "index.db-wal", "index.db-journal"] {
+        assert!(
+            !dir.path().join(sidecar).exists(),
+            "immutable open must not create the {sidecar} sidecar",
+        );
     }
 }

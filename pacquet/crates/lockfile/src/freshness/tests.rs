@@ -1,7 +1,12 @@
-use super::{StalenessReason, check_lockfile_settings, satisfies_package_manifest};
+use super::{
+    LockfileSettingsCheck, StalenessReason, check_lockfile_settings,
+    check_lockfile_settings_with_catalogs, satisfies_package_manifest,
+};
 use crate::Lockfile;
+use pacquet_catalogs_types::Catalogs;
 use pacquet_package_manifest::PackageManifest;
 use pretty_assertions::assert_eq;
+use std::collections::BTreeMap;
 use tempfile::tempdir;
 use text_block_macros::text_block;
 
@@ -17,9 +22,18 @@ fn manifest_from_json(json: &str) -> (tempfile::TempDir, PackageManifest) {
     (tmp, manifest)
 }
 
-/// Single-importer lockfile + matching manifest passes the check.
-/// Baseline for every test below — if this fails everything else is
-/// noise.
+fn settings_check(catalogs: &Catalogs) -> LockfileSettingsCheck<'_> {
+    LockfileSettingsCheck {
+        catalogs,
+        overrides: None,
+        package_extensions_checksum: None,
+        ignored_optional_dependencies: None,
+        patched_dependencies: None,
+        inject_workspace_packages: false,
+        peers_suffix_max_length: crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH,
+    }
+}
+
 #[test]
 fn matching_manifest_and_lockfile_satisfies() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -45,8 +59,6 @@ fn matching_manifest_and_lockfile_satisfies() {
     assert!(satisfies_package_manifest(importer, &manifest, ".", &|_: &str| false).is_ok());
 }
 
-/// Manifest lists a dep the lockfile doesn't. Should surface as
-/// `SpecifiersDiffer` with the missing entry in `added`.
 #[test]
 fn manifest_adds_dep_returns_specifier_diff() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -80,8 +92,6 @@ fn manifest_adds_dep_returns_specifier_diff() {
     assert!(diff.modified.is_empty());
 }
 
-/// Lockfile lists a dep the manifest dropped. Should surface as a
-/// `SpecifiersDiffer` with the dropped entry in `removed`.
 #[test]
 fn manifest_drops_dep_returns_specifier_diff() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -115,10 +125,6 @@ fn manifest_drops_dep_returns_specifier_diff() {
     assert_eq!(diff.removed.get("lodash").map(String::as_str), Some("^4.17.21"));
 }
 
-/// Same dep, same name, different specifier. Should surface as a
-/// `SpecifiersDiffer` with the (lockfile, manifest) pair in
-/// `modified`. This is the "user bumped a dep in package.json
-/// without re-running install" case — the most common drift cause.
 #[test]
 fn manifest_bumps_specifier_returns_specifier_diff() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -151,9 +157,6 @@ fn manifest_bumps_specifier_returns_specifier_diff() {
     assert_eq!(modified.1, "^18.0.0");
 }
 
-/// Manifest with dev + optional in addition to prod, all matching
-/// the lockfile. Confirms the flat-union pre-pass treats all three
-/// fields equally.
 #[test]
 fn matching_across_all_three_dep_fields_satisfies() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -193,7 +196,6 @@ fn matching_across_all_three_dep_fields_satisfies() {
 /// caller asked about isn't present.
 #[test]
 fn missing_importer_returns_no_importer() {
-    // Build a manually-constructed lockfile with empty importers.
     let lockfile: Lockfile =
         serde_saphyr::from_str("lockfileVersion: '9.0'\n").expect("parse minimal lockfile");
     // We can't easily get a `ProjectSnapshot` out of an empty map,
@@ -222,8 +224,6 @@ fn dep_moves_between_fields_returns_dep_specifier_mismatch() {
     })
     .expect("parse fixture lockfile");
     let importer = lockfile.root_project().expect("root importer present");
-    // Same name + specifier, but now in `dependencies` instead of
-    // `devDependencies`.
     let (_dir, manifest) = manifest_from_json(
         r#"{
         "name": "x",
@@ -250,22 +250,12 @@ fn spec_diff_display_lists_added_removed_modified() {
     diff.removed.insert("underscore".to_string(), "^1.0.0".to_string());
     diff.modified.insert("react".to_string(), ("^17.0.2".to_string(), "^18.0.0".to_string()));
     let rendered = diff.to_string();
-    // Plural noun + plural verb for n>1.
     assert!(rendered.contains("2 dependencies were added: "));
-    // Singular noun + singular verb for n==1 — the Copilot review
-    // catch ("1 dependencies were added" was grammatically wrong).
     assert!(rendered.contains("1 dependency was removed: underscore@^1.0.0"));
     assert!(rendered.contains("1 dependency is mismatched:"));
     assert!(rendered.contains("react (lockfile: ^17.0.2, manifest: ^18.0.0)"));
 }
 
-/// Two deps swapped between fields with same cardinality on each
-/// side: lockfile has `react` under `dependencies` + `typescript`
-/// under `devDependencies`, manifest swaps them. The flat-union diff
-/// over `(deps ∪ devDeps ∪ optDeps)` matches because the union is
-/// identical, so the per-field check is the only thing that can
-/// catch this. Pre-fix the per-field loop only ran when field
-/// cardinalities differed; this test guards against that regression.
 #[test]
 fn cross_field_swap_with_same_cardinalities_caught_by_per_field_check() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -283,8 +273,6 @@ fn cross_field_swap_with_same_cardinalities_caught_by_per_field_check() {
     })
     .expect("parse fixture lockfile");
     let importer = lockfile.root_project().expect("root importer present");
-    // Same names + specifiers as the lockfile, but `react` and
-    // `typescript` swap fields.
     let (_dir, manifest) = manifest_from_json(
         r#"{
         "name": "x",
@@ -301,8 +289,6 @@ fn cross_field_swap_with_same_cardinalities_caught_by_per_field_check() {
     );
 }
 
-/// `publishDirectory` on the lockfile differing from
-/// `publishConfig.directory` on the manifest fails the check.
 /// Mirrors upstream's `publishDirectory` mismatch.
 #[test]
 fn publish_directory_mismatch_returns_publish_directory_mismatch() {
@@ -334,9 +320,6 @@ fn publish_directory_mismatch_returns_publish_directory_mismatch() {
     );
 }
 
-/// `dependenciesMeta` mismatch (different `injected` flag) fails
-/// the check. Two `None`s and `None`-vs-empty-object are both
-/// considered equal — that's a separate happy-path case.
 #[test]
 fn dependencies_meta_mismatch_returns_dependencies_meta_mismatch() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -368,10 +351,9 @@ fn dependencies_meta_mismatch_returns_dependencies_meta_mismatch() {
     );
 }
 
-/// `NoImporter` message renders with `importers["."]`-style
-/// formatting, not `importers."."` (the previous `{:?}` debug-
-/// format output). Caught in Copilot review on #450 — debug-format
-/// quoting reads poorly for short keys like `.`.
+/// `NoImporter` renders with `importers["."]`-style formatting, not
+/// the `{:?}` debug-format `importers."."`, which quotes short keys
+/// like `.` poorly.
 #[test]
 fn no_importer_message_uses_bracket_quoted_id() {
     let reason = StalenessReason::NoImporter { importer_id: ".".to_string() };
@@ -383,10 +365,6 @@ fn no_importer_message_uses_bracket_quoted_id() {
     );
 }
 
-/// Multi-element `removed` and `modified` buckets exercise the
-/// plural arm of `noun_verb_for` *and* the comma separator inside
-/// the per-bucket loops. The single-item display test above only
-/// hits the singular branch and the first-iteration of the loop.
 #[test]
 fn spec_diff_display_lists_plural_removed_and_modified_with_separators() {
     let mut diff = super::SpecDiff::default();
@@ -395,20 +373,15 @@ fn spec_diff_display_lists_plural_removed_and_modified_with_separators() {
     diff.modified.insert("gamma".to_string(), ("^3.0.0".to_string(), "^4.0.0".to_string()));
     diff.modified.insert("delta".to_string(), ("^0.1.0".to_string(), "^0.2.0".to_string()));
     let rendered = diff.to_string();
-    // Plural noun + plural verb for n>1 (`were`).
     assert!(rendered.contains("2 dependencies were removed: "), "got: {rendered:?}");
-    // Comma separator inside the removed loop.
     assert!(
         rendered.contains("alpha@^1.0.0, beta@^2.0.0")
             || rendered.contains("beta@^2.0.0, alpha@^1.0.0"),
         "expected comma-joined removed entries, got: {rendered:?}",
     );
-    // Plural noun + plural verb for n>1 `modified` (`are`).
     assert!(rendered.contains("2 dependencies are mismatched:"), "got: {rendered:?}");
 }
 
-/// Pinpoint singular-vs-plural wording per bucket so the n==1 case
-/// doesn't silently regress.
 #[test]
 fn spec_diff_display_uses_singular_for_count_of_one() {
     let mut diff = super::SpecDiff::default();
@@ -421,12 +394,6 @@ fn spec_diff_display_uses_singular_for_count_of_one() {
     assert!(!rendered.contains("dependencies were added"));
 }
 
-/// `dependenciesMeta: {}` on the manifest with no `dependenciesMeta`
-/// on the importer should match — empty object and absent are
-/// equivalent. Mirrors upstream's `?? {}` coercion at
-/// <https://github.com/pnpm/pnpm/blob/94240bc046/lockfile/verification/src/satisfiesPackageManifest.ts#L56-L58>.
-/// Ports the upstream test at
-/// <https://github.com/pnpm/pnpm/blob/94240bc046/lockfile/verification/test/satisfiesPackageManifest.ts#L232-L252>.
 #[test]
 fn dependencies_meta_empty_object_equivalent_to_absent() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -440,7 +407,6 @@ fn dependencies_meta_empty_object_equivalent_to_absent() {
     })
     .expect("parse fixture lockfile");
     let importer = lockfile.root_project().expect("root importer present");
-    // Manifest has `dependenciesMeta: {}`; lockfile has none.
     let (_dir, manifest) = manifest_from_json(
         r#"{
         "name": "x",
@@ -452,9 +418,6 @@ fn dependencies_meta_empty_object_equivalent_to_absent() {
     assert!(satisfies_package_manifest(importer, &manifest, ".", &|_: &str| false).is_ok());
 }
 
-/// `publishDirectory` happy-path: lockfile and manifest agree on the
-/// directory. Ports the upstream test at
-/// <https://github.com/pnpm/pnpm/blob/94240bc046/lockfile/verification/test/satisfiesPackageManifest.ts#L314-L334>.
 #[test]
 fn publish_directory_match_satisfies() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -480,15 +443,6 @@ fn publish_directory_match_satisfies() {
     assert!(satisfies_package_manifest(importer, &manifest, ".", &|_: &str| false).is_ok());
 }
 
-/// Same dep listed in both `dependencies` and `devDependencies` on
-/// the manifest, only in `dependencies` on the lockfile — should
-/// pass because upstream's per-field check filters out a dep from
-/// `devDependencies` when it also exists in `dependencies` /
-/// `optionalDependencies` (precedence: optional > prod > dev).
-/// Mirrors upstream's `pkgDepNames` filter at
-/// <https://github.com/pnpm/pnpm/blob/94240bc046/lockfile/verification/src/satisfiesPackageManifest.ts#L69-L84>.
-/// Ports the upstream test at
-/// <https://github.com/pnpm/pnpm/blob/94240bc046/lockfile/verification/test/satisfiesPackageManifest.ts#L211-L230>.
 #[test]
 fn same_dep_in_prod_and_dev_counts_under_prod() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -502,8 +456,6 @@ fn same_dep_in_prod_and_dev_counts_under_prod() {
     })
     .expect("parse fixture lockfile");
     let importer = lockfile.root_project().expect("root importer present");
-    // Manifest lists foo under both prod and dev; lockfile records
-    // it only under prod (the higher-precedence field).
     let (_dir, manifest) = manifest_from_json(
         r#"{
         "name": "x",
@@ -518,10 +470,6 @@ fn same_dep_in_prod_and_dev_counts_under_prod() {
     );
 }
 
-/// Same dep in both `dependencies` and `optionalDependencies`:
-/// optional wins precedence, lockfile records it only under
-/// `optionalDependencies`. Verifies the precedence rule in the
-/// other direction.
 #[test]
 fn same_dep_in_prod_and_optional_counts_under_optional() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -549,11 +497,6 @@ fn same_dep_in_prod_and_optional_counts_under_optional() {
     );
 }
 
-/// Manifest has prod-only deps; lockfile has prod deps plus an
-/// empty `devDependencies` map. Should satisfy — absent and empty
-/// must be treated alike on the importer side too. Ports the
-/// upstream test at
-/// <https://github.com/pnpm/pnpm/blob/94240bc046/lockfile/verification/test/satisfiesPackageManifest.ts#L20-L31>.
 #[test]
 fn importer_empty_dev_dependencies_equivalent_to_absent() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -579,25 +522,128 @@ fn importer_empty_dev_dependencies_equivalent_to_absent() {
 }
 
 // ---------------------------------------------------------------------------
-// `ignoredOptionalDependencies` — umbrella #434 slice 7
+// `catalogs` drift — pacquet's mirror of upstream's
+// `getOutdatedLockfileSetting` first check
 // ---------------------------------------------------------------------------
 
-/// Sorted equality: both sides empty (`None` and `[]` equivalent).
-/// Mirrors upstream's
-/// [`getOutdatedLockfileSetting.ts:58-60`](https://github.com/pnpm/pnpm/blob/94240bc046/lockfile/settings-checker/src/getOutdatedLockfileSetting.ts#L58-L60).
+#[test]
+fn check_settings_passes_when_catalog_snapshot_matches_config() {
+    let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
+        "lockfileVersion: '9.0'"
+        "catalogs:"
+        "  default:"
+        "    react:"
+        "      specifier: ^18.2.0"
+        "      version: 18.2.0"
+    })
+    .expect("parse lockfile with catalogs");
+    let catalogs = Catalogs::from([(
+        "default".to_string(),
+        BTreeMap::from([("react".to_string(), "^18.2.0".to_string())]),
+    )]);
+    assert!(check_lockfile_settings_with_catalogs(&lockfile, settings_check(&catalogs)).is_ok());
+}
+
+#[test]
+fn check_settings_ignores_catalog_config_entries_absent_from_snapshot() {
+    let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
+        "lockfileVersion: '9.0'"
+    })
+    .expect("parse lockfile without catalog snapshot");
+    let catalogs = Catalogs::from([(
+        "default".to_string(),
+        BTreeMap::from([("react".to_string(), "^18.2.0".to_string())]),
+    )]);
+    assert!(check_lockfile_settings_with_catalogs(&lockfile, settings_check(&catalogs)).is_ok());
+}
+
+#[test]
+fn check_settings_returns_drift_when_catalog_snapshot_specifier_changes() {
+    let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
+        "lockfileVersion: '9.0'"
+        "catalogs:"
+        "  default:"
+        "    react:"
+        "      specifier: ^18.2.0"
+        "      version: 18.2.0"
+    })
+    .expect("parse lockfile with catalogs");
+    let catalogs = Catalogs::from([(
+        "default".to_string(),
+        BTreeMap::from([("react".to_string(), "^19.0.0".to_string())]),
+    )]);
+    let err = check_lockfile_settings_with_catalogs(&lockfile, settings_check(&catalogs))
+        .expect_err("changed catalog entry must surface drift");
+    let StalenessReason::CatalogsChanged { lockfile: snapshot, config } = err else {
+        panic!("expected CatalogsChanged");
+    };
+    assert_eq!(
+        snapshot
+            .as_ref()
+            .and_then(|catalogs| catalogs.get("default"))
+            .and_then(|catalog| catalog.get("react"))
+            .map(|entry| entry.specifier.as_str()),
+        Some("^18.2.0"),
+    );
+    assert_eq!(
+        config.get("default").and_then(|catalog| catalog.get("react")).map(String::as_str),
+        Some("^19.0.0"),
+    );
+}
+
+#[test]
+fn check_settings_returns_drift_when_catalog_snapshot_entry_is_removed_from_config() {
+    let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
+        "lockfileVersion: '9.0'"
+        "catalogs:"
+        "  default:"
+        "    react:"
+        "      specifier: ^18.2.0"
+        "      version: 18.2.0"
+    })
+    .expect("parse lockfile with catalogs");
+    let catalogs = Catalogs::from([("default".to_string(), BTreeMap::new())]);
+    let err = check_lockfile_settings_with_catalogs(&lockfile, settings_check(&catalogs))
+        .expect_err("removed catalog entry must surface drift");
+    assert!(matches!(err, StalenessReason::CatalogsChanged { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// `ignoredOptionalDependencies` — umbrella <https://github.com/pnpm/pacquet/issues/434> slice 7
+// ---------------------------------------------------------------------------
+
 #[test]
 fn check_settings_passes_when_both_sides_empty() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
         "lockfileVersion: '9.0'"
     })
     .expect("parse minimal lockfile");
-    assert!(check_lockfile_settings(&lockfile, None, None).is_ok());
-    assert!(check_lockfile_settings(&lockfile, None, Some(&[])).is_ok());
+    assert!(
+        check_lockfile_settings(
+            &lockfile,
+            None,
+            None,
+            None,
+            None,
+            false,
+            crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH
+        )
+        .is_ok(),
+    );
+    assert!(
+        check_lockfile_settings(
+            &lockfile,
+            None,
+            None,
+            Some(&[]),
+            None,
+            false,
+            crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH
+        )
+        .is_ok(),
+    );
 }
 
-/// Order-insensitive compare — upstream sorts both arrays before
-/// the equality check, so a config that lists patterns in a
-/// different order must still pass.
 #[test]
 fn check_settings_passes_when_sets_match_regardless_of_order() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -608,10 +654,20 @@ fn check_settings_passes_when_sets_match_regardless_of_order() {
     })
     .expect("parse lockfile with ignoredOptionalDependencies");
     let config_set = ["bar".to_string(), "foo".to_string()];
-    assert!(check_lockfile_settings(&lockfile, None, Some(&config_set)).is_ok());
+    assert!(
+        check_lockfile_settings(
+            &lockfile,
+            None,
+            None,
+            Some(&config_set),
+            None,
+            false,
+            crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH,
+        )
+        .is_ok(),
+    );
 }
 
-/// Set mismatch surfaces as `IgnoredOptionalDependenciesChanged`.
 #[test]
 fn check_settings_returns_drift_when_sets_differ() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -621,8 +677,16 @@ fn check_settings_returns_drift_when_sets_differ() {
     })
     .expect("parse lockfile with ignoredOptionalDependencies");
     let config_set = ["bar".to_string()];
-    let err = check_lockfile_settings(&lockfile, None, Some(&config_set))
-        .expect_err("set drift must surface as IgnoredOptionalDependenciesChanged");
+    let err = check_lockfile_settings(
+        &lockfile,
+        None,
+        None,
+        Some(&config_set),
+        None,
+        false,
+        crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH,
+    )
+    .expect_err("set drift must surface as IgnoredOptionalDependenciesChanged");
     assert_eq!(
         err,
         StalenessReason::IgnoredOptionalDependenciesChanged {
@@ -632,7 +696,6 @@ fn check_settings_returns_drift_when_sets_differ() {
     );
 }
 
-/// Drift in the "lockfile has, config doesn't" direction.
 #[test]
 fn check_settings_returns_drift_when_lockfile_has_set_but_config_does_not() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -641,8 +704,16 @@ fn check_settings_returns_drift_when_lockfile_has_set_but_config_does_not() {
         "  - foo"
     })
     .expect("parse lockfile with ignoredOptionalDependencies");
-    let err = check_lockfile_settings(&lockfile, None, None)
-        .expect_err("removing a set in config while lockfile has it must surface drift");
+    let err = check_lockfile_settings(
+        &lockfile,
+        None,
+        None,
+        None,
+        None,
+        false,
+        crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH,
+    )
+    .expect_err("removing a set in config while lockfile has it must surface drift");
     let StalenessReason::IgnoredOptionalDependenciesChanged { lockfile: l, config: c } = err else {
         panic!("expected IgnoredOptionalDependenciesChanged");
     };
@@ -655,24 +726,40 @@ fn check_settings_returns_drift_when_lockfile_has_set_but_config_does_not() {
 // `getOutdatedLockfileSetting` overrides check
 // ---------------------------------------------------------------------------
 
-/// Both sides empty / absent → no drift. Mirrors upstream's
-/// `equals(lockfile.overrides ?? {}, overrides ?? {})` semantics: a
-/// missing key on either side is treated as the empty map.
 #[test]
 fn check_settings_passes_when_overrides_both_empty() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
         "lockfileVersion: '9.0'"
     })
     .expect("parse minimal lockfile");
-    assert!(check_lockfile_settings(&lockfile, None, None).is_ok());
+    assert!(
+        check_lockfile_settings(
+            &lockfile,
+            None,
+            None,
+            None,
+            None,
+            false,
+            crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH
+        )
+        .is_ok(),
+    );
 
     let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    assert!(check_lockfile_settings(&lockfile, Some(&empty), None).is_ok());
+    assert!(
+        check_lockfile_settings(
+            &lockfile,
+            Some(&empty),
+            None,
+            None,
+            None,
+            false,
+            crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH,
+        )
+        .is_ok(),
+    );
 }
 
-/// Identical maps pass regardless of key insertion order — the
-/// comparison normalizes through `BTreeMap`. Mirrors upstream's
-/// order-insensitive `equals` from Ramda.
 #[test]
 fn check_settings_passes_when_overrides_match_regardless_of_order() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -685,10 +772,20 @@ fn check_settings_passes_when_overrides_match_regardless_of_order() {
     let mut config: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     config.insert("bar".to_string(), "2.0.0".to_string());
     config.insert("foo".to_string(), "1.0.0".to_string());
-    assert!(check_lockfile_settings(&lockfile, Some(&config), None).is_ok());
+    assert!(
+        check_lockfile_settings(
+            &lockfile,
+            Some(&config),
+            None,
+            None,
+            None,
+            false,
+            crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH,
+        )
+        .is_ok(),
+    );
 }
 
-/// Value mismatch on a shared key surfaces as `OverridesChanged`.
 #[test]
 fn check_settings_returns_drift_on_overrides_value_change() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -699,8 +796,16 @@ fn check_settings_returns_drift_on_overrides_value_change() {
     .expect("parse lockfile with overrides");
     let mut config: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     config.insert("foo".to_string(), "2.0.0".to_string());
-    let err = check_lockfile_settings(&lockfile, Some(&config), None)
-        .expect_err("changed override value must surface drift");
+    let err = check_lockfile_settings(
+        &lockfile,
+        Some(&config),
+        None,
+        None,
+        None,
+        false,
+        crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH,
+    )
+    .expect_err("changed override value must surface drift");
     let StalenessReason::OverridesChanged { lockfile: l, config: c } = err else {
         panic!("expected OverridesChanged");
     };
@@ -708,7 +813,6 @@ fn check_settings_returns_drift_on_overrides_value_change() {
     assert_eq!(c.get("foo").map(String::as_str), Some("2.0.0"));
 }
 
-/// Lockfile has an override that config no longer does → drift.
 #[test]
 fn check_settings_returns_drift_when_lockfile_has_overrides_but_config_does_not() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -717,8 +821,16 @@ fn check_settings_returns_drift_when_lockfile_has_overrides_but_config_does_not(
         "  foo: 1.0.0"
     })
     .expect("parse lockfile with overrides");
-    let err = check_lockfile_settings(&lockfile, None, None)
-        .expect_err("dropped override must surface drift");
+    let err = check_lockfile_settings(
+        &lockfile,
+        None,
+        None,
+        None,
+        None,
+        false,
+        crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH,
+    )
+    .expect_err("dropped override must surface drift");
     let StalenessReason::OverridesChanged { lockfile: l, config: c } = err else {
         panic!("expected OverridesChanged");
     };
@@ -726,7 +838,6 @@ fn check_settings_returns_drift_when_lockfile_has_overrides_but_config_does_not(
     assert!(c.is_empty());
 }
 
-/// Config has an override that lockfile doesn't → drift.
 #[test]
 fn check_settings_returns_drift_when_config_has_overrides_but_lockfile_does_not() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -735,8 +846,16 @@ fn check_settings_returns_drift_when_config_has_overrides_but_lockfile_does_not(
     .expect("parse minimal lockfile");
     let mut config: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     config.insert("foo".to_string(), "1.0.0".to_string());
-    let err = check_lockfile_settings(&lockfile, Some(&config), None)
-        .expect_err("added override must surface drift");
+    let err = check_lockfile_settings(
+        &lockfile,
+        Some(&config),
+        None,
+        None,
+        None,
+        false,
+        crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH,
+    )
+    .expect_err("added override must surface drift");
     let StalenessReason::OverridesChanged { lockfile: l, config: c } = err else {
         panic!("expected OverridesChanged");
     };
@@ -744,10 +863,208 @@ fn check_settings_returns_drift_when_config_has_overrides_but_lockfile_does_not(
     assert_eq!(c.get("foo").map(String::as_str), Some("1.0.0"));
 }
 
-/// `overrides` is checked before `ignoredOptionalDependencies` — when
-/// both have drifted, the overrides drift is the one reported, matching
-/// upstream's check ordering at
-/// <https://github.com/pnpm/pnpm/blob/606f53e78f/lockfile/settings-checker/src/getOutdatedLockfileSetting.ts#L50-L56>.
+// ---------------------------------------------------------------------------
+// `patchedDependencies` drift — pacquet's lockfile-side mirror of
+// upstream's `getOutdatedLockfileSetting` patchedDependencies check
+// ---------------------------------------------------------------------------
+
+#[test]
+fn check_settings_passes_when_patched_dependencies_match() {
+    let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
+        "lockfileVersion: '9.0'"
+        "patchedDependencies:"
+        "  graceful-fs@4.2.11: abc123"
+    })
+    .expect("parse lockfile with patchedDependencies");
+    let config = std::collections::BTreeMap::from([(
+        "graceful-fs@4.2.11".to_string(),
+        "abc123".to_string(),
+    )]);
+    assert!(
+        check_lockfile_settings(
+            &lockfile,
+            None,
+            None,
+            None,
+            Some(&config),
+            false,
+            crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH,
+        )
+        .is_ok(),
+    );
+}
+
+/// A changed patch-file hash (e.g. the user edited the patch) surfaces
+/// as `PatchedDependenciesChanged` so the frozen install is rejected
+/// rather than silently materializing against a stale `(patch_hash=...)`.
+#[test]
+fn check_settings_returns_drift_when_patch_hash_changes() {
+    let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
+        "lockfileVersion: '9.0'"
+        "patchedDependencies:"
+        "  graceful-fs@4.2.11: oldhash"
+    })
+    .expect("parse lockfile with patchedDependencies");
+    let config = std::collections::BTreeMap::from([(
+        "graceful-fs@4.2.11".to_string(),
+        "newhash".to_string(),
+    )]);
+    let err = check_lockfile_settings(
+        &lockfile,
+        None,
+        None,
+        None,
+        Some(&config),
+        false,
+        crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH,
+    )
+    .expect_err("changed patch hash must surface drift");
+    let StalenessReason::PatchedDependenciesChanged { lockfile: l, config: c } = err else {
+        panic!("expected PatchedDependenciesChanged, got {err:?}");
+    };
+    assert_eq!(l.get("graceful-fs@4.2.11").map(String::as_str), Some("oldhash"));
+    assert_eq!(c.get("graceful-fs@4.2.11").map(String::as_str), Some("newhash"));
+}
+
+#[test]
+fn check_settings_returns_drift_when_patch_removed_from_config() {
+    let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
+        "lockfileVersion: '9.0'"
+        "patchedDependencies:"
+        "  graceful-fs@4.2.11: abc123"
+    })
+    .expect("parse lockfile with patchedDependencies");
+    let err = check_lockfile_settings(
+        &lockfile,
+        None,
+        None,
+        None,
+        None,
+        false,
+        crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH,
+    )
+    .expect_err("dropped patch must surface drift");
+    let StalenessReason::PatchedDependenciesChanged { lockfile: l, config: c } = err else {
+        panic!("expected PatchedDependenciesChanged, got {err:?}");
+    };
+    assert_eq!(l.get("graceful-fs@4.2.11").map(String::as_str), Some("abc123"));
+    assert!(c.is_empty());
+}
+
+#[test]
+fn check_settings_returns_ok_when_no_package_extensions_checksum_on_either_side() {
+    let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
+        "lockfileVersion: '9.0'"
+    })
+    .expect("parse minimal lockfile");
+    assert!(
+        check_lockfile_settings(
+            &lockfile,
+            None,
+            None,
+            None,
+            None,
+            false,
+            crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH,
+        )
+        .is_ok(),
+    );
+}
+
+#[test]
+fn check_settings_returns_ok_when_package_extensions_checksum_matches() {
+    let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
+        "lockfileVersion: '9.0'"
+        "packageExtensionsChecksum: sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    })
+    .expect("parse lockfile");
+    assert!(
+        check_lockfile_settings(
+            &lockfile,
+            None,
+            Some("sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+            None,
+            None,
+            false,
+            crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH,
+        )
+        .is_ok(),
+    );
+}
+
+/// Mirrors upstream's `lockfile.packageExtensionsChecksum !==
+/// packageExtensionsChecksum` branch.
+#[test]
+fn check_settings_returns_drift_on_package_extensions_checksum_value_change() {
+    let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
+        "lockfileVersion: '9.0'"
+        "packageExtensionsChecksum: sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    })
+    .expect("parse lockfile");
+    let err = check_lockfile_settings(
+        &lockfile,
+        None,
+        Some("sha256-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="),
+        None,
+        None,
+        false,
+        crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH,
+    )
+    .expect_err("changed checksum must surface drift");
+    let StalenessReason::PackageExtensionsChecksumChanged { lockfile: l, config: c } = err else {
+        panic!("expected PackageExtensionsChecksumChanged, got {err:?}");
+    };
+    assert_eq!(l.as_deref(), Some("sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+    assert_eq!(c.as_deref(), Some("sha256-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="));
+}
+
+#[test]
+fn check_settings_returns_drift_when_lockfile_has_checksum_but_config_does_not() {
+    let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
+        "lockfileVersion: '9.0'"
+        "packageExtensionsChecksum: sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    })
+    .expect("parse lockfile");
+    let err = check_lockfile_settings(
+        &lockfile,
+        None,
+        None,
+        None,
+        None,
+        false,
+        crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH,
+    )
+    .expect_err("dropped extensions must surface drift");
+    let StalenessReason::PackageExtensionsChecksumChanged { lockfile: l, config: c } = err else {
+        panic!("expected PackageExtensionsChecksumChanged, got {err:?}");
+    };
+    assert_eq!(l.as_deref(), Some("sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+    assert!(c.is_none());
+}
+
+#[test]
+fn check_settings_returns_drift_when_config_has_checksum_but_lockfile_does_not() {
+    let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
+        "lockfileVersion: '9.0'"
+    })
+    .expect("parse minimal lockfile");
+    let err = check_lockfile_settings(
+        &lockfile,
+        None,
+        Some("sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+        None,
+        None,
+        false,
+        crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH,
+    )
+    .expect_err("added extensions must surface drift");
+    let StalenessReason::PackageExtensionsChecksumChanged { lockfile: l, config: c } = err else {
+        panic!("expected PackageExtensionsChecksumChanged, got {err:?}");
+    };
+    assert!(l.is_none());
+    assert_eq!(c.as_deref(), Some("sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+}
+
 #[test]
 fn check_settings_reports_overrides_before_ignored_optional() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -761,12 +1078,203 @@ fn check_settings_reports_overrides_before_ignored_optional() {
     let mut config: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     config.insert("foo".to_string(), "2.0.0".to_string());
     let ignored: [String; 0] = [];
-    let err = check_lockfile_settings(&lockfile, Some(&config), Some(&ignored))
-        .expect_err("both drifted; expect OverridesChanged surfaced");
+    let err = check_lockfile_settings(
+        &lockfile,
+        Some(&config),
+        None,
+        Some(&ignored),
+        None,
+        false,
+        crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH,
+    )
+    .expect_err("both drifted; expect OverridesChanged surfaced");
     assert!(
         matches!(err, StalenessReason::OverridesChanged { .. }),
         "expected OverridesChanged first, got {err:?}",
     );
+}
+
+// ---------------------------------------------------------------------------
+// `injectWorkspacePackages` drift — pacquet's lockfile-side mirror of
+// upstream's `getOutdatedLockfileSetting.ts:80-82` Boolean-normalized
+// comparison.
+// ---------------------------------------------------------------------------
+
+/// Both sides false → no drift. Pacquet's wire format omits the
+/// `settings.injectWorkspacePackages` key when `false`, so a lockfile
+/// missing the field entirely deserializes to `false` and compares
+/// equal to a config that also has it off.
+#[test]
+fn check_settings_passes_when_inject_workspace_packages_both_false() {
+    let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
+        "lockfileVersion: '9.0'"
+    })
+    .expect("parse minimal lockfile");
+    assert!(
+        check_lockfile_settings(
+            &lockfile,
+            None,
+            None,
+            None,
+            None,
+            false,
+            crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH,
+        )
+        .is_ok(),
+    );
+}
+
+#[test]
+fn check_settings_passes_when_inject_workspace_packages_both_true() {
+    let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
+        "lockfileVersion: '9.0'"
+        "settings:"
+        "  autoInstallPeers: false"
+        "  excludeLinksFromLockfile: false"
+        "  injectWorkspacePackages: true"
+    })
+    .expect("parse lockfile with inject on");
+    assert!(
+        check_lockfile_settings(
+            &lockfile,
+            None,
+            None,
+            None,
+            None,
+            true,
+            crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH,
+        )
+        .is_ok(),
+    );
+}
+
+#[test]
+fn check_settings_returns_drift_when_config_enables_inject_workspace_packages() {
+    let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
+        "lockfileVersion: '9.0'"
+    })
+    .expect("parse minimal lockfile");
+    let err = check_lockfile_settings(
+        &lockfile,
+        None,
+        None,
+        None,
+        None,
+        true,
+        crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH,
+    )
+    .expect_err("enabling inject must surface drift");
+    assert_eq!(
+        err,
+        StalenessReason::InjectWorkspacePackagesChanged { lockfile: false, config: true },
+    );
+}
+
+#[test]
+fn check_settings_returns_drift_when_config_disables_inject_workspace_packages() {
+    let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
+        "lockfileVersion: '9.0'"
+        "settings:"
+        "  autoInstallPeers: false"
+        "  excludeLinksFromLockfile: false"
+        "  injectWorkspacePackages: true"
+    })
+    .expect("parse lockfile with inject on");
+    let err = check_lockfile_settings(
+        &lockfile,
+        None,
+        None,
+        None,
+        None,
+        false,
+        crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH,
+    )
+    .expect_err("disabling inject must surface drift");
+    assert_eq!(
+        err,
+        StalenessReason::InjectWorkspacePackagesChanged { lockfile: true, config: false },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `peersSuffixMaxLength` drift — pacquet's mirror of upstream's
+// `getOutdatedLockfileSetting` peersSuffixMaxLength check
+// ---------------------------------------------------------------------------
+
+#[test]
+fn check_settings_passes_when_peers_suffix_max_length_unset_and_config_is_default() {
+    let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
+        "lockfileVersion: '9.0'"
+    })
+    .expect("parse minimal lockfile");
+    assert!(
+        check_lockfile_settings(
+            &lockfile,
+            None,
+            None,
+            None,
+            None,
+            false,
+            crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH
+        )
+        .is_ok(),
+    );
+}
+
+/// Lockfile carries no `settings.peersSuffixMaxLength` (writer used
+/// the default — pnpm strips the field at that point), but the current
+/// config asks for a non-default value. That's drift: the recorded
+/// dep paths assume 1000; re-resolving under a different cap would
+/// produce a different graph. Mirrors upstream's
+/// [`getOutdatedLockfileSetting.ts`](https://github.com/pnpm/pnpm/blob/39101f5e37/lockfile/settings-checker/src/getOutdatedLockfileSetting.ts)
+/// `lockfile.settings?.peersSuffixMaxLength == null && peersSuffixMaxLength !== 1000`
+/// branch.
+#[test]
+fn check_settings_returns_drift_when_lockfile_implicit_default_differs_from_config() {
+    let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
+        "lockfileVersion: '9.0'"
+    })
+    .expect("parse minimal lockfile");
+    let err = check_lockfile_settings(&lockfile, None, None, None, None, false, 10)
+        .expect_err("config != default must surface drift when lockfile is unset");
+    assert_eq!(
+        err,
+        StalenessReason::PeersSuffixMaxLengthChanged {
+            lockfile: crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH,
+            config: 10,
+        },
+    );
+}
+
+#[test]
+fn check_settings_passes_when_explicit_peers_suffix_max_length_matches() {
+    let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
+        "lockfileVersion: '9.0'"
+        "settings:"
+        "  autoInstallPeers: false"
+        "  excludeLinksFromLockfile: false"
+        "  peersSuffixMaxLength: 10"
+    })
+    .expect("parse lockfile with settings");
+    assert!(check_lockfile_settings(&lockfile, None, None, None, None, false, 10).is_ok());
+}
+
+/// Mirrors upstream's
+/// `lockfile.settings?.peersSuffixMaxLength != null && lockfile.settings.peersSuffixMaxLength !== peersSuffixMaxLength`
+/// branch.
+#[test]
+fn check_settings_returns_drift_when_explicit_peers_suffix_max_length_differs() {
+    let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
+        "lockfileVersion: '9.0'"
+        "settings:"
+        "  autoInstallPeers: false"
+        "  excludeLinksFromLockfile: false"
+        "  peersSuffixMaxLength: 10"
+    })
+    .expect("parse lockfile with settings");
+    let err = check_lockfile_settings(&lockfile, None, None, None, None, false, 100)
+        .expect_err("changed peersSuffixMaxLength must surface drift");
+    assert_eq!(err, StalenessReason::PeersSuffixMaxLengthChanged { lockfile: 10, config: 100 });
 }
 
 /// Once `check_lockfile_settings` passes, `satisfies_package_manifest`
@@ -858,14 +1366,9 @@ fn ignored_optional_dependencies_round_trips_through_yaml() {
 /// [`createOptionalDependenciesRemover`](https://github.com/pnpm/pnpm/blob/94240bc046/hooks/read-package-hook/src/createOptionalDependenciesRemover.ts)
 /// iterates `optionalDependencies` keys and deletes from
 /// `optionalDependencies` + `dependencies` only, never touching
-/// `devDependencies`. Regression for CodeRabbit review on PR #507.
-///
-/// Fixture: same name `foo` in both `optionalDependencies` and
-/// `devDependencies` on the manifest; lockfile has `foo` only in
-/// dev (resolver dropped the optional via the hook, kept the dev).
-/// Filter says `foo` is ignored. Without the group gate, the
-/// manifest's dev `foo` would be filtered too → diff would flag
-/// lockfile's dev `foo` as removed → false drift.
+/// `devDependencies`. Without the group gate, a dev entry sharing a
+/// name with an ignored optional would be filtered too, flagging the
+/// lockfile's dev entry as removed → false drift.
 #[test]
 fn ignored_optional_does_not_apply_to_dev_dependencies() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -891,11 +1394,9 @@ fn ignored_optional_does_not_apply_to_dev_dependencies() {
     assert!(satisfies_package_manifest(importer, &manifest, ".", is_ignored).is_ok());
 }
 
-/// Mirror sanity: if the filter incorrectly applied to dev (the
-/// pre-CodeRabbit-fix behavior), this same fixture without the
-/// group gate would flag drift. Used to pin that the gate exists
-/// — removing the `matches!(... Prod | Optional)` check inside
-/// `satisfies_package_manifest` makes this test fail.
+/// Pins the group gate: removing the `matches!(... Prod | Optional)`
+/// check inside `satisfies_package_manifest` makes this test fail,
+/// because the filter would then incorrectly apply to dev entries.
 #[test]
 fn ignored_optional_dev_only_lockfile_entry_kept() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -916,11 +1417,6 @@ fn ignored_optional_dev_only_lockfile_entry_kept() {
         "devDependencies": { "foo": "^1.0.0" }
     }"#,
     );
-    // The manifest doesn't have `foo` in optionalDependencies, so
-    // upstream's hook wouldn't iterate it. Filter says `foo` matches
-    // a pattern — exercising the case "pattern says foo is ignored
-    // but manifest's only entry for foo is in devDependencies".
-    // Should pass (dev entry untouched).
     let is_ignored: &dyn Fn(&str) -> bool = &|name: &str| name == "foo";
     assert!(satisfies_package_manifest(importer, &manifest, ".", is_ignored).is_ok());
 }

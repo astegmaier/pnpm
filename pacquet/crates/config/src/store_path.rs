@@ -25,7 +25,7 @@
 //! parser cache against the home store and then can't find the same
 //! source files in the case-sensitive TypeScript program loaded from
 //! the workspace volume, so `eslint --fix` fails with a
-//! "TSConfig does not include this file" error on every project file.
+//! "`TSConfig` does not include this file" error on every project file.
 //!
 //! The hardlink attempt itself is threaded through the
 //! [`LinkProbe`] capability so tests can answer the linkability
@@ -53,14 +53,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-/// Resolve where to place the default pnpm store given the SmartDefault
+/// Resolve where to place the default pnpm store given the `SmartDefault`
 /// home-based path and the project root.
 ///
-/// Returns `home_default` unchanged when the project's volume can be
-/// reached via hardlink from `pnpm_home_dir`. Otherwise returns
-/// `<mountpoint>/.pnpm-store` where `<mountpoint>` is the first
-/// ancestor of `pkg_root` that accepts the hardlink (the volume mount
-/// point), preferring the mountpoint's parent when it too is linkable.
 /// Falls back to `home_default` whenever the algorithm cannot complete
 /// — pnpm's
 /// [`storePathRelativeToHome`](https://github.com/pnpm/pnpm/blob/29a42efc3b/store/path/src/index.ts#L45-L78)
@@ -142,9 +137,7 @@ fn filesystem_root(path: &Path) -> PathBuf {
 
 /// Given `from` (an ancestor of `to`), return `from` with one more
 /// path segment appended along the way to `to`. Port of npm's
-/// [`next-path`](https://github.com/zkochan/packages/blob/main/next-path/index.js):
-/// `nextPath('/', '/Volumes/src/proj')` → `'/Volumes'`,
-/// `nextPath('/Volumes', '/Volumes/src/proj')` → `'/Volumes/src'`.
+/// [`next-path`](https://github.com/zkochan/packages/blob/main/next-path/index.js).
 /// Returns `from` unchanged when `from` is not a prefix of `to`.
 fn next_path(from: &Path, to: &Path) -> PathBuf {
     let from_components: Vec<_> = from.components().collect();
@@ -170,7 +163,7 @@ fn next_path(from: &Path, to: &Path) -> PathBuf {
 /// [`canLinkToSubdir`](https://github.com/pnpm/pnpm/blob/29a42efc3b/store/path/src/index.ts#L80-L92):
 /// create a temp file in `from_dir`, create a temp subdirectory in
 /// `to_dir`, attempt the hardlink, then clean up. Failure for any
-/// reason (parent missing, EACCES, EXDEV, …) collapses to `false`.
+/// reason (parent missing, EACCES, EXDEV, ...) collapses to `false`.
 pub(crate) fn host_can_link_between_dirs(from_dir: &Path, to_dir: &Path) -> bool {
     let src = path_temp_in(from_dir);
     if fs::File::create(&src).is_err() {
@@ -197,7 +190,7 @@ pub(crate) fn host_can_link_between_dirs(from_dir: &Path, to_dir: &Path) -> bool
 /// once and removes it.
 fn path_temp_in(folder: &Path) -> PathBuf {
     let pid = std::process::id();
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
     folder.join(format!("_tmp_{pid}_{nanos:08x}"))
 }
 

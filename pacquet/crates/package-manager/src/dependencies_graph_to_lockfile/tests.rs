@@ -1,19 +1,27 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::str::FromStr;
-
+use super::{GraphToLockfileOptions, ImporterLockfileInput, dependencies_graph_to_lockfile};
+use indexmap::IndexMap;
 use pacquet_deps_path::DepPath;
 use pacquet_lockfile::{
     DirectoryResolution, ImporterDepVersion, LockfileResolution, PackageKey, PkgName, PkgNameVer,
-    RegistryResolution, SnapshotDepRef,
+    RegistryResolution, SnapshotDepRef, VariationsResolution,
 };
 use pacquet_package_manifest::PackageManifest;
-use pacquet_resolving_deps_resolver::{DependenciesGraph, DependenciesGraphNode, PeerDep};
+use pacquet_resolving_deps_resolver::{
+    ChildEdge, DependenciesGraph, DependenciesGraphNode, DependenciesTreeNode, DirectDep, NodeId,
+    PeerDep, ResolvePeersOptions, ResolvedPackage, ResolvedTree, TreeChildren, resolve_peers,
+};
 use pacquet_resolving_resolver_base::{PkgResolutionId, ResolveResult};
 use serde_json::json;
 use ssri::Integrity;
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    str::FromStr,
+    sync::Arc,
+};
 use tempfile::TempDir;
 
-use super::{GraphToLockfileOptions, ImporterLockfileInput, dependencies_graph_to_lockfile};
+/// Shared empty catalogs for the catalog-free fixtures in this module.
+static EMPTY_CATALOGS: pacquet_catalogs_types::Catalogs = BTreeMap::new();
 
 /// Build a single-importer [`GraphToLockfileOptions`] under the root key
 /// (`"."`). Every existing test exercises the single-importer shape;
@@ -24,7 +32,7 @@ fn single_importer_opts<'a>(
     direct: BTreeMap<String, DepPath>,
     auto_install_peers: bool,
     exclude_links_from_lockfile: bool,
-    overrides: Option<HashMap<String, String>>,
+    overrides: Option<IndexMap<String, String>>,
     ignored_optional_dependencies: Option<Vec<String>>,
 ) -> GraphToLockfileOptions<'a> {
     let mut importers = BTreeMap::new();
@@ -36,9 +44,18 @@ fn single_importer_opts<'a>(
         importers,
         graph,
         auto_install_peers,
+        dedupe_peers: false,
         exclude_links_from_lockfile,
+        inject_workspace_packages: false,
+        peers_suffix_max_length: None,
         overrides,
         ignored_optional_dependencies,
+        patched_dependencies: None,
+        package_extensions_checksum: None,
+        pnpmfile_checksum: None,
+        catalogs: &EMPTY_CATALOGS,
+        registry: "https://registry.npmjs.org",
+        lockfile_include_tarball_url: false,
     }
 }
 
@@ -100,6 +117,7 @@ fn make_node_with_optional(
         resolved_package_id: format!("{name}@{version}"),
         resolve_result: std::sync::Arc::new(make_resolve_result(name, version, manifest)),
         children,
+        optional_children: HashSet::new(),
         peer_dependencies,
         transitive_peer_dependencies,
         resolved_peer_names: HashSet::new(),
@@ -111,6 +129,10 @@ fn make_node_with_optional(
 }
 
 /// Write a `package.json` to a temp dir and return the loaded manifest.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "test helper called from multiple sites with owned literals; by-value keeps the call sites clean"
+)]
 fn write_manifest(deps_value: serde_json::Value) -> (TempDir, PackageManifest) {
     let tmp = TempDir::new().expect("create tempdir");
     let manifest_path = tmp.path().join("package.json");
@@ -120,10 +142,6 @@ fn write_manifest(deps_value: serde_json::Value) -> (TempDir, PackageManifest) {
     (tmp, manifest)
 }
 
-/// Bare-bones fresh-install lockfile shape: one direct prod dep with no
-/// transitive deps. Exercises the importer-side specifier wiring, the
-/// regular (non-alias, non-peer) version cell, and the packages /
-/// snapshots split.
 #[test]
 fn fresh_install_records_a_single_direct_dependency() {
     let (_tmp, manifest) = write_manifest(json!({
@@ -172,9 +190,135 @@ fn fresh_install_records_a_single_direct_dependency() {
     assert!(snapshot.transitive_peer_dependencies.is_none());
 }
 
-/// `dev` and `optional` direct dependencies land in their own importer
-/// sections — `devDependencies` and `optionalDependencies` — and are
-/// kept out of the plain `dependencies` map.
+#[test]
+fn dedupe_peers_round_trips_through_lockfile_settings() {
+    let (_tmp, manifest) = write_manifest(json!({
+        "name": "fixture",
+        "version": "1.0.0",
+    }));
+    let graph = DependenciesGraph::new();
+    let direct = BTreeMap::new();
+
+    let mut importers = BTreeMap::new();
+    importers.insert(
+        ".".to_string(),
+        ImporterLockfileInput { manifest: &manifest, direct_dependencies_by_alias: direct.clone() },
+    );
+    let on = dependencies_graph_to_lockfile(GraphToLockfileOptions {
+        importers,
+        graph: &graph,
+        auto_install_peers: false,
+        dedupe_peers: true,
+        exclude_links_from_lockfile: false,
+        inject_workspace_packages: false,
+        peers_suffix_max_length: None,
+        overrides: None,
+        ignored_optional_dependencies: None,
+        patched_dependencies: None,
+        package_extensions_checksum: None,
+        pnpmfile_checksum: None,
+        catalogs: &EMPTY_CATALOGS,
+        registry: "https://registry.npmjs.org",
+        lockfile_include_tarball_url: false,
+    });
+    let on_settings = on.settings.as_ref().expect("settings written");
+    assert_eq!(on_settings.dedupe_peers, Some(true));
+    let on_yaml = serde_saphyr::to_string(on_settings).unwrap();
+    assert!(on_yaml.contains("dedupePeers: true"), "yaml: {on_yaml}");
+
+    let mut importers = BTreeMap::new();
+    importers.insert(
+        ".".to_string(),
+        ImporterLockfileInput { manifest: &manifest, direct_dependencies_by_alias: direct },
+    );
+    let off = dependencies_graph_to_lockfile(GraphToLockfileOptions {
+        importers,
+        graph: &graph,
+        auto_install_peers: false,
+        dedupe_peers: false,
+        exclude_links_from_lockfile: false,
+        inject_workspace_packages: false,
+        peers_suffix_max_length: None,
+        overrides: None,
+        ignored_optional_dependencies: None,
+        patched_dependencies: None,
+        package_extensions_checksum: None,
+        pnpmfile_checksum: None,
+        catalogs: &EMPTY_CATALOGS,
+        registry: "https://registry.npmjs.org",
+        lockfile_include_tarball_url: false,
+    });
+    let off_settings = off.settings.as_ref().expect("settings written");
+    assert_eq!(off_settings.dedupe_peers, None);
+    let off_yaml = serde_saphyr::to_string(off_settings).unwrap();
+    assert!(!off_yaml.contains("dedupePeers"), "yaml: {off_yaml}");
+}
+
+#[test]
+fn patched_dependencies_flow_into_lockfile_and_empty_is_omitted() {
+    let (_tmp, manifest) = write_manifest(json!({
+        "name": "fixture",
+        "version": "1.0.0",
+        "dependencies": { "react": "^17.0.2" },
+    }));
+    let node = make_node(
+        "react",
+        "17.0.2",
+        json!({ "name": "react", "version": "17.0.2" }),
+        BTreeMap::new(),
+        BTreeMap::new(),
+        HashSet::new(),
+    );
+    let mut graph = DependenciesGraph::new();
+    graph.insert(node.dep_path.clone(), node);
+    let mut direct = BTreeMap::new();
+    direct.insert("react".to_string(), DepPath::from("react@17.0.2".to_string()));
+
+    let build = |patched: Option<BTreeMap<String, String>>| {
+        let mut importers = BTreeMap::new();
+        importers.insert(
+            ".".to_string(),
+            ImporterLockfileInput {
+                manifest: &manifest,
+                direct_dependencies_by_alias: direct.clone(),
+            },
+        );
+        dependencies_graph_to_lockfile(GraphToLockfileOptions {
+            importers,
+            graph: &graph,
+            auto_install_peers: false,
+            dedupe_peers: false,
+            exclude_links_from_lockfile: false,
+            inject_workspace_packages: false,
+            peers_suffix_max_length: None,
+            overrides: None,
+            ignored_optional_dependencies: None,
+            patched_dependencies: patched,
+            package_extensions_checksum: None,
+            pnpmfile_checksum: None,
+            catalogs: &EMPTY_CATALOGS,
+            registry: "https://registry.npmjs.org",
+            lockfile_include_tarball_url: false,
+        })
+    };
+
+    let with_patch = build(Some(BTreeMap::from([(
+        "graceful-fs@4.2.11".to_string(),
+        "68ebc232025360cb3dcd3081f4067f4e9fc022ab6b6f71a3230e86c7a5b337d1".to_string(),
+    )])));
+    assert_eq!(
+        with_patch
+            .patched_dependencies
+            .as_ref()
+            .and_then(|map| map.get("graceful-fs@4.2.11"))
+            .map(String::as_str),
+        Some("68ebc232025360cb3dcd3081f4067f4e9fc022ab6b6f71a3230e86c7a5b337d1"),
+    );
+
+    assert!(build(Some(BTreeMap::new())).patched_dependencies.is_none());
+    assert!(build(None).patched_dependencies.is_none());
+}
+
 #[test]
 fn dev_and_optional_direct_deps_split_into_distinct_importer_sections() {
     let (_tmp, manifest) = write_manifest(json!({
@@ -220,7 +364,6 @@ fn dev_and_optional_direct_deps_split_into_distinct_importer_sections() {
     let opt = importer.optional_dependencies.as_ref().expect("optional deps");
     assert!(opt.contains_key(&PkgName::parse("fsevents").unwrap()));
 
-    // hasBin / os surface on `packages:` metadata.
     let packages = lockfile.packages.as_ref().unwrap();
     let typescript_key: PackageKey = "typescript@5.1.6".parse().unwrap();
     assert_eq!(packages[&typescript_key].has_bin, Some(true));
@@ -228,10 +371,167 @@ fn dev_and_optional_direct_deps_split_into_distinct_importer_sections() {
     assert_eq!(packages[&fsevents_key].os.as_deref(), Some(["darwin".to_string()].as_slice()));
 }
 
-/// A package with a peer-suffixed depPath produces a peer-keyed snapshot
-/// entry, but the matching `packages:` entry uses the peer-stripped
-/// pkgId. `peerDependencies` metadata lives on `packages:`, not the
-/// snapshot.
+#[test]
+fn duplicate_manifest_alias_uses_pnpm_dependency_field_precedence() {
+    let (_tmp, manifest) = write_manifest(json!({
+        "name": "fixture",
+        "version": "1.0.0",
+        "devDependencies": { "duplicated": "^1.0.0" },
+        "optionalDependencies": { "duplicated": "^1.0.0" },
+    }));
+
+    let duplicated = make_node(
+        "duplicated",
+        "1.0.0",
+        json!({ "name": "duplicated", "version": "1.0.0" }),
+        BTreeMap::new(),
+        BTreeMap::new(),
+        HashSet::new(),
+    );
+    let mut graph = DependenciesGraph::new();
+    graph.insert(duplicated.dep_path.clone(), duplicated);
+
+    let mut direct = BTreeMap::new();
+    direct.insert("duplicated".to_string(), DepPath::from("duplicated@1.0.0".to_string()));
+
+    let lockfile = dependencies_graph_to_lockfile(single_importer_opts(
+        &manifest, &graph, direct, false, false, None, None,
+    ));
+
+    let importer = lockfile.root_project().expect("root importer");
+    assert!(importer.dev_dependencies.is_none(), "optionalDependencies wins over devDependencies");
+    let opt = importer.optional_dependencies.as_ref().expect("optional deps");
+    assert!(opt.contains_key(&PkgName::parse("duplicated").unwrap()));
+}
+
+#[test]
+fn aliased_catalog_dependency_records_catalog_snapshot() {
+    let (_tmp, manifest) = write_manifest(json!({
+        "name": "fixture",
+        "version": "1.0.0",
+        "dependencies": { "js-yaml": "catalog:" },
+    }));
+
+    let zkochan_js_yaml = make_node(
+        "@zkochan/js-yaml",
+        "0.0.11",
+        json!({ "name": "@zkochan/js-yaml", "version": "0.0.11" }),
+        BTreeMap::new(),
+        BTreeMap::new(),
+        HashSet::new(),
+    );
+    let mut graph = DependenciesGraph::new();
+    graph.insert(zkochan_js_yaml.dep_path.clone(), zkochan_js_yaml);
+
+    let mut direct = BTreeMap::new();
+    direct.insert("js-yaml".to_string(), DepPath::from("@zkochan/js-yaml@0.0.11".to_string()));
+
+    let mut catalogs: pacquet_catalogs_types::Catalogs = BTreeMap::new();
+    catalogs
+        .entry("default".to_string())
+        .or_default()
+        .insert("js-yaml".to_string(), "npm:@zkochan/js-yaml@0.0.11".to_string());
+
+    let mut importers = BTreeMap::new();
+    importers.insert(
+        ".".to_string(),
+        ImporterLockfileInput { manifest: &manifest, direct_dependencies_by_alias: direct },
+    );
+    let lockfile = dependencies_graph_to_lockfile(GraphToLockfileOptions {
+        importers,
+        graph: &graph,
+        auto_install_peers: false,
+        dedupe_peers: false,
+        exclude_links_from_lockfile: false,
+        inject_workspace_packages: false,
+        peers_suffix_max_length: None,
+        overrides: None,
+        ignored_optional_dependencies: None,
+        patched_dependencies: None,
+        package_extensions_checksum: None,
+        pnpmfile_checksum: None,
+        catalogs: &catalogs,
+        registry: "https://registry.npmjs.org",
+        lockfile_include_tarball_url: false,
+    });
+
+    let snapshots = lockfile.catalogs.as_ref().expect("catalogs snapshot present");
+    let entry = snapshots
+        .get("default")
+        .and_then(|catalog| catalog.get("js-yaml"))
+        .expect("aliased catalog entry recorded");
+    assert_eq!(entry.specifier, "npm:@zkochan/js-yaml@0.0.11");
+    assert_eq!(entry.version, "0.0.11");
+}
+
+#[test]
+fn runtime_dependency_strips_importer_prefix_and_records_package_version() {
+    let (_tmp, manifest) = write_manifest(json!({
+        "name": "fixture",
+        "version": "1.0.0",
+        "dependencies": { "node": "runtime:26.3.0" },
+    }));
+
+    let dep_path = DepPath::from("node@runtime:26.3.0".to_string());
+    let resolve_result = ResolveResult {
+        id: PkgResolutionId::from("node@runtime:26.3.0"),
+        name_ver: None,
+        latest: None,
+        published_at: None,
+        manifest: Some(std::sync::Arc::new(json!({
+            "name": "node",
+            "version": "26.3.0",
+            "bin": { "node": "bin/node" },
+        }))),
+        resolution: LockfileResolution::Variations(VariationsResolution { variants: vec![] }),
+        resolved_via: "node-runtime".to_string(),
+        normalized_bare_specifier: None,
+        alias: Some("node".to_string()),
+        policy_violation: None,
+    };
+    let node = DependenciesGraphNode {
+        dep_path: dep_path.clone(),
+        resolved_package_id: "node@runtime:26.3.0".to_string(),
+        resolve_result: std::sync::Arc::new(resolve_result),
+        children: BTreeMap::new(),
+        optional_children: HashSet::new(),
+        peer_dependencies: BTreeMap::new(),
+        transitive_peer_dependencies: HashSet::new(),
+        resolved_peer_names: HashSet::new(),
+        depth: 1,
+        installable: true,
+        is_pure: true,
+        optional: false,
+    };
+
+    let mut graph = DependenciesGraph::new();
+    graph.insert(dep_path.clone(), node);
+
+    let mut direct = BTreeMap::new();
+    direct.insert("node".to_string(), dep_path);
+
+    let lockfile = dependencies_graph_to_lockfile(single_importer_opts(
+        &manifest, &graph, direct, false, false, None, None,
+    ));
+
+    let importer = lockfile.root_project().expect("root importer");
+    let entry = importer
+        .dependencies
+        .as_ref()
+        .expect("deps")
+        .get(&PkgName::parse("node").unwrap())
+        .unwrap();
+    assert_eq!(entry.specifier, "runtime:26.3.0");
+    match &entry.version {
+        ImporterDepVersion::Regular(ver) => assert_eq!(ver.to_string(), "runtime:26.3.0"),
+        other => panic!("expected Regular(runtime:26.3.0), got {other:?}"),
+    }
+
+    let metadata_key: PackageKey = "node@runtime:26.3.0".parse().unwrap();
+    let metadata = &lockfile.packages.as_ref().expect("packages")[&metadata_key];
+    assert_eq!(metadata.version.as_deref(), Some("26.3.0"));
+}
+
 #[test]
 fn peer_suffixed_dep_path_splits_into_distinct_snapshot_and_package_keys() {
     let (_tmp, manifest) = write_manifest(json!({
@@ -255,8 +555,10 @@ fn peer_suffixed_dep_path_splits_into_distinct_snapshot_and_package_keys() {
     let mut react_dom_children = BTreeMap::new();
     react_dom_children.insert("react".to_string(), DepPath::from("react@17.0.2".to_string()));
     let mut react_dom_peers = BTreeMap::new();
-    react_dom_peers
-        .insert("react".to_string(), PeerDep { version: "17.0.2".to_string(), optional: false });
+    react_dom_peers.insert(
+        "react".to_string(),
+        PeerDep { version: "17.0.2".to_string(), optional: false, meta_only: false },
+    );
     let react_dom_dep_path = DepPath::from("react-dom@17.0.2(react@17.0.2)".to_string());
     let react_dom = DependenciesGraphNode {
         dep_path: react_dom_dep_path.clone(),
@@ -271,9 +573,10 @@ fn peer_suffixed_dep_path_splits_into_distinct_snapshot_and_package_keys() {
             }),
         )),
         children: react_dom_children,
+        optional_children: HashSet::new(),
         peer_dependencies: react_dom_peers,
         transitive_peer_dependencies: HashSet::new(),
-        resolved_peer_names: ["react".to_string()].into_iter().collect(),
+        resolved_peer_names: std::iter::once("react".to_string()).collect(),
         depth: 1,
         installable: true,
         is_pure: false,
@@ -311,9 +614,6 @@ fn peer_suffixed_dep_path_splits_into_distinct_snapshot_and_package_keys() {
     }
 }
 
-/// Snapshot children declared by the resolved manifest's
-/// `optionalDependencies` map land in the snapshot's
-/// `optionalDependencies` (not `dependencies`).
 #[test]
 fn snapshot_partitions_optional_children_by_manifest_optional_dependencies() {
     let (_tmp, manifest) = write_manifest(json!({
@@ -369,8 +669,98 @@ fn snapshot_partitions_optional_children_by_manifest_optional_dependencies() {
     }
 }
 
-/// `transitivePeerDependencies` carries every name in the node's
-/// transitive set, sorted and deduplicated.
+#[test]
+fn snapshot_preserves_optional_child_edges_from_resolved_tree() {
+    let (_tmp, manifest) = write_manifest(json!({
+        "name": "fixture",
+        "version": "1.0.0",
+        "dependencies": { "outer": "^1.0.0" },
+    }));
+
+    let outer_id = "outer@1.0.0".to_string();
+    let inner_id = "inner@1.0.0".to_string();
+    let outer_node_id = NodeId::next();
+
+    let mut tree = ResolvedTree {
+        direct: vec![DirectDep {
+            alias: "outer".to_string(),
+            node_id: outer_node_id.clone(),
+            id: outer_id.clone(),
+        }],
+        packages: HashMap::from([
+            (
+                outer_id.clone(),
+                ResolvedPackage {
+                    id: outer_id.clone(),
+                    result: Arc::new(make_resolve_result(
+                        "outer",
+                        "1.0.0",
+                        json!({ "name": "outer", "version": "1.0.0" }),
+                    )),
+                    peer_dependencies: BTreeMap::new(),
+                    optional: false,
+                    is_leaf: false,
+                },
+            ),
+            (
+                inner_id.clone(),
+                ResolvedPackage {
+                    id: inner_id.clone(),
+                    result: Arc::new(make_resolve_result(
+                        "inner",
+                        "1.0.0",
+                        json!({ "name": "inner", "version": "1.0.0" }),
+                    )),
+                    peer_dependencies: BTreeMap::new(),
+                    optional: true,
+                    is_leaf: true,
+                },
+            ),
+        ]),
+        dependencies_tree: HashMap::from([(
+            outer_node_id,
+            DependenciesTreeNode {
+                resolved_package_id: outer_id.clone(),
+                children: TreeChildren::Lazy { parent_ids: Arc::new(Vec::new()) },
+                depth: 0,
+                installable: true,
+            },
+        )]),
+        all_peer_dep_names: HashSet::new(),
+        policy_violations: Vec::new(),
+        applied_patches: HashSet::new(),
+        children_by_id: HashMap::from([(
+            outer_id,
+            Arc::new(vec![ChildEdge {
+                alias: "inner".to_string(),
+                pkg_id: inner_id,
+                optional: true,
+            }]),
+        )]),
+    };
+
+    let resolved = resolve_peers(&mut tree, ResolvePeersOptions::default());
+    let lockfile = dependencies_graph_to_lockfile(single_importer_opts(
+        &manifest,
+        &resolved.graph,
+        resolved.direct_dependencies_by_alias,
+        false,
+        false,
+        None,
+        None,
+    ));
+
+    let snapshots = lockfile.snapshots.as_ref().unwrap();
+    let outer_key: PackageKey = "outer@1.0.0".parse().unwrap();
+    let outer_snap = &snapshots[&outer_key];
+    assert!(outer_snap.dependencies.is_none(), "optional child must not be written as regular");
+    let opt = outer_snap.optional_dependencies.as_ref().expect("opt deps map");
+    assert!(opt.contains_key(&PkgName::parse("inner").unwrap()));
+
+    let inner_key: PackageKey = "inner@1.0.0".parse().unwrap();
+    assert!(snapshots[&inner_key].optional, "optional child edge keeps the child optional");
+}
+
 #[test]
 fn snapshot_records_transitive_peer_dependencies_sorted() {
     let (_tmp, manifest) = write_manifest(json!({
@@ -409,12 +799,6 @@ fn snapshot_records_transitive_peer_dependencies_sorted() {
     assert_eq!(recorded.as_slice(), ["a-peer".to_string(), "z-peer".to_string()].as_slice());
 }
 
-/// `SnapshotEntry.optional` is copied from the resolver's
-/// [`DependenciesGraphNode::optional`] field — `true` for snapshots
-/// the walker marked as reachable only via `optionalDependencies`
-/// edges, `false` for everything else. Confirms the adapter doesn't
-/// silently drop the bit (the regression that motivated the field's
-/// addition in the first place).
 #[test]
 fn snapshot_optional_flag_round_trips_from_dependencies_graph_node() {
     let (_tmp, manifest) = write_manifest(json!({
@@ -464,17 +848,6 @@ fn snapshot_optional_flag_round_trips_from_dependencies_graph_node() {
     );
 }
 
-/// Scenario from
-/// [pnpm/pnpm#11916](https://github.com/pnpm/pnpm/issues/11916): root
-/// declares `optionalDependencies.a` and `dependencies.b`; `a.dependencies = {c}`
-/// and `b.dependencies = {a}`. The resolver's [`DependenciesGraphNode::optional`]
-/// field is stale on `c` — the tree walker marks it `optional: true`
-/// on the `optional → a → c` descent and then misses the AND-fold on
-/// the `prod → b → a` revisit because the lazy-children path doesn't
-/// re-traverse `a`'s subtree. The lockfile-pruner BFS re-derives the
-/// flag from the importer-rooted graph, so `c` ends up `optional:
-/// false` (reachable through the all-non-optional path `prod → b →
-/// a → c`).
 #[test]
 fn transitive_optional_is_recomputed_for_packages_reachable_via_a_non_optional_path() {
     let (_tmp, manifest) = write_manifest(json!({
@@ -484,10 +857,7 @@ fn transitive_optional_is_recomputed_for_packages_reachable_via_a_non_optional_p
         "optionalDependencies": { "a": "^1.0.0" },
     }));
 
-    // `c` was first reached via the optional path, so the resolver
-    // left `node.optional = true`. The pruner should flip it back to
-    // false.
-    let c = make_node_with_optional(
+    let node_c = make_node_with_optional(
         "c",
         "1.0.0",
         json!({ "name": "c", "version": "1.0.0" }),
@@ -497,12 +867,9 @@ fn transitive_optional_is_recomputed_for_packages_reachable_via_a_non_optional_p
         true,
     );
 
-    // `a` was revisited from `b` so the resolver AND-folded its flag
-    // to false — that part already works. The bug is purely in the
-    // descendants.
     let mut a_children = BTreeMap::new();
     a_children.insert("c".to_string(), DepPath::from("c@1.0.0".to_string()));
-    let a = make_node_with_optional(
+    let node_a = make_node_with_optional(
         "a",
         "1.0.0",
         json!({ "name": "a", "version": "1.0.0", "dependencies": { "c": "^1.0.0" } }),
@@ -514,7 +881,7 @@ fn transitive_optional_is_recomputed_for_packages_reachable_via_a_non_optional_p
 
     let mut b_children = BTreeMap::new();
     b_children.insert("a".to_string(), DepPath::from("a@1.0.0".to_string()));
-    let b = make_node_with_optional(
+    let node_b = make_node_with_optional(
         "b",
         "1.0.0",
         json!({ "name": "b", "version": "1.0.0", "dependencies": { "a": "^1.0.0" } }),
@@ -525,9 +892,9 @@ fn transitive_optional_is_recomputed_for_packages_reachable_via_a_non_optional_p
     );
 
     let mut graph = DependenciesGraph::new();
-    graph.insert(a.dep_path.clone(), a);
-    graph.insert(b.dep_path.clone(), b);
-    graph.insert(c.dep_path.clone(), c);
+    graph.insert(node_a.dep_path.clone(), node_a);
+    graph.insert(node_b.dep_path.clone(), node_b);
+    graph.insert(node_c.dep_path.clone(), node_c);
 
     let mut direct = BTreeMap::new();
     direct.insert("a".to_string(), DepPath::from("a@1.0.0".to_string()));
@@ -546,11 +913,6 @@ fn transitive_optional_is_recomputed_for_packages_reachable_via_a_non_optional_p
     assert!(!snapshots[&c_key].optional, "c is reachable via prod → b → a → c");
 }
 
-/// Ported from upstream pnpm's
-/// [`'subdependency is both optional and dev'`](https://github.com/pnpm/pnpm/blob/b9de85dcb6/lockfile/pruner/test/index.ts#L378-L449)
-/// pruner test: when one shared subdep is reached via a dev parent's
-/// `optionalDependencies` and a prod parent's `dependencies`, only
-/// the strictly-optional subdep ends up `optional: true`.
 #[test]
 fn shared_subdep_reached_through_dev_optional_and_prod_paths_is_marked_non_optional() {
     let (_tmp, manifest) = write_manifest(json!({
@@ -661,6 +1023,7 @@ fn make_link_node(target: &str, manifest: serde_json::Value) -> DependenciesGrap
         resolved_package_id: id_text,
         resolve_result: std::sync::Arc::new(resolve_result),
         children: BTreeMap::new(),
+        optional_children: HashSet::new(),
         peer_dependencies: BTreeMap::new(),
         transitive_peer_dependencies: HashSet::new(),
         resolved_peer_names: HashSet::new(),
@@ -671,11 +1034,6 @@ fn make_link_node(target: &str, manifest: serde_json::Value) -> DependenciesGrap
     }
 }
 
-/// A direct dependency resolved to a workspace sibling lands as
-/// `ImporterDepVersion::Link(<rel-path>)` instead of failing to parse
-/// the depPath as `name@version`. Mirrors upstream's
-/// [`depPathToRef`](https://github.com/pnpm/pnpm/blob/097983fbca/installing/deps-resolver/src/depPathToRef.ts)
-/// branch for `link:` resolutions.
 #[test]
 fn workspace_link_direct_dep_renders_as_importer_link() {
     let (_tmp, manifest) = write_manifest(json!({
@@ -704,16 +1062,10 @@ fn workspace_link_direct_dep_renders_as_importer_link() {
         other => panic!("expected Link(..), got {other:?}"),
     }
 
-    // `link:` nodes don't make it into packages: / snapshots: — the
-    // sibling project carries its own importer entry, and the symlink
-    // is materialized by `SymlinkDirectDependencies`.
     assert!(lockfile.packages.is_none() || lockfile.packages.as_ref().unwrap().is_empty());
     assert!(lockfile.snapshots.is_none() || lockfile.snapshots.as_ref().unwrap().is_empty());
 }
 
-/// A transitive dep that depends on a workspace sibling renders the
-/// edge as `SnapshotDepRef::Link(<rel-path>)` instead of dropping it
-/// from the snapshot's `dependencies` map.
 #[test]
 fn workspace_link_child_renders_as_snapshot_link() {
     let (_tmp, manifest) = write_manifest(json!({
@@ -756,10 +1108,6 @@ fn workspace_link_child_renders_as_snapshot_link() {
     }
 }
 
-/// Multi-importer: each workspace project contributes its own
-/// `importers[<id>]` entry with its own `specifiers` and dep groups,
-/// and shared transitive deps are listed once in `packages:` /
-/// `snapshots:`.
 #[test]
 fn multi_importer_workspace_writes_per_project_lockfile_entries() {
     let (_a_tmp, a_manifest) = write_manifest(json!({
@@ -773,8 +1121,6 @@ fn multi_importer_workspace_writes_per_project_lockfile_entries() {
         "dependencies": { "lodash": "^4.17.21" },
     }));
 
-    // Same transitive dep shared by both importers; merging puts one
-    // entry in the unified graph.
     let lodash = make_node(
         "lodash",
         "4.17.21",
@@ -805,9 +1151,18 @@ fn multi_importer_workspace_writes_per_project_lockfile_entries() {
         importers,
         graph: &graph,
         auto_install_peers: false,
+        dedupe_peers: false,
         exclude_links_from_lockfile: false,
+        inject_workspace_packages: false,
+        peers_suffix_max_length: None,
         overrides: None,
         ignored_optional_dependencies: None,
+        patched_dependencies: None,
+        package_extensions_checksum: None,
+        pnpmfile_checksum: None,
+        catalogs: &EMPTY_CATALOGS,
+        registry: "https://registry.npmjs.org",
+        lockfile_include_tarball_url: false,
     });
 
     let a_snap = lockfile.importers.get("packages/a").expect("importer a");
@@ -822,26 +1177,6 @@ fn multi_importer_workspace_writes_per_project_lockfile_entries() {
     assert_eq!(packages.len(), 1, "shared dep deduped to one entry");
 }
 
-/// Multi-importer cross-importer pruner BFS. Ported from upstream
-/// pnpm's [`pruneSharedLockfile`](https://github.com/pnpm/pnpm/blob/d8a79a9c30/lockfile/pruner/src/index.ts#L17)
-/// behavior — `copyPackageSnapshots` pools every importer's
-/// `(devDepPaths, optionalDepPaths, prodDepPaths)` via `unnest(...)`
-/// before the three `copyDependencySubGraph` walks, so a depPath
-/// reachable via a non-optional path from any importer must end up
-/// `optional: false` even when another importer reaches it only via
-/// an optional path.
-///
-/// Scenario:
-/// - `packages/a` has `prod-only` as a prod dep; `prod-only` →
-///   `shared` as a non-optional child.
-/// - `packages/b` has `opt-only` as an optional dep; `opt-only` →
-///   `shared` as a non-optional child (so the optional flag flows
-///   purely from the importer-level edge).
-///
-/// `shared`'s resolver-side `node.optional` is left as `true`
-/// (simulating the resolver having first reached it via the optional
-/// chain). The BFS must flip it back to `false` because importer A's
-/// path is all non-optional.
 #[test]
 fn multi_importer_pruner_marks_shared_dep_non_optional_when_any_importer_reaches_via_prod() {
     let (_a_tmp, a_manifest) = write_manifest(json!({
@@ -855,10 +1190,6 @@ fn multi_importer_pruner_marks_shared_dep_non_optional_when_any_importer_reaches
         "optionalDependencies": { "opt-only": "^1.0.0" },
     }));
 
-    // Stale-optional flag on `shared` — the resolver tagged it
-    // `optional: true` because the optional chain was walked first.
-    // The pruner BFS should re-derive it from importer-rooted
-    // reachability and flip it to false.
     let shared = make_node_with_optional(
         "shared",
         "1.0.0",
@@ -925,9 +1256,18 @@ fn multi_importer_pruner_marks_shared_dep_non_optional_when_any_importer_reaches
         importers,
         graph: &graph,
         auto_install_peers: false,
+        dedupe_peers: false,
         exclude_links_from_lockfile: false,
+        inject_workspace_packages: false,
+        peers_suffix_max_length: None,
         overrides: None,
         ignored_optional_dependencies: None,
+        patched_dependencies: None,
+        package_extensions_checksum: None,
+        pnpmfile_checksum: None,
+        catalogs: &EMPTY_CATALOGS,
+        registry: "https://registry.npmjs.org",
+        lockfile_include_tarball_url: false,
     });
 
     let snapshots = lockfile.snapshots.as_ref().expect("snapshots map");
@@ -945,21 +1285,6 @@ fn multi_importer_pruner_marks_shared_dep_non_optional_when_any_importer_reaches
     );
 }
 
-/// Auto-installed peers (hoisted into `direct_dependencies_by_alias`
-/// by the resolver when `autoInstallPeers: true` is on) must NOT seed
-/// the pruner BFS — they aren't in the manifest, so
-/// [`build_importer`](super::build_importer) excludes them from the
-/// importer's lockfile entry, and upstream's
-/// [`pruneSharedLockfile`](https://github.com/pnpm/pnpm/blob/d8a79a9c30/lockfile/pruner/src/index.ts#L27-L29)
-/// seeds only from what was written to the importer entries.
-///
-/// Scenario: importer declares `parent` in `optionalDependencies`;
-/// the resolver auto-installs `parent`'s peer `peer-x` and hoists it
-/// to the importer's `direct_dependencies_by_alias`. With the
-/// undeclared-alias skip, the BFS only seeds `parent` (optional), so
-/// `peer-x` ends up `optional: true` — matching pnpm. Without the
-/// skip, `peer-x` would have been treated as a Prod-defaulted
-/// importer-level dep and forced to `optional: false`.
 #[test]
 fn auto_installed_peer_not_declared_in_manifest_is_skipped_from_pruner_seeds() {
     let (_tmp, manifest) = write_manifest(json!({
@@ -998,9 +1323,6 @@ fn auto_installed_peer_not_declared_in_manifest_is_skipped_from_pruner_seeds() {
     graph.insert(parent.dep_path.clone(), parent);
     graph.insert(peer_x.dep_path.clone(), peer_x);
 
-    // The resolver hoisted `peer-x` to the importer level even though
-    // the manifest doesn't declare it — this is exactly what
-    // `auto_install_peers` does.
     let mut direct = BTreeMap::new();
     direct.insert("parent".to_string(), DepPath::from("parent@1.0.0".to_string()));
     direct.insert("peer-x".to_string(), DepPath::from("peer-x@1.0.0".to_string()));
@@ -1019,15 +1341,6 @@ fn auto_installed_peer_not_declared_in_manifest_is_skipped_from_pruner_seeds() {
     );
 }
 
-/// Multi-importer with a `workspace:` link between two siblings.
-/// Ported from the spirit of upstream pnpm's
-/// [`headless install is used when package linked to another package in the workspace`](https://github.com/pnpm/pnpm/blob/d8a79a9c30/installing/deps-installer/test/install/multipleImporters.ts#L540)
-/// scenario, narrowed to the lockfile-rendering side: importer `a`
-/// depends on importer `b` via a `link:` resolved depPath, so
-/// `importers["packages/a"].dependencies.b` renders as
-/// `ImporterDepVersion::Link("../b")` and `importers["packages/b"]`
-/// gets its own entry — no cross-pollution into `packages:` /
-/// `snapshots:`.
 #[test]
 fn workspace_sibling_link_renders_per_importer_with_link_ref() {
     let (_a_tmp, a_manifest) = write_manifest(json!({
@@ -1074,13 +1387,20 @@ fn workspace_sibling_link_renders_per_importer_with_link_ref() {
         importers,
         graph: &graph,
         auto_install_peers: false,
+        dedupe_peers: false,
         exclude_links_from_lockfile: false,
+        inject_workspace_packages: false,
+        peers_suffix_max_length: None,
         overrides: None,
         ignored_optional_dependencies: None,
+        patched_dependencies: None,
+        package_extensions_checksum: None,
+        pnpmfile_checksum: None,
+        catalogs: &EMPTY_CATALOGS,
+        registry: "https://registry.npmjs.org",
+        lockfile_include_tarball_url: false,
     });
 
-    // Importer a points at b via a link: ref carrying the relative
-    // path the resolver produced.
     let a_snap = lockfile.importers.get("packages/a").expect("importer a");
     let b_in_a =
         a_snap.dependencies.as_ref().unwrap().get(&PkgName::parse("b").unwrap()).expect("b in a");
@@ -1090,17 +1410,98 @@ fn workspace_sibling_link_renders_per_importer_with_link_ref() {
         other => panic!("expected Link(..), got {other:?}"),
     }
 
-    // Importer b has its own lockfile entry, independent of importer a.
     let b_snap = lockfile.importers.get("packages/b").expect("importer b");
     assert!(
         b_snap.dependencies.as_ref().unwrap().contains_key(&PkgName::parse("lodash").unwrap()),
         "importer b carries its own deps",
     );
 
-    // The link: node never lands in packages: / snapshots: — it's a
-    // sibling project, not a resolved registry package.
     let packages = lockfile.packages.as_ref().expect("packages");
     let lodash_key: PackageKey = "lodash@4.17.21".parse().unwrap();
     assert!(packages.contains_key(&lodash_key));
     assert_eq!(packages.len(), 1, "only lodash lands in packages:");
+}
+
+#[test]
+fn external_link_direct_dep_omitted_from_importer_when_exclude_links_from_lockfile_true() {
+    let (_tmp, manifest) = write_manifest(json!({
+        "name": "fixture",
+        "version": "1.0.0",
+        "dependencies": {
+            "is-positive": "1.0.0",
+            "external-1": "link:/abs/external-1",
+        },
+    }));
+
+    let link_node =
+        make_link_node("/abs/external-1", json!({ "name": "external-1", "version": "1.0.0" }));
+    let is_positive = make_node(
+        "is-positive",
+        "1.0.0",
+        json!({ "name": "is-positive", "version": "1.0.0" }),
+        BTreeMap::new(),
+        BTreeMap::new(),
+        HashSet::new(),
+    );
+
+    let mut graph = DependenciesGraph::new();
+    graph.insert(link_node.dep_path.clone(), link_node.clone());
+    graph.insert(is_positive.dep_path.clone(), is_positive);
+
+    let mut direct = BTreeMap::new();
+    direct.insert("external-1".to_string(), link_node.dep_path);
+    direct.insert("is-positive".to_string(), DepPath::from("is-positive@1.0.0".to_string()));
+
+    let lockfile = dependencies_graph_to_lockfile(single_importer_opts(
+        &manifest, &graph, direct, false, true, None, None,
+    ));
+
+    let importer = lockfile.root_project().expect("root importer");
+    let deps = importer.dependencies.as_ref().expect("dependencies map");
+    assert!(
+        deps.contains_key(&PkgName::parse("is-positive").unwrap()),
+        "non-link direct dep is still recorded",
+    );
+    assert!(
+        !deps.contains_key(&PkgName::parse("external-1").unwrap()),
+        "link: direct dep is omitted from importer.dependencies",
+    );
+    let specifiers = importer.specifiers.as_ref().expect("specifiers map");
+    assert!(
+        !specifiers.contains_key("external-1"),
+        "link: direct dep is omitted from importer.specifiers",
+    );
+    assert!(
+        lockfile.settings.as_ref().expect("settings block").exclude_links_from_lockfile,
+        "the setting round-trips into the lockfile settings block",
+    );
+}
+
+#[test]
+fn workspace_link_direct_dep_kept_when_exclude_links_from_lockfile_true() {
+    let (_tmp, manifest) = write_manifest(json!({
+        "name": "app",
+        "version": "1.0.0",
+        "dependencies": { "shared": "workspace:*" },
+    }));
+
+    let link_node = make_link_node("../shared", json!({ "name": "shared", "version": "1.0.0" }));
+    let mut graph = DependenciesGraph::new();
+    graph.insert(link_node.dep_path.clone(), link_node.clone());
+
+    let mut direct = BTreeMap::new();
+    direct.insert("shared".to_string(), link_node.dep_path);
+
+    let lockfile = dependencies_graph_to_lockfile(single_importer_opts(
+        &manifest, &graph, direct, false, true, None, None,
+    ));
+
+    let importer = lockfile.root_project().expect("root importer");
+    let deps = importer.dependencies.as_ref().expect("dependencies map");
+    let shared = deps.get(&PkgName::parse("shared").unwrap()).expect("shared entry");
+    assert_eq!(shared.specifier, "workspace:*");
+    match &shared.version {
+        ImporterDepVersion::Link(target) => assert_eq!(target, "../shared"),
+        other => panic!("expected Link(..), got {other:?}"),
+    }
 }

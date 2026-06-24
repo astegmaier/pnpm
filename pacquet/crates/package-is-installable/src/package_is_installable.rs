@@ -1,21 +1,28 @@
 //! Port of `packageIsInstallable` from
 //! <https://github.com/pnpm/pnpm/blob/94240bc046/config/package-is-installable/src/index.ts>.
 
+use crate::{
+    check_engine::{
+        Engine, InvalidNodeVersionError, UnsupportedEngineError, WantedEngine, check_engine,
+    },
+    check_platform::{
+        SupportedArchitectures, UnsupportedPlatformError, WantedPlatformRef, check_platform,
+    },
+    infer_platform_from_package_name::inferred_platform,
+};
 use derive_more::{Display, Error};
 use miette::Diagnostic;
 use serde::Serialize;
 
-use crate::check_engine::{
-    Engine, InvalidNodeVersionError, UnsupportedEngineError, WantedEngine, check_engine,
-};
-use crate::check_platform::{
-    SupportedArchitectures, UnsupportedPlatformError, WantedPlatformRef, check_platform,
-};
-
 /// Inputs from a package manifest (or lockfile metadata row) that
 /// drive the installability check.
+///
+/// `name` feeds the platform-from-name inference for optional
+/// dependencies (see [`inferred_platform`]); an empty name disables
+/// the inference and leaves only the declared fields.
 #[derive(Debug, Default, Clone)]
 pub struct PackageInstallabilityManifest {
+    pub name: String,
     pub engines: Option<WantedEngine>,
     pub cpu: Option<Vec<String>>,
     pub os: Option<Vec<String>>,
@@ -64,6 +71,7 @@ impl InstallabilityError {
     /// `pnpm:skipped-optional-dependency` event for an invalid node
     /// version is therefore `unsupported_engine`, even though the
     /// underlying error code is `ERR_PNPM_INVALID_NODE_VERSION`.
+    #[must_use]
     pub fn skip_reason(&self) -> SkipReason {
         match self {
             Self::Engine(_) | Self::InvalidNodeVersion(_) => SkipReason::UnsupportedEngine,
@@ -133,9 +141,6 @@ pub struct InstallabilityOptions<'a> {
 /// the first error a manifest produces, or `None` if compatible.
 /// Mirrors upstream `checkPackage` at
 /// <https://github.com/pnpm/pnpm/blob/94240bc046/config/package-is-installable/src/index.ts#L68-L94>.
-///
-/// Platform is checked first (so an unsupported OS surfaces as a
-/// `Platform` error even if the engine range would also reject).
 pub fn check_package(
     package_id: &str,
     manifest: &PackageInstallabilityManifest,
@@ -201,6 +206,27 @@ pub fn package_is_installable(
     manifest: &PackageInstallabilityManifest,
     options: &InstallabilityOptions<'_>,
 ) -> Result<InstallabilityVerdict, Box<InstallabilityError>> {
+    let effective: PackageInstallabilityManifest;
+    let manifest = if options.optional
+        && let Some(platform) = inferred_platform(
+            &manifest.name,
+            WantedPlatformRef {
+                os: manifest.os.as_deref(),
+                cpu: manifest.cpu.as_deref(),
+                libc: manifest.libc.as_deref(),
+            },
+        ) {
+        effective = PackageInstallabilityManifest {
+            name: manifest.name.clone(),
+            engines: manifest.engines.clone(),
+            os: platform.os,
+            cpu: platform.cpu,
+            libc: platform.libc,
+        };
+        &effective
+    } else {
+        manifest
+    };
     let warn = match check_package(package_id, manifest, options) {
         Ok(maybe) => maybe,
         Err(invalid_node) => {

@@ -16,13 +16,17 @@ fn parsed(map: &[(&str, &str)]) -> Vec<pacquet_config_parse_overrides::VersionOv
 
 /// Build an in-memory `PackageManifest` from a JSON value. The path
 /// is a stub (the overrider reads `value()` / `value_mut()` only).
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "test helper called from multiple sites with owned literals; by-value keeps the call sites clean"
+)]
 fn manifest_from_value(value: Value) -> PackageManifest {
     let dir = tempfile::tempdir().expect("tempdir for manifest");
     let path = dir.path().join("package.json");
     std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
-    // Keep the tempdir alive by leaking its path; tests don't rely on
-    // cleanup since they only inspect the in-memory value.
-    std::mem::forget(dir);
+    // Persist the tempdir; tests only inspect the in-memory value and
+    // don't rely on cleanup.
+    let _ = dir.keep();
     PackageManifest::from_path(path).expect("read fixture manifest")
 }
 
@@ -110,8 +114,6 @@ fn version_scoped_target_only_matches_intersecting_range() {
     );
 }
 
-/// Parent-scoped overrides only fire when the *manifest's* name (and,
-/// if specified, version) matches the `parentPkg` half.
 #[test]
 fn parent_scoped_override_only_fires_on_matching_parent() {
     let overrides = parsed(&[("parent>foo", "9.9.9")]);
@@ -142,12 +144,6 @@ fn parent_scoped_override_only_fires_on_matching_parent() {
     );
 }
 
-/// Both parent-scoped and generic overrides for the same target —
-/// upstream prefers the parent-scoped variant when it matches,
-/// falling back to the generic one otherwise. Mirrors the
-/// `?? pickMostSpecificVersionOverride(genericVersionOverrides…)`
-/// fallback at upstream's
-/// [`createVersionsOverrider.ts:96-108`](https://github.com/pnpm/pnpm/blob/0d88df854f/hooks/read-package-hook/src/createVersionsOverrider.ts#L96-L108).
 #[test]
 fn parent_scoped_override_takes_precedence_over_generic() {
     let overrides = parsed(&[("parent>foo", "9.9.9"), ("foo", "1.0.0")]);
@@ -174,7 +170,6 @@ fn parent_scoped_override_takes_precedence_over_generic() {
     );
 }
 
-/// A `link:` override against an absolute path is written verbatim.
 #[test]
 fn link_protocol_override_absolute_path_written_verbatim() {
     let abs = if cfg!(windows) { r"C:\workspace\local-foo" } else { "/tmp/local-foo" };
@@ -199,11 +194,6 @@ fn link_protocol_override_absolute_path_written_verbatim() {
     assert_eq!(stripped, normalized_abs);
 }
 
-/// A `link:` override given as a relative path is anchored against
-/// the rootDir at construction time and re-relativized against the
-/// importing package's `pkg_dir` on apply. For the root manifest
-/// where `pkg_dir == root_dir`, the result is the same string the
-/// user wrote.
 #[test]
 fn link_protocol_override_relative_path_reanchored_against_pkg_dir() {
     let overrides = parsed(&[("foo", "link:./local-foo")]);
@@ -238,7 +228,6 @@ fn file_protocol_override_rewrites_with_file_prefix() {
     assert!(rewritten.contains("vendor/foo"), "got {rewritten}");
 }
 
-/// No-op: with no overrides, the manifest passes through unchanged.
 #[test]
 fn empty_overrides_leaves_manifest_untouched() {
     let overrides = parsed(&[]);
@@ -255,8 +244,6 @@ fn empty_overrides_leaves_manifest_untouched() {
     assert_eq!(manifest.value(), &before);
 }
 
-/// Override target that the manifest doesn't list: no-op (nothing to
-/// add — upstream's hook only rewrites *existing* dep entries).
 #[test]
 fn override_for_missing_dep_does_not_add_entry() {
     let overrides = parsed(&[("foo", "1.0.0")]);
@@ -271,4 +258,74 @@ fn override_for_missing_dep_does_not_add_entry() {
 
     assert!(manifest.value().get("dependencies").unwrap().get("foo").is_none());
     assert_eq!(dep_spec(&manifest, "dependencies", "bar"), Some("^1"));
+}
+
+#[test]
+fn override_with_valid_peer_range_rewrites_peer_dependencies() {
+    let overrides = parsed(&[("ajv@>=7.0.0-alpha.0 <8.18.0", ">=8.18.0")]);
+    let overrider = VersionsOverrider::new(&overrides, Path::new("/workspace"));
+
+    let mut manifest = manifest_from_value(json!({
+        "name": "schema-validator",
+        "version": "1.0.0",
+        "peerDependencies": { "ajv": "^8.12.0" },
+    }));
+    overrider.apply(&mut manifest, Some(Path::new("/workspace")));
+
+    assert_eq!(dep_spec(&manifest, "peerDependencies", "ajv"), Some(">=8.18.0"));
+    assert_eq!(dep_spec(&manifest, "dependencies", "ajv"), None);
+}
+
+#[test]
+fn override_with_non_peer_range_lands_in_dependencies_and_keeps_the_peer() {
+    let overrides = parsed(&[("istanbul-reports", "npm:@zkochan/istanbul-reports")]);
+    let overrider = VersionsOverrider::new(&overrides, Path::new("/workspace"));
+
+    let mut manifest = manifest_from_value(json!({
+        "name": "reporter-host",
+        "version": "1.0.0",
+        "peerDependencies": { "istanbul-reports": "^3.0.0" },
+    }));
+    overrider.apply(&mut manifest, Some(Path::new("/workspace")));
+
+    assert_eq!(
+        dep_spec(&manifest, "dependencies", "istanbul-reports"),
+        Some("npm:@zkochan/istanbul-reports"),
+    );
+    assert_eq!(dep_spec(&manifest, "peerDependencies", "istanbul-reports"), Some("^3.0.0"));
+}
+
+#[test]
+fn dash_override_deletes_the_peer_dependency() {
+    let overrides = parsed(&[("unwanted-peer", "-")]);
+    let overrider = VersionsOverrider::new(&overrides, Path::new("/workspace"));
+
+    let mut manifest = manifest_from_value(json!({
+        "name": "my-app",
+        "version": "1.0.0",
+        "peerDependencies": { "unwanted-peer": "^1.0.0", "kept": "^2.0.0" },
+    }));
+    overrider.apply(&mut manifest, Some(Path::new("/workspace")));
+
+    assert_eq!(dep_spec(&manifest, "peerDependencies", "unwanted-peer"), None);
+    assert_eq!(dep_spec(&manifest, "peerDependencies", "kept"), Some("^2.0.0"));
+}
+
+#[test]
+fn apply_to_arc_clones_when_only_a_peer_matches() {
+    let overrides = parsed(&[("ajv@<8.18.0", ">=8.18.0")]);
+    let overrider = VersionsOverrider::new(&overrides, Path::new("/workspace"));
+
+    let original = std::sync::Arc::new(json!({
+        "name": "schema-validator",
+        "version": "1.0.0",
+        "peerDependencies": { "ajv": "^8.12.0" },
+    }));
+    let updated = overrider.apply_to_arc(std::sync::Arc::clone(&original), None);
+
+    assert!(!std::sync::Arc::ptr_eq(&original, &updated), "peer-only match must clone");
+    assert_eq!(
+        updated.get("peerDependencies").and_then(|peers| peers.get("ajv")).and_then(Value::as_str),
+        Some(">=8.18.0"),
+    );
 }

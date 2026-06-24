@@ -4,7 +4,7 @@
 //! [`readWorkspaceManifest`](https://github.com/pnpm/pnpm/blob/94240bc046/workspace/workspace-manifest-reader/src/index.ts).
 //!
 //! Pacquet already has `pacquet_config::WorkspaceSettings` parsing
-//! the file for *settings* (`storeDir`, `registry`, …). That stays the
+//! the file for *settings* (`storeDir`, `registry`, ...). That stays the
 //! authoritative settings parser; this module is concerned only with
 //! the workspace-shape fields (`packages:`, catalogs) that drive
 //! project enumeration. Splitting them mirrors upstream's package
@@ -13,13 +13,7 @@
 //! is not a dependency of this crate.)
 //!
 //! The validation rules mirror upstream's
-//! [`validateWorkspaceManifest`](https://github.com/pnpm/pnpm/blob/94240bc046/workspace/workspace-manifest-reader/src/index.ts):
-//!
-//! - File missing → `None`.
-//! - Empty / `{}` document → `Some(default)`.
-//! - Root is not an object (e.g. a YAML sequence) → error.
-//! - `packages` present but not a string array → error.
-//! - Empty-string entries in `packages` → error.
+//! [`validateWorkspaceManifest`](https://github.com/pnpm/pnpm/blob/94240bc046/workspace/workspace-manifest-reader/src/index.ts).
 
 use derive_more::{Display, Error};
 use miette::Diagnostic;
@@ -37,7 +31,7 @@ pub const WORKSPACE_MANIFEST_FILENAME: &str = "pnpm-workspace.yaml";
 
 /// Subset of `pnpm-workspace.yaml` consumed by project enumeration.
 ///
-/// The settings half (`storeDir`, `registry`, lifecycle policies, …)
+/// The settings half (`storeDir`, `registry`, lifecycle policies, ...)
 /// is read separately by `pacquet_config::WorkspaceSettings`.
 /// Splitting along the upstream package boundary keeps each reader
 /// focused on the shape its callers actually need and avoids a
@@ -49,12 +43,13 @@ pub struct WorkspaceManifest {
     /// the workspace dir.
     ///
     /// `Option` rather than `Vec` so callers can distinguish three
-    /// states: `None` (the `packages` key is absent — fall back to the
-    /// default `['.', '**']` patterns, matching upstream's
-    /// `opts.patterns ?? defaults`), `Some(vec![])` (explicit empty
-    /// array — enumerate only the workspace root), and `Some(...)`
-    /// (the user's patterns). Collapsing the first two would silently
-    /// promote `packages: []` into a recursive scan.
+    /// states: `None` (the `packages` key is absent), `Some(vec![])`
+    /// (explicit empty array), and `Some(...)` (the user's patterns).
+    /// Callers that enumerate a real workspace should pass this through
+    /// [`workspace_package_patterns`], while direct `findPackages`-style
+    /// callers can still choose the lower-level recursive default.
+    /// Collapsing the first two would silently lose the difference
+    /// between omitted and explicitly-empty `packages`.
     #[serde(default)]
     pub packages: Option<Vec<String>>,
 
@@ -104,6 +99,16 @@ pub enum ReadWorkspaceManifestError {
     },
     #[diagnostic(transparent)]
     Invalid(#[error(source)] InvalidWorkspaceManifestError),
+}
+
+/// Resolve `pnpm-workspace.yaml` `packages:` into pnpm's workspace
+/// package pattern default.
+///
+/// Mirrors config-reader's `workspacePackagePatterns` fallback:
+/// `workspaceManifest?.packages ?? ['.']`.
+#[must_use]
+pub fn workspace_package_patterns(manifest: &WorkspaceManifest) -> Vec<String> {
+    manifest.packages.clone().unwrap_or_else(|| vec![".".to_string()])
 }
 
 /// Read and validate the `pnpm-workspace.yaml` under `dir`.

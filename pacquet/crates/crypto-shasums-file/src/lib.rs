@@ -8,21 +8,32 @@
 //! `sha256-<base64>` integrity string the lockfile records on the
 //! emitted `BinaryResolution`.
 //!
-//! Two surfaces:
+//! Three surfaces:
 //!
 //! - [`fetch_shasums_file`] — download and parse every row at once.
 //!   The node-resolver and bun-resolver fan the parsed rows out across
 //!   every artifact a release ships.
+//! - [`fetch_verified_node_shasums_file`] — download a Node.js release
+//!   SHASUMS file, verify its detached `OpenPGP` signature against the
+//!   embedded Node.js release keys, then parse the trusted body.
 //! - [`pick_file_checksum_from_shasums_file`] — re-parse a previously
 //!   downloaded body to extract the integrity of a single file. The
 //!   verifier path uses it when only one variant's hash is needed.
 
-use std::sync::Arc;
+mod node_release_keys;
+
+use std::{io::Cursor, string::FromUtf8Error, sync::Arc};
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use derive_more::{Display, Error};
 use miette::Diagnostic;
 use pacquet_network::ThrottledClient;
+use pgp::{
+    composed::{Deserializable, DetachedSignature, SignedPublicKey},
+    types::KeyDetails,
+};
+
+use node_release_keys::{NODE_RELEASE_KEYS, NodeReleaseKey};
 
 /// One row parsed out of a `SHASUMS256.txt` body.
 ///
@@ -55,6 +66,74 @@ pub enum FetchShasumsFileError {
     },
 }
 
+/// Errors raised by [`fetch_verified_node_shasums`] and
+/// [`fetch_verified_node_shasums_file`].
+///
+/// Mirrors pnpm's `NODE_SHASUMS_FETCH_FAIL` and
+/// `NODE_SHASUMS_SIGNATURE_INVALID` codes. These are specific to
+/// Node.js runtime verification, where a repository-configurable
+/// mirror cannot be trusted to supply both the binary and the hash
+/// list unchecked.
+#[derive(Debug, Display, Error, Diagnostic)]
+pub enum FetchVerifiedNodeShasumsError {
+    #[display("Failed to fetch {what} ({url}) to verify the Node.js download (status: {status})")]
+    #[diagnostic(code(NODE_SHASUMS_FETCH_FAIL))]
+    StatusNotOk {
+        #[error(not(source))]
+        what: &'static str,
+        #[error(not(source))]
+        url: String,
+        status: u16,
+    },
+
+    #[display("Failed to fetch {what} ({url}) to verify the Node.js download")]
+    #[diagnostic(code(NODE_SHASUMS_FETCH_FAIL))]
+    Network {
+        #[error(not(source))]
+        what: &'static str,
+        #[error(not(source))]
+        url: String,
+        #[error(source)]
+        error: Arc<reqwest::Error>,
+    },
+
+    #[display("Could not read the Node.js SHASUMS signature: {error}")]
+    #[diagnostic(code(NODE_SHASUMS_SIGNATURE_INVALID))]
+    SignatureUnreadable {
+        #[error(source)]
+        error: Arc<pgp::errors::Error>,
+    },
+
+    #[display("The verified Node.js SHASUMS file at {url} is not valid UTF-8")]
+    #[diagnostic(code(NODE_SHASUMS_SIGNATURE_INVALID))]
+    InvalidUtf8 {
+        #[error(not(source))]
+        url: String,
+        #[error(source)]
+        error: Arc<FromUtf8Error>,
+    },
+
+    #[display(
+        "Embedded Node.js release key fingerprint mismatch: expected {expected}, got {actual}"
+    )]
+    #[diagnostic(code(NODE_SHASUMS_SIGNATURE_INVALID))]
+    EmbeddedKeyFingerprintMismatch {
+        #[error(not(source))]
+        expected: &'static str,
+        #[error(not(source))]
+        actual: String,
+    },
+
+    #[display(
+        "The OpenPGP signature of {url} does not match any trusted Node.js release key. The downloaded Node.js runtime cannot be verified as a genuine release."
+    )]
+    #[diagnostic(code(NODE_SHASUMS_SIGNATURE_INVALID))]
+    SignatureInvalid {
+        #[error(not(source))]
+        url: String,
+    },
+}
+
 /// Errors raised by [`pick_file_checksum_from_shasums_file`].
 ///
 /// Two upstream codes survive the port verbatim — they are the
@@ -77,16 +156,49 @@ pub enum PickFileChecksumError {
 
 /// Download `<shasums_url>` and decode every `<hex>  <filename>` row.
 ///
-/// Mirrors upstream's
-/// [`fetchShasumsFile`](https://github.com/pnpm/pnpm/blob/1627943d2a/crypto/shasums-file/src/index.ts#L11-L27).
-/// Empty lines are skipped; whitespace between the hash and the
-/// filename is split on `\s+` to tolerate the double-space the
-/// upstream files actually use *and* any future formatting drift.
+/// Whitespace between the hash and the filename is split on `\s+` to
+/// tolerate the double-space the upstream files actually use *and* any
+/// future formatting drift.
 pub async fn fetch_shasums_file(
     http_client: &ThrottledClient,
     shasums_url: &str,
 ) -> Result<Vec<ShasumsFileItem>, FetchShasumsFileError> {
     let body = fetch_shasums_file_raw(http_client, shasums_url).await?;
+    Ok(parse_shasums_file(&body))
+}
+
+/// Fetch a Node.js release's `SHASUMS256.txt` and verify its
+/// detached `OpenPGP` signature (`SHASUMS256.txt.sig`) against the
+/// embedded Node.js release keys before returning the body.
+pub async fn fetch_verified_node_shasums(
+    http_client: &ThrottledClient,
+    shasums_url: &str,
+) -> Result<String, FetchVerifiedNodeShasumsError> {
+    let shasums_bytes =
+        fetch_node_shasums_bytes(http_client, shasums_url, "SHASUMS256.txt").await?;
+    let signature_url = format!("{shasums_url}.sig");
+    let signature_bytes =
+        fetch_node_shasums_bytes(http_client, &signature_url, "SHASUMS256.txt.sig").await?;
+
+    if !is_signed_by_trusted_node_release_key(&shasums_bytes, &signature_bytes)? {
+        return Err(FetchVerifiedNodeShasumsError::SignatureInvalid {
+            url: shasums_url.to_string(),
+        });
+    }
+
+    String::from_utf8(shasums_bytes).map_err(|error| FetchVerifiedNodeShasumsError::InvalidUtf8 {
+        url: shasums_url.to_string(),
+        error: Arc::new(error),
+    })
+}
+
+/// Like [`fetch_shasums_file`], but first verifies the SHASUMS file's
+/// detached `OpenPGP` signature against the Node.js release keys.
+pub async fn fetch_verified_node_shasums_file(
+    http_client: &ThrottledClient,
+    shasums_url: &str,
+) -> Result<Vec<ShasumsFileItem>, FetchVerifiedNodeShasumsError> {
+    let body = fetch_verified_node_shasums(http_client, shasums_url).await?;
     Ok(parse_shasums_file(&body))
 }
 
@@ -119,11 +231,84 @@ pub async fn fetch_shasums_file_raw(
     })
 }
 
+async fn fetch_node_shasums_bytes(
+    http_client: &ThrottledClient,
+    url: &str,
+    what: &'static str,
+) -> Result<Vec<u8>, FetchVerifiedNodeShasumsError> {
+    let response =
+        http_client.acquire_for_url(url).await.get(url).send().await.map_err(|error| {
+            FetchVerifiedNodeShasumsError::Network {
+                what,
+                url: url.to_string(),
+                error: Arc::new(error),
+            }
+        })?;
+    if !response.status().is_success() {
+        return Err(FetchVerifiedNodeShasumsError::StatusNotOk {
+            what,
+            url: url.to_string(),
+            status: response.status().as_u16(),
+        });
+    }
+    response.bytes().await.map(|bytes| bytes.to_vec()).map_err(|error| {
+        FetchVerifiedNodeShasumsError::Network {
+            what,
+            url: url.to_string(),
+            error: Arc::new(error),
+        }
+    })
+}
+
+fn is_signed_by_trusted_node_release_key(
+    content: &[u8],
+    signature_bytes: &[u8],
+) -> Result<bool, FetchVerifiedNodeShasumsError> {
+    let signature = DetachedSignature::from_bytes(Cursor::new(signature_bytes))
+        .map_err(signature_unreadable)?;
+    for key in trusted_node_release_keys()? {
+        if signature.verify(&key.primary_key, content).is_ok() {
+            return Ok(true);
+        }
+        for subkey in &key.public_subkeys {
+            if signature.verify(subkey, content).is_ok() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn trusted_node_release_keys() -> Result<Vec<SignedPublicKey>, FetchVerifiedNodeShasumsError> {
+    NODE_RELEASE_KEYS.iter().map(read_node_release_key).collect()
+}
+
+fn read_node_release_key(
+    trusted_key: &NodeReleaseKey,
+) -> Result<SignedPublicKey, FetchVerifiedNodeShasumsError> {
+    let (key, _headers) = SignedPublicKey::from_armor_single(trusted_key.armored_key.as_bytes())
+        .map_err(signature_unreadable)?;
+    let actual_fingerprint = key.fingerprint().to_string();
+    let fingerprint_matches = actual_fingerprint.eq_ignore_ascii_case(trusted_key.fingerprint);
+    if !fingerprint_matches {
+        return Err(FetchVerifiedNodeShasumsError::EmbeddedKeyFingerprintMismatch {
+            expected: trusted_key.fingerprint,
+            actual: actual_fingerprint,
+        });
+    }
+    Ok(key)
+}
+
+fn signature_unreadable(error: pgp::errors::Error) -> FetchVerifiedNodeShasumsError {
+    FetchVerifiedNodeShasumsError::SignatureUnreadable { error: Arc::new(error) }
+}
+
 /// Parse a `SHASUMS256.txt` body into rows.
 ///
 /// Split out from [`fetch_shasums_file`] so verifier-side code that
 /// already has the body in hand can decode it without re-issuing the
 /// network request.
+#[must_use]
 pub fn parse_shasums_file(body: &str) -> Vec<ShasumsFileItem> {
     body.lines()
         .filter_map(|line| {
@@ -143,12 +328,9 @@ pub fn parse_shasums_file(body: &str) -> Vec<ShasumsFileItem> {
 
 /// Pull the integrity of one file out of a body the caller already has.
 ///
-/// Mirrors upstream's
-/// [`pickFileChecksumFromShasumsFile`](https://github.com/pnpm/pnpm/blob/1627943d2a/crypto/shasums-file/src/index.ts#L46-L67):
-/// match on a row ending in `  <file_name>` (two spaces — the format
+/// Matches on a row ending in `  <file_name>` (two spaces — the format
 /// upstream's files actually use, *not* the `\s+` permissive split
-/// [`fetch_shasums_file`] tolerates), validate the hex hash is exactly
-/// 64 lower-case hex characters, then re-encode it as `sha256-<b64>`.
+/// [`fetch_shasums_file`] tolerates).
 pub fn pick_file_checksum_from_shasums_file(
     body: &str,
     file_name: &str,

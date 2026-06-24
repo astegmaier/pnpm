@@ -1,5 +1,7 @@
-use crate::SkippedSnapshots;
-use crate::graph_sequencer::{GraphSequencerResult, graph_sequencer};
+use crate::{
+    SkippedSnapshots,
+    graph_sequencer::{GraphSequencerResult, graph_sequencer},
+};
 use pacquet_lockfile::{PackageKey, ProjectSnapshot, SnapshotEntry};
 use pacquet_patching::ExtendedPatchInfo;
 use std::collections::{HashMap, HashSet};
@@ -116,7 +118,7 @@ fn build_children_map(
         // off whichever sibling visits it second. Both the entry
         // nodes and every child list must be in a deterministic
         // order for the build sequence to be reproducible.
-        child_keys.sort_by_key(|k| k.to_string());
+        child_keys.sort_by_key(std::string::ToString::to_string);
         children.insert(key.clone(), child_keys);
     }
     children
@@ -174,7 +176,7 @@ fn collect_root_dep_paths(
     // run. Long-term fix is to preserve lockfile declaration order
     // via `IndexMap`; until then, an alphabetical sort is enough to
     // make the build path deterministic.
-    roots.sort_by_key(|k| k.to_string());
+    roots.sort_by_key(std::string::ToString::to_string);
     roots
 }
 
@@ -230,11 +232,6 @@ fn get_subgraph_to_build(
         // recursion so a skipped optional doesn't drag its
         // transitive deps into the walk via an edge pnpm wouldn't
         // see.
-        //
-        // A descendant of a skipped node that's ALSO reachable from
-        // a non-skipped root still gets visited normally on that
-        // other branch, because we don't poison `walked` for the
-        // child here — we just skip this edge.
         if ctx.skipped.contains(dep_path) {
             walked.insert(dep_path.clone());
             continue;

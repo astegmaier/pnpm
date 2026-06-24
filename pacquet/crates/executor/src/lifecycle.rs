@@ -112,16 +112,25 @@ pub struct RunPostinstallHooks<'a> {
     /// (`sh -c` on POSIX, `cmd /d /s /c` on Windows).
     pub script_shell: Option<&'a Path>,
     /// Whether the dep is reachable only through optional edges
-    /// (`snapshots[<key>].optional` in the v9 lockfile). Stamped
-    /// into the `pnpm:lifecycle` `Script` and `Exit` events so
-    /// downstream reporters can dispatch correctly, mirroring
-    /// upstream's `lifecycleLogger.debug({ optional, … })` at
-    /// <https://github.com/pnpm/pnpm/blob/b4f8f47ac2/exec/lifecycle/src/runLifecycleHook.ts#L102>.
+    /// (`snapshots[<key>].optional` in the v9 lockfile).
     /// Does NOT affect failure handling — `BuildModules` consults the
     /// same flag independently to decide whether to swallow a build
-    /// failure (see #397 item 6).
+    /// failure (see [#397](https://github.com/pnpm/pacquet/issues/397) item 6).
     pub optional: bool,
 }
+
+/// The lifecycle stages pnpm runs for a *dependency* during the build
+/// phase, in execution order.
+const DEPENDENCY_LIFECYCLE_STAGES: [&str; 3] = ["preinstall", "install", "postinstall"];
+
+/// The lifecycle stages pnpm runs for each workspace *project* during
+/// `pnpm install`, in execution order. Mirrors the hardcoded list at
+/// the `runLifecycleHooksConcurrently` call sites in
+/// [`pkg-manager/core`](https://github.com/pnpm/pnpm/blob/80037699fb/pkg-manager/core/src/install/index.ts#L1525)
+/// and
+/// [`pkg-manager/headless`](https://github.com/pnpm/pnpm/blob/80037699fb/pkg-manager/headless/src/index.ts#L671).
+pub const PROJECT_LIFECYCLE_STAGES: [&str; 6] =
+    ["preinstall", "install", "postinstall", "preprepare", "prepare", "postprepare"];
 
 /// Run the preinstall, install, and postinstall lifecycle scripts for
 /// a single dependency.
@@ -131,7 +140,41 @@ pub struct RunPostinstallHooks<'a> {
 ///
 /// Returns `true` if any script was present and executed.
 pub fn run_postinstall_hooks<Reporter: self::Reporter>(
-    opts: RunPostinstallHooks<'_>,
+    opts: &RunPostinstallHooks<'_>,
+) -> Result<bool, LifecycleScriptError> {
+    run_lifecycle_stages::<Reporter>(opts, &DEPENDENCY_LIFECYCLE_STAGES)
+}
+
+/// Run a workspace project's own lifecycle scripts during
+/// `pnpm install` — preinstall, install, postinstall, preprepare,
+/// prepare, postprepare, in that order.
+///
+/// Ports the per-importer body of `runLifecycleHooksConcurrently` from
+/// `https://github.com/pnpm/pnpm/blob/80037699fb/exec/lifecycle/src/runLifecycleHooksConcurrently.ts`.
+/// The caller fans this out across projects (and is responsible for
+/// linking each project's bins beforehand so a later project's scripts
+/// can resolve binaries built by an earlier one).
+///
+/// Returns `true` if any script was present and executed.
+pub fn run_project_lifecycle_scripts<Reporter: self::Reporter>(
+    opts: &RunPostinstallHooks<'_>,
+) -> Result<bool, LifecycleScriptError> {
+    run_lifecycle_stages::<Reporter>(opts, &PROJECT_LIFECYCLE_STAGES)
+}
+
+/// Read the manifest at `opts.pkg_root` and run each of `stages` whose
+/// script is present, in order. Shared by [`run_postinstall_hooks`]
+/// and [`run_project_lifecycle_scripts`].
+///
+/// The `install` stage falls back to `node-gyp rebuild` when neither
+/// `install` nor `preinstall` is defined and a `binding.gyp` exists,
+/// matching `checkBindingGyp` at
+/// <https://github.com/pnpm/pnpm/blob/80037699fb/exec/lifecycle/src/runLifecycleHook.ts#L181-L188>.
+/// The `npx only-allow pnpm` guard script is skipped — it does nothing
+/// under pnpm/pacquet.
+fn run_lifecycle_stages<Reporter: self::Reporter>(
+    opts: &RunPostinstallHooks<'_>,
+    stages: &[&str],
 ) -> Result<bool, LifecycleScriptError> {
     let manifest = match safe_read_package_json_from_dir(opts.pkg_root) {
         Ok(Some(value)) => value,
@@ -148,36 +191,30 @@ pub fn run_postinstall_hooks<Reporter: self::Reporter>(
     let get_script =
         |name: &str| -> Option<&str> { scripts.and_then(|s| s.get(name)).and_then(|v| v.as_str()) };
 
-    // Snapshot the process env once for this package. Each of
-    // preinstall/install/postinstall reads from this snapshot, which
-    // keeps the three runs observably consistent and avoids three
-    // separate calls to `env::vars()` over a thread-shared global.
+    // Snapshot the process env once for this package. Every stage reads
+    // from this snapshot, which keeps the runs observably consistent
+    // and avoids one call to `env::vars()` per stage over a
+    // thread-shared global.
     let parent_env: HashMap<String, String> = env::vars().collect();
 
     let mut ran_any = false;
 
-    if let Some(script) = get_script("preinstall")
-        && script != "npx only-allow pnpm"
-    {
-        run_lifecycle_hook::<Reporter>("preinstall", script, &opts, &manifest, &parent_env)?;
-        ran_any = true;
-    }
+    for &stage in stages {
+        let script = if stage == "install" {
+            get_script("install").map(String::from).or_else(|| {
+                (get_script("preinstall").is_none() && opts.pkg_root.join("binding.gyp").exists())
+                    .then(|| "node-gyp rebuild".to_string())
+            })
+        } else {
+            get_script(stage).map(String::from)
+        };
 
-    let install_script = get_script("install").map(String::from).or_else(|| {
-        (get_script("preinstall").is_none() && opts.pkg_root.join("binding.gyp").exists())
-            .then(|| "node-gyp rebuild".to_string())
-    });
-    if let Some(script) = &install_script
-        && script != "npx only-allow pnpm"
-    {
-        run_lifecycle_hook::<Reporter>("install", script, &opts, &manifest, &parent_env)?;
-        ran_any = true;
-    }
+        let Some(script) = script else { continue };
+        if script == "npx only-allow pnpm" {
+            continue;
+        }
 
-    if let Some(script) = get_script("postinstall")
-        && script != "npx only-allow pnpm"
-    {
-        run_lifecycle_hook::<Reporter>("postinstall", script, &opts, &manifest, &parent_env)?;
+        run_lifecycle_hook::<Reporter>(stage, &script, opts, &manifest, &parent_env)?;
         ran_any = true;
     }
 
@@ -188,10 +225,6 @@ pub fn run_postinstall_hooks<Reporter: self::Reporter>(
 ///
 /// Ports the core of `runLifecycleHook` from
 /// `https://github.com/pnpm/pnpm/blob/80037699fb/exec/lifecycle/src/runLifecycleHook.ts`.
-///
-/// Mirrors the upstream emit ordering: a `Script` event before the spawn,
-/// `Stdio` events for each stdout/stderr line, then an `Exit` event with
-/// the resolved exit code.
 ///
 /// `parent_env` is captured by the caller so multi-stage callers (the
 /// `run_postinstall_hooks` wrapper and `pacquet-git-fetcher`'s
@@ -215,8 +248,6 @@ pub fn run_lifecycle_hook<Reporter: self::Reporter>(
 
     let pkg_root_str = opts.pkg_root.to_string_lossy().into_owned();
 
-    // Mirrors `lifecycleLogger.debug({ depPath, optional, script, stage, wd })`
-    // at <https://github.com/pnpm/pnpm/blob/b4f8f47ac2/exec/lifecycle/src/runLifecycleHook.ts#L102>.
     Reporter::emit(&LogEvent::Lifecycle(LifecycleLog {
         level: LogLevel::Debug,
         message: LifecycleMessage::Script {
@@ -293,9 +324,13 @@ pub fn run_lifecycle_hook<Reporter: self::Reporter>(
     child_env.insert("PATH".to_string(), path_env.to_string_lossy().into_owned());
 
     let mut cmd = Command::new(&shell.program);
-    cmd.args(&shell.args)
-        .arg(script)
-        .current_dir(opts.pkg_root)
+    cmd.args(&shell.args);
+    // Append the script body. The chain is broken here because the
+    // Windows `cmd /d /s /c` path needs `raw_arg` rather than `arg`
+    // (see [`push_script_arg`]) — a branch the method chain can't
+    // express.
+    push_script_arg(&mut cmd, script, shell.windows_verbatim_args);
+    cmd.current_dir(opts.pkg_root)
         // Stripping inherited env so leftover npm_* keys from a wrapping
         // invocation cannot leak in. `build_env` already folded the
         // surviving parent keys into `built.env`.
@@ -303,10 +338,6 @@ pub fn run_lifecycle_hook<Reporter: self::Reporter>(
         .envs(&child_env)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // `windowsVerbatimArguments` from `npm-lifecycle/index.js:251`.
-    // Wire up Rust's equivalent (`raw_arg` on Windows) when we have a
-    // way to test it. For now the field signals intent for follow-up.
-    let _ = shell.windows_verbatim_args;
 
     let mut child = cmd.spawn().map_err(|error| LifecycleScriptError::Spawn {
         dep_path: opts.dep_path.to_string(),
@@ -351,8 +382,6 @@ pub fn run_lifecycle_hook<Reporter: self::Reporter>(
         let _ = h.join();
     }
 
-    // Mirrors `lifecycleLogger.debug({ depPath, exitCode, optional, stage, wd })`
-    // at <https://github.com/pnpm/pnpm/blob/80037699fb/exec/lifecycle/src/runLifecycleHook.ts#L165>.
     Reporter::emit(&LogEvent::Lifecycle(LifecycleLog {
         level: LogLevel::Debug,
         message: LifecycleMessage::Exit {
@@ -374,6 +403,32 @@ pub fn run_lifecycle_hook<Reporter: self::Reporter>(
     }
 
     Ok(())
+}
+
+/// Append the script body as the shell command's final argument.
+///
+/// On Windows the `cmd /d /s /c` path passes `windows_verbatim_args =
+/// true`; the script is then appended with
+/// `std::os::windows::process::CommandExt::raw_arg` so embedded quoting
+/// (e.g. `node -e "..."`) reaches the child untouched. This mirrors
+/// Node's `windowsVerbatimArguments` at
+/// <https://github.com/pnpm/npm-lifecycle/blob/d2d8e790/index.js#L251>;
+/// the default `arg` quoting would escape the inner `"` and break such
+/// commands under `cmd.exe`. Everywhere else (POSIX `sh -c`, a custom
+/// `scriptShell`) the standard `arg` is correct.
+#[cfg(windows)]
+pub fn push_script_arg(cmd: &mut Command, script: &str, windows_verbatim_args: bool) {
+    use std::os::windows::process::CommandExt;
+    if windows_verbatim_args {
+        cmd.raw_arg(script);
+    } else {
+        cmd.arg(script);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn push_script_arg(cmd: &mut Command, script: &str, _windows_verbatim_args: bool) {
+    cmd.arg(script);
 }
 
 /// Spawn a thread that reads `reader` line-by-line and emits a

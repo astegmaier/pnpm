@@ -4,11 +4,15 @@ use std::{fs, path::Path};
 use tempfile::tempdir;
 
 fn touch(root: &Path, rel: &str) {
+    write(root, rel, "");
+}
+
+fn write(root: &Path, rel: &str, contents: &str) {
     let path = root.join(rel);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).unwrap();
     }
-    fs::write(path, "").unwrap();
+    fs::write(path, contents).unwrap();
 }
 
 #[test]
@@ -203,8 +207,6 @@ fn gitignore_excludes_when_no_npmignore() {
 
 #[test]
 fn npmignore_does_not_drop_always_included_files() {
-    // Even when `.npmignore` says to drop README/LICENSE/etc., they
-    // must still ship — npm-packlist's always-included override.
     let dir = tempdir().unwrap();
     let root = dir.path();
     touch(root, "package.json");
@@ -224,8 +226,6 @@ fn npmignore_does_not_drop_always_included_files() {
 
 #[test]
 fn npmignore_in_subdir_applies_to_subtree_only() {
-    // A nested `.npmignore` should narrow only its own subtree, not
-    // override the root's view.
     let dir = tempdir().unwrap();
     let root = dir.path();
     touch(root, "package.json");
@@ -251,7 +251,6 @@ fn bundle_dependencies_subtree_is_included() {
     touch(root, "index.js");
     touch(root, "node_modules/dep/package.json");
     touch(root, "node_modules/dep/lib.js");
-    // Sibling node_modules entry that is NOT bundled — must not ship.
     touch(root, "node_modules/other/package.json");
     touch(root, "node_modules/other/lib.js");
 
@@ -267,6 +266,115 @@ fn bundle_dependencies_subtree_is_included() {
     assert!(
         !out.iter().any(|p| p.starts_with("node_modules/other")),
         "non-bundled `other` must not ship: {out:?}",
+    );
+}
+
+#[test]
+fn bundle_dependencies_pull_in_hoisted_transitive_deps() {
+    // Port of pnpm's `pack: bundles transitive dependencies of bundled
+    // dependencies (hoisted)`
+    // ([pnpm11/releasing/commands/test/publish/pack.ts](https://github.com/pnpm/pnpm/blob/dd79bdc08e/pnpm11/releasing/commands/test/publish/pack.ts#L161-L191)).
+    // `top` is bundled and
+    // declares `dependencies: { nested }`; `nested` is hoisted to the
+    // root `node_modules`. The closure must follow `top`'s
+    // dependencies and resolve `nested` via the walk-up to the root,
+    // splicing it in at `node_modules/nested/`.
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    touch(root, "package.json");
+    write(
+        root,
+        "node_modules/top/package.json",
+        r#"{"name":"top","version":"1.0.0","dependencies":{"nested":"1.0.0"}}"#,
+    );
+    touch(root, "node_modules/top/index.js");
+    write(root, "node_modules/nested/package.json", r#"{"name":"nested","version":"1.0.0"}"#);
+    touch(root, "node_modules/nested/index.js");
+
+    let manifest = json!({
+        "name": "x",
+        "version": "0.0.0",
+        "bundledDependencies": ["top"],
+    });
+    let out = packlist(root, &manifest).unwrap();
+
+    assert!(out.contains(&"node_modules/top/index.js".to_string()), "{out:?}");
+    assert!(
+        out.contains(&"node_modules/nested/index.js".to_string()),
+        "hoisted transitive dep `nested` must be bundled: {out:?}",
+    );
+}
+
+#[test]
+fn bundle_dependencies_follow_nested_node_modules_before_hoisted() {
+    // A bundled dep's own `node_modules/<dep>` wins over a hoisted copy
+    // at the root, matching node module resolution.
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    touch(root, "package.json");
+    write(
+        root,
+        "node_modules/top/package.json",
+        r#"{"name":"top","version":"1.0.0","dependencies":{"nested":"2.0.0"}}"#,
+    );
+    write(
+        root,
+        "node_modules/top/node_modules/nested/package.json",
+        r#"{"name":"nested","version":"2.0.0"}"#,
+    );
+    touch(root, "node_modules/top/node_modules/nested/nested-v2.js");
+    write(root, "node_modules/nested/package.json", r#"{"name":"nested","version":"1.0.0"}"#);
+    touch(root, "node_modules/nested/hoisted-v1.js");
+
+    let manifest = json!({
+        "name": "x",
+        "version": "0.0.0",
+        "bundleDependencies": ["top"],
+    });
+    let out = packlist(root, &manifest).unwrap();
+
+    assert!(
+        out.contains(&"node_modules/top/node_modules/nested/nested-v2.js".to_string()),
+        "nested copy of `nested` must be bundled: {out:?}",
+    );
+    assert!(
+        !out.contains(&"node_modules/nested/hoisted-v1.js".to_string()),
+        "hoisted `nested` is shadowed by the nested copy and must not ship: {out:?}",
+    );
+}
+
+#[test]
+fn bundle_dependencies_optional_deps_of_bundled_dep_are_included() {
+    // `optionalDependencies` are part of a bundled package's runtime
+    // closure, so they ship; `devDependencies` do not.
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    touch(root, "package.json");
+    write(
+        root,
+        "node_modules/top/package.json",
+        r#"{"name":"top","version":"1.0.0","optionalDependencies":{"opt":"1.0.0"},"devDependencies":{"dev":"1.0.0"}}"#,
+    );
+    touch(root, "node_modules/top/index.js");
+    write(root, "node_modules/opt/package.json", r#"{"name":"opt","version":"1.0.0"}"#);
+    touch(root, "node_modules/opt/index.js");
+    write(root, "node_modules/dev/package.json", r#"{"name":"dev","version":"1.0.0"}"#);
+    touch(root, "node_modules/dev/index.js");
+
+    let manifest = json!({
+        "name": "x",
+        "version": "0.0.0",
+        "bundleDependencies": ["top"],
+    });
+    let out = packlist(root, &manifest).unwrap();
+
+    assert!(
+        out.contains(&"node_modules/opt/index.js".to_string()),
+        "optionalDependencies of a bundled dep must ship: {out:?}",
+    );
+    assert!(
+        !out.iter().any(|p| p.starts_with("node_modules/dev")),
+        "devDependencies of a bundled dep must not ship: {out:?}",
     );
 }
 
@@ -292,8 +400,6 @@ fn bundled_dependencies_legacy_spelling_works() {
 
 #[test]
 fn bundle_dependency_missing_dir_is_silently_skipped() {
-    // A bundleDependencies entry that's not actually on disk should
-    // not crash the fetcher — npm-packlist treats it as a no-op.
     let dir = tempdir().unwrap();
     let root = dir.path();
     touch(root, "package.json");
@@ -313,8 +419,7 @@ fn npmignore_in_parent_dir_does_not_leak_in() {
     // which would let a `.gitignore` above `pkg_dir` exclude files
     // inside it. The packlist must depend only on the package
     // directory's own contents — we set `parents(false)` precisely
-    // to prevent this. Test: drop a `.gitignore` *above* the pkg dir
-    // saying to exclude `index.js`, then confirm the file still ships.
+    // to prevent this.
     let dir = tempdir().unwrap();
     fs::write(dir.path().join(".gitignore"), "index.js\n").unwrap();
     let root = dir.path().join("pkg");
@@ -333,11 +438,9 @@ fn npmignore_in_parent_dir_does_not_leak_in() {
 
 #[test]
 fn bundle_dependencies_rejects_path_traversal() {
-    // Defense-in-depth regression: a malicious manifest with a `..`
-    // in bundleDependencies must not let the fetcher read files
-    // outside the package directory. Build a "valid" sibling dir
-    // outside the package's node_modules and prove its files don't
-    // end up in the result.
+    // Defense-in-depth: a malicious manifest with a `..` in
+    // bundleDependencies must not let the fetcher read files outside
+    // the package directory.
     let dir = tempdir().unwrap();
     let root = dir.path().join("pkg");
     fs::create_dir_all(&root).unwrap();
@@ -362,12 +465,41 @@ fn bundle_dependencies_rejects_path_traversal() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn bundle_dependency_symlink_escaping_pkg_dir_is_refused() {
+    // Defense-in-depth: the bundle name is a single safe segment
+    // (`is_safe_bundle_name` accepts it), but `node_modules/<name>` is
+    // a symlink pointing outside the package. Resolving and walking it
+    // would splice host files into the published set. The fetcher
+    // imports untrusted git-hosted packages, so this must be refused.
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("pkg");
+    fs::create_dir_all(root.join("node_modules")).unwrap();
+    touch(&root, "package.json");
+    // A sibling directory outside the package, made to look like a real
+    // package so the walk-up resolves it.
+    let escape = dir.path().join("escape");
+    fs::create_dir_all(&escape).unwrap();
+    fs::write(escape.join("package.json"), r#"{"name":"evil","version":"1.0.0"}"#).unwrap();
+    fs::write(escape.join("secret.txt"), "DO NOT EXFIL\n").unwrap();
+    std::os::unix::fs::symlink(&escape, root.join("node_modules/evil")).unwrap();
+
+    let manifest = json!({
+        "name": "x",
+        "version": "0.0.0",
+        "bundleDependencies": ["evil"],
+    });
+    let out = packlist(&root, &manifest).unwrap();
+
+    assert!(
+        !out.iter().any(|path| path.contains("secret")),
+        "a node_modules symlink escaping pkg_dir must not leak host files: {out:?}",
+    );
+}
+
 #[test]
 fn always_excluded_dir_segments_only_match_vcs() {
-    // Regression for the over-eager segment walk that used to match
-    // anything in `ALWAYS_EXCLUDED_NAMES` at any depth — including
-    // file-typed entries (`.npmrc`, `package-lock.json`). A literal
-    // VCS dir segment still excludes everything under it.
     let dir = tempdir().unwrap();
     let root = dir.path();
     touch(root, "package.json");
@@ -401,8 +533,7 @@ fn files_field_bare_basename_matches_at_depth() {
     // pattern, so it matches both root-level `cli` and a nested
     // `bin/cli`. The `Gitignore::matched` call already handles this
     // because gitignore patterns without a leading slash are
-    // unanchored — drop the previously-present leaf fallback once
-    // this test pins the behavior.
+    // unanchored.
     let dir = tempdir().unwrap();
     let root = dir.path();
     touch(root, "package.json");
@@ -427,29 +558,29 @@ fn files_field_bare_basename_matches_at_depth() {
 
 #[test]
 fn bundle_dependencies_self_cycle_is_caught() {
-    // Defense-in-depth: a bundled dep whose own manifest declares a
-    // bundle pointing back at itself (or any cycle reachable through
-    // the canonical-path chain) must not stack-overflow the fetcher.
-    // The visited-set + depth cap inside `packlist_inner` stops the
-    // recursion; the test just confirms the fetcher returns without
-    // panicking and includes the one-level bundle's files exactly
-    // once.
+    // Defense-in-depth: a bundled dep whose own manifest depends on
+    // itself (or any cycle reachable through the canonical-path chain)
+    // must not loop the closure walk forever. The visited-set keyed on
+    // the canonicalised resolved directory stops the re-entry.
     let dir = tempdir().unwrap();
     let root = dir.path();
     touch(root, "package.json");
     touch(root, "node_modules/self/package.json");
     touch(root, "node_modules/self/lib.js");
-    // The bundled dep declares itself as a bundleDependency. Without
-    // cycle detection this becomes infinite recursion.
+    // The bundled dep lists itself as a runtime dependency. The
+    // closure follows `dependencies`, so without cycle detection this
+    // re-resolves `self` forever.
     fs::write(
         root.join("node_modules/self/package.json"),
-        r#"{"name":"self","version":"1.0.0","bundleDependencies":["self"]}"#,
+        r#"{"name":"self","version":"1.0.0","dependencies":{"self":"1.0.0"}}"#,
     )
     .unwrap();
     // Symlink `node_modules/self/node_modules/self` back to the
-    // outer `node_modules/self` so the canonical-path check has
-    // something to catch. (On platforms that can't symlink, the
-    // depth cap kicks in instead.)
+    // outer `node_modules/self` so the nested-first walk-up resolves
+    // the self-dependency to a directory the canonical-path check
+    // recognises as already visited. (On platforms that can't
+    // symlink, the walk-up falls back to the same outer directory and
+    // the visited-set still catches it.)
     fs::create_dir_all(root.join("node_modules/self/node_modules")).unwrap();
     #[cfg(unix)]
     {
@@ -470,8 +601,8 @@ fn bundle_dependencies_self_cycle_is_caught() {
     assert!(out.contains(&"package.json".to_string()));
     assert!(out.contains(&"node_modules/self/package.json".to_string()));
     assert!(out.contains(&"node_modules/self/lib.js".to_string()));
-    // No deeper paths via the cycle — the visited-set / depth cap
-    // refused the re-entry.
+    // No deeper paths via the cycle — the visited-set refused the
+    // re-entry.
     assert!(
         !out.iter().any(|p| p.starts_with("node_modules/self/node_modules/")),
         "cycle through node_modules/self/node_modules/self/... must be cut: {out:?}",
@@ -480,10 +611,6 @@ fn bundle_dependencies_self_cycle_is_caught() {
 
 #[test]
 fn main_field_pointing_at_always_excluded_basename_is_refused() {
-    // Regression: pass 3 force-includes `main` / `bin` only after
-    // running them through `should_always_exclude`. A manifest with
-    // `"main": "package-lock.json"` previously would have re-added
-    // the lockfile despite the basename-cruft filter.
     let dir = tempdir().unwrap();
     let root = dir.path();
     touch(root, "package.json");
@@ -507,10 +634,8 @@ fn main_field_pointing_at_always_excluded_basename_is_refused() {
 
 #[test]
 fn bin_field_pointing_at_vcs_segment_is_refused() {
-    // Same idea for `bin`: a manifest pointing `bin/cli` at
-    // `.git/something` (silly but possible) must not re-add a VCS
-    // file. Uses a basename inside a `.git` segment to hit the dir-
-    // segment exclusion path rather than the basename one.
+    // Uses a basename inside a `.git` segment to hit the dir-segment
+    // exclusion path rather than the basename one.
     let dir = tempdir().unwrap();
     let root = dir.path();
     touch(root, "package.json");

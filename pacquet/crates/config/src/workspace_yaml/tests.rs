@@ -1,29 +1,51 @@
 use super::{LoadWorkspaceYamlError, WORKSPACE_MANIFEST_FILENAME, WorkspaceSettings};
 use crate::{
-    Config, LinkWorkspacePackages, NodeLinker, ScriptsPrependNodePath, TrustPolicy, api::EnvVar,
+    CatalogMode, Config, HoistingLimits, LinkWorkspacePackages, NodeLinker, NodePackageMapType,
+    ResolutionMode, ScriptsPrependNodePath, TrustPolicy, api::EnvVar,
 };
 use pacquet_store_dir::StoreDir;
+use pacquet_workspace_state::{ConfigDependency, ConfigDependencyDetail};
 use pipe_trait::Pipe;
 use pretty_assertions::assert_eq;
 use std::{fs, path::Path};
 
 #[test]
 fn parses_common_settings_from_yaml() {
-    let yaml = r#"
+    let yaml = r"
 storeDir: ../my-store
 registry: https://reg.example
 lockfile: false
 autoInstallPeers: true
+dedupePeers: true
+preferWorkspacePackages: true
 nodeLinker: hoisted
+nodeExperimentalPackageMap: true
+nodePackageMapType: loose
 packages:
   - packages/*
-"#;
+";
     let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
     assert_eq!(settings.store_dir.as_deref(), Some("../my-store"));
     assert_eq!(settings.registry.as_deref(), Some("https://reg.example"));
     assert_eq!(settings.lockfile, Some(false));
     assert_eq!(settings.auto_install_peers, Some(true));
+    assert_eq!(settings.dedupe_peers, Some(true));
+    assert_eq!(settings.prefer_workspace_packages, Some(true));
     assert!(matches!(settings.node_linker, Some(NodeLinker::Hoisted)));
+    assert_eq!(settings.node_experimental_package_map, Some(true));
+    assert_eq!(settings.node_package_map_type, Some(NodePackageMapType::Loose));
+}
+
+#[test]
+fn parses_ignore_compatibility_db_from_yaml_and_applies() {
+    let settings: WorkspaceSettings =
+        serde_saphyr::from_str("ignoreCompatibilityDb: true\n").unwrap();
+    assert_eq!(settings.ignore_compatibility_db, Some(true));
+
+    let mut config = Config::new();
+    assert!(!config.ignore_compatibility_db);
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert!(config.ignore_compatibility_db);
 }
 
 #[test]
@@ -46,11 +68,11 @@ packages:
 
 #[test]
 fn apply_overrides_npmrc_defaults() {
-    let yaml = r#"
+    let yaml = r"
 storeDir: /absolute/store
 lockfile: false
 registry: https://reg.example
-"#;
+";
     let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
     let mut config = Config::new();
     config.lockfile = true;
@@ -88,12 +110,12 @@ fn apply_resolves_relative_paths_against_base_dir() {
 /// crates/tarball.
 #[test]
 fn parses_fetch_retry_settings_from_yaml_and_applies() {
-    let yaml = r#"
+    let yaml = r"
 fetchRetries: 5
 fetchRetryFactor: 3
 fetchRetryMintimeout: 1000
 fetchRetryMaxtimeout: 4000
-"#;
+";
     let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
     assert_eq!(settings.fetch_retries, Some(5));
     assert_eq!(settings.fetch_retry_factor, Some(3));
@@ -108,6 +130,43 @@ fetchRetryMaxtimeout: 4000
     assert_eq!(config.fetch_retry_maxtimeout, 4000);
 }
 
+/// `ignoreScripts` parses from `pnpm-workspace.yaml` as a camelCase
+/// key and `apply_to` pushes it onto [`Config::ignore_scripts`], so
+/// `ignoreScripts: true` in the workspace manifest suppresses lifecycle
+/// scripts the same way the `--ignore-scripts` CLI flag does.
+#[test]
+fn parses_ignore_scripts_from_yaml_and_applies() {
+    let settings: WorkspaceSettings = serde_saphyr::from_str("ignoreScripts: true\n").unwrap();
+    assert_eq!(settings.ignore_scripts, Some(true));
+
+    let mut config = Config::new();
+    assert!(!config.ignore_scripts, "default is false");
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert!(config.ignore_scripts);
+}
+
+/// `networkConcurrency` / `fetchTimeout` / `userAgent` parse from
+/// `pnpm-workspace.yaml` as camelCase keys and `apply_to` pushes them
+/// onto the `Config`, matching pnpm.
+#[test]
+fn parses_network_settings_from_yaml_and_applies() {
+    let yaml = r"
+networkConcurrency: 8
+fetchTimeout: 120000
+userAgent: my-agent/2.0
+";
+    let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+    assert_eq!(settings.network_concurrency, Some(8));
+    assert_eq!(settings.fetch_timeout, Some(120_000));
+    assert_eq!(settings.user_agent.as_deref(), Some("my-agent/2.0"));
+
+    let mut config = Config::new();
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert_eq!(config.network_concurrency, 8);
+    assert_eq!(config.fetch_timeout, 120_000);
+    assert_eq!(config.user_agent, "my-agent/2.0");
+}
+
 /// `namedRegistries` is the per-alias registry-URL map from
 /// `pnpm-workspace.yaml`. The deserializer reads the camelCase key
 /// and `apply_to` writes the map onto [`Config::named_registries`]
@@ -116,11 +175,11 @@ fetchRetryMaxtimeout: 4000
 /// schema.
 #[test]
 fn parses_named_registries_from_yaml_and_applies() {
-    let yaml = r#"
+    let yaml = r"
 namedRegistries:
   gh: https://npm.pkg.ghes.example.com/
   work: https://npm.work.example.com/
-"#;
+";
     let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
     let named = settings.named_registries.as_ref().expect("named_registries present");
     assert_eq!(named.get("gh").map(String::as_str), Some("https://npm.pkg.ghes.example.com/"));
@@ -138,14 +197,38 @@ namedRegistries:
     );
 }
 
-/// Env-var placeholders inside `namedRegistries` values expand on
-/// the [`WorkspaceSettings::substitute_env`] pass, matching upstream's
-/// [`replaceEnvInStringValues`](https://github.com/pnpm/pnpm/blob/b61e268d57/config/reader/src/getOptionsFromRootManifest.ts#L86-L93)
-/// behaviour for the `namedRegistries` key. Substitution lands
-/// before `apply_to` so the resolved URL is what ends up on
-/// [`Config::named_registries`].
 #[test]
-fn substitutes_env_vars_inside_named_registries_values() {
+fn parses_registries_from_yaml_and_applies() {
+    let yaml = r"
+registries:
+  default: https://default.example.com/npm
+  '@private': https://private.example.com/npm
+";
+    let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+    let registries = settings.registries.as_ref().expect("registries present");
+    assert_eq!(
+        registries.get("default").map(String::as_str),
+        Some("https://default.example.com/npm"),
+    );
+    assert_eq!(
+        registries.get("@private").map(String::as_str),
+        Some("https://private.example.com/npm"),
+    );
+
+    let mut config = Config::new();
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert_eq!(config.registry, "https://default.example.com/npm/");
+    assert_eq!(
+        config.registries.get("@private").map(String::as_str),
+        Some("https://private.example.com/npm/"),
+    );
+}
+
+/// Env-var placeholders inside workspace request destinations are ignored so
+/// repository-controlled config cannot smuggle victim environment
+/// values into outbound requests.
+#[test]
+fn ignores_env_vars_inside_workspace_request_destination_values() {
     struct EnvWithHost;
     impl EnvVar for EnvWithHost {
         fn var(name: &str) -> Option<String> {
@@ -153,17 +236,105 @@ fn substitutes_env_vars_inside_named_registries_values() {
         }
     }
 
-    let yaml = r#"
+    let yaml = r"
+pnprServer: https://${WORK_HOST}/pnpr/
+registry: https://${WORK_HOST}/npm/
+registries:
+  '@safe': https://safe.example.com/npm/
+  '@work': https://${WORK_HOST}/scope/
 namedRegistries:
+  literal: 'https://registry.example.com/${/npm/'
+  stable: https://registry.example.com/npm/
   work: https://${WORK_HOST}/npm/
-"#;
+";
     let mut settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
-    settings.substitute_env::<EnvWithHost>();
+    settings.substitute_env_untrusted::<EnvWithHost>();
     let mut config = Config::new();
     settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert_eq!(config.pnpr_server, None);
+    assert_eq!(config.registry, "https://registry.npmjs.org/");
+    assert_eq!(
+        config.registries.get("@safe").map(String::as_str),
+        Some("https://safe.example.com/npm/"),
+    );
+    assert_eq!(config.registries.get("@work"), None);
+    assert_eq!(
+        config.named_registries.get("stable").map(String::as_str),
+        Some("https://registry.example.com/npm/"),
+    );
+    assert_eq!(
+        config.named_registries.get("literal").map(String::as_str),
+        Some("https://registry.example.com/${/npm/"),
+    );
+    assert_eq!(config.named_registries.get("work"), None);
+}
+
+#[test]
+fn expands_env_vars_inside_non_registry_workspace_values() {
+    struct EnvWithPaths;
+    impl EnvVar for EnvWithPaths {
+        fn var(name: &str) -> Option<String> {
+            match name {
+                "CACHE_DIR" => Some("cache-dir".to_owned()),
+                "HOOK" => Some("hook.js".to_owned()),
+                "SHELL" => Some("custom-shell".to_owned()),
+                "STORE_DIR" => Some("store-dir".to_owned()),
+                "USER_AGENT" => Some("pacquet-test/1.0".to_owned()),
+                _ => None,
+            }
+        }
+    }
+
+    let yaml = r"
+storeDir: ${STORE_DIR}
+cacheDir: ${CACHE_DIR}
+scriptShell: ${SHELL}
+nodeOptions: --require=${HOOK}
+userAgent: ${USER_AGENT}
+";
+    let mut settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+    settings.substitute_env_untrusted::<EnvWithPaths>();
+
+    let base = Path::new("/workspace/root");
+    let mut config = Config::new();
+    settings.apply_to(&mut config, base);
+
+    assert_eq!(config.store_dir, StoreDir::from(base.join("store-dir")));
+    assert_eq!(config.cache_dir, base.join("cache-dir"));
+    assert_eq!(config.script_shell.as_deref(), Some("custom-shell"));
+    assert_eq!(config.node_options.as_deref(), Some("--require=hook.js"));
+    assert_eq!(config.user_agent, "pacquet-test/1.0");
+}
+
+#[test]
+fn trusted_settings_expand_env_vars_inside_request_destination_values() {
+    struct EnvWithHost;
+    impl EnvVar for EnvWithHost {
+        fn var(name: &str) -> Option<String> {
+            (name == "WORK_HOST").then(|| "internal.example.com".to_owned())
+        }
+    }
+
+    let yaml = r"
+pnprServer: https://${WORK_HOST}/pnpr/
+registry: https://${WORK_HOST}/npm/
+namedRegistries:
+  stable: https://registry.example.com/npm/
+  work: https://${WORK_HOST}/work/
+";
+    let mut settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+    settings.substitute_env_trusted::<EnvWithHost>();
+    let mut config = Config::new();
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert_eq!(config.pnpr_server.as_deref(), Some("https://internal.example.com/pnpr/"));
+    assert_eq!(config.registry, "https://internal.example.com/npm/");
+    assert_eq!(
+        config.named_registries.get("stable").map(String::as_str),
+        Some("https://registry.example.com/npm/"),
+    );
     assert_eq!(
         config.named_registries.get("work").map(String::as_str),
-        Some("https://internal.example.com/npm/"),
+        Some("https://internal.example.com/work/"),
     );
 }
 
@@ -299,6 +470,76 @@ patchedDependencies:
     assert_eq!(map.get("lodash@4.17.21").map(String::as_str), Some("patches/lodash@4.17.21.patch"));
 }
 
+#[test]
+fn patches_dir_reads_from_workspace_yaml() {
+    let settings: WorkspaceSettings =
+        serde_saphyr::from_str("patchesDir: custom-patches\n").unwrap();
+    assert_eq!(settings.patches_dir.as_deref(), Some("custom-patches"));
+
+    let mut config = Config::new();
+    settings.apply_to(&mut config, Path::new("/workspace/root"));
+    assert_eq!(config.patches_dir.as_deref(), Some("custom-patches"));
+}
+
+/// `configDependencies` is a map of package name → version-with-integrity
+/// spec. pacquet records it into the workspace-state file so pnpm's
+/// `checkDepsStatus` doesn't treat the install as stale on the next
+/// `pnpm run` / `pnpm node`. Guards the camelCase rename, optionality,
+/// and `apply_to` wiring.
+#[test]
+fn parses_config_dependencies_from_yaml_and_applies() {
+    let yaml = r#"
+configDependencies:
+  "@pnpm/pacquet": 0.2.2-14
+"#;
+    let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+    let expected = settings.config_dependencies.clone();
+    assert_eq!(
+        expected.as_ref().and_then(|m| m.get("@pnpm/pacquet")),
+        Some(&ConfigDependency::VersionWithIntegrity("0.2.2-14".to_string())),
+    );
+
+    let mut config = Config::new();
+    assert!(config.config_dependencies.is_none(), "default is None");
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert_eq!(config.config_dependencies, expected);
+}
+
+/// pnpm's `configDependencies` value can also be the `{ tarball?, integrity }`
+/// object form. It must parse (not error) and round-trip, otherwise an
+/// upstream-supported manifest becomes a hard config-load failure.
+#[test]
+fn parses_object_form_config_dependencies() {
+    let yaml = r#"
+configDependencies:
+  "@scope/dep":
+    integrity: sha512-abc
+    tarball: https://example.test/dep.tgz
+"#;
+    let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+    let map = settings.config_dependencies.expect("field present");
+    assert_eq!(
+        map.get("@scope/dep"),
+        Some(&ConfigDependency::Detailed(ConfigDependencyDetail {
+            integrity: "sha512-abc".to_string(),
+            tarball: Some("https://example.test/dep.tgz".to_string()),
+        })),
+    );
+}
+
+/// `configDependencies` is workspace-only: it must not be honored from
+/// the global `config.yaml`, matching pnpm's `isConfigFileKey` filter.
+#[test]
+fn config_dependencies_cleared_as_workspace_only_field() {
+    let yaml = r#"
+configDependencies:
+  "@pnpm/pacquet": 0.2.2-14
+"#;
+    let mut settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+    settings.clear_workspace_only_fields();
+    assert!(settings.config_dependencies.is_none());
+}
+
 /// `allowBuilds` is a map of `name[@version]` → bool. Same camelCase
 /// rename + `apply_to` wiring as the other yaml-sourced settings.
 /// pnpm 10+ moved this out of `package.json#pnpm` (matches
@@ -339,7 +580,7 @@ fn parses_dangerously_allow_all_builds_from_yaml_and_applies() {
 
 /// `scriptsPrependNodePath` is the tri-state from upstream
 /// [`Config.scriptsPrependNodePath: boolean | 'warn-only'`](https://github.com/pnpm/pnpm/blob/b4f8f47ac2/config/reader/src/Config.ts#L108).
-/// `true` → Always, `false` → Never, `"warn-only"` → WarnOnly.
+/// `true` → Always, `false` → Never, `"warn-only"` → `WarnOnly`.
 /// Pacquet's default is Never (matches upstream's
 /// [`StrictBuildOptions.scriptsPrependNodePath: false`](https://github.com/pnpm/pnpm/blob/b4f8f47ac2/building/after-install/src/extendBuildOptions.ts#L78)).
 #[test]
@@ -406,6 +647,42 @@ fn parses_link_workspace_packages_deep_from_yaml() {
 fn rejects_invalid_link_workspace_packages() {
     let yaml = "linkWorkspacePackages: shallow\n";
     serde_saphyr::from_str::<WorkspaceSettings>(yaml).expect_err("must reject");
+}
+
+/// `injectWorkspacePackages: true` propagates from yaml to
+/// `Config.inject_workspace_packages`. Mirrors upstream's
+/// [`Config.injectWorkspacePackages`](https://github.com/pnpm/pnpm/blob/39101f5e37/config/reader/src/Config.ts#L190).
+#[test]
+fn parses_inject_workspace_packages_true_from_yaml() {
+    let yaml = "injectWorkspacePackages: true\n";
+    let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+    assert_eq!(settings.inject_workspace_packages, Some(true));
+
+    let mut config = Config::new();
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert!(config.inject_workspace_packages);
+}
+
+#[test]
+fn parses_inject_workspace_packages_false_from_yaml() {
+    let yaml = "injectWorkspacePackages: false\n";
+    let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+    assert_eq!(settings.inject_workspace_packages, Some(false));
+
+    let mut config = Config::new();
+    config.inject_workspace_packages = true;
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert!(!config.inject_workspace_packages);
+}
+
+#[test]
+fn inject_workspace_packages_defaults_off_when_absent() {
+    let yaml = "linkWorkspacePackages: true\n";
+    let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+    assert_eq!(settings.inject_workspace_packages, None);
+
+    let config = Config::new();
+    assert!(!config.inject_workspace_packages);
 }
 
 /// `unsafePerm: false` from yaml propagates to `Config.unsafe_perm`
@@ -475,6 +752,55 @@ fn parses_negative_child_concurrency_from_yaml_and_resolves() {
     assert!(config.child_concurrency <= parallelism, "must not exceed available parallelism");
 }
 
+/// A positive `workspaceConcurrency` is taken verbatim — same
+/// [`getWorkspaceConcurrency`](https://github.com/pnpm/pnpm/blob/b4f8f47ac2/config/reader/src/concurrency.ts#L25-L34)
+/// resolution as `childConcurrency`.
+#[test]
+fn parses_positive_workspace_concurrency_from_yaml_and_applies() {
+    let yaml = "workspaceConcurrency: 8\n";
+    let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+    assert_eq!(settings.workspace_concurrency, Some(8));
+
+    let mut config = Config::new();
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert_eq!(config.workspace_concurrency, 8);
+}
+
+/// A non-positive `workspaceConcurrency` is interpreted as
+/// `max(1, parallelism - |value|)`. The exact result depends on the
+/// host's reported parallelism, so bound-check it like the
+/// `childConcurrency` sibling does.
+#[test]
+fn parses_negative_workspace_concurrency_from_yaml_and_resolves() {
+    let yaml = "workspaceConcurrency: -1\n";
+    let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+    assert_eq!(settings.workspace_concurrency, Some(-1));
+
+    let mut config = Config::new();
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    let parallelism = crate::available_parallelism();
+    assert!(config.workspace_concurrency >= 1, "must floor at 1");
+    assert!(config.workspace_concurrency <= parallelism, "must not exceed available parallelism");
+}
+
+/// `workspaceConcurrency` and `childConcurrency` are independent
+/// settings: setting one must not move the other off its default.
+/// Mirrors upstream, where they are separate config keys
+/// ([`config/reader/src/index.ts:208`](https://github.com/pnpm/pnpm/blob/b4f8f47ac2/config/reader/src/index.ts#L208)
+/// vs the `childConcurrency` build path).
+#[test]
+fn workspace_and_child_concurrency_are_independent() {
+    let yaml = "workspaceConcurrency: 7\n";
+    let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+    assert_eq!(settings.child_concurrency, None);
+
+    let mut config = Config::new();
+    let child_default = config.child_concurrency;
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert_eq!(config.workspace_concurrency, 7);
+    assert_eq!(config.child_concurrency, child_default, "childConcurrency stays at its default");
+}
+
 #[test]
 fn apply_leaves_unset_fields_alone() {
     let yaml = "storeDir: /s\n";
@@ -521,7 +847,7 @@ fn find_propagates_when_manifest_path_is_a_directory() {
         "expected ReadFile, got {err:?}",
     );
 
-    drop(tmp); // clean up
+    drop(tmp);
 }
 
 /// A `pnpm-workspace.yaml` whose contents do not parse as YAML must
@@ -542,7 +868,7 @@ fn find_propagates_parse_yaml_error_on_malformed_manifest() {
     };
     assert_eq!(path, manifest);
 
-    drop(tmp); // clean up
+    drop(tmp);
 }
 
 #[test]
@@ -555,10 +881,10 @@ fn find_returns_none_when_no_manifest() {
 fn apply_replaces_git_shallow_hosts_defaults() {
     // pnpm replaces the built-in default array wholesale rather than
     // merging it, so we mirror that. See `default_git_shallow_hosts`.
-    let yaml = r#"
+    let yaml = r"
 gitShallowHosts:
   - corp-git.example.com
-"#;
+";
     let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
     let mut config = Config::new();
 
@@ -578,12 +904,12 @@ gitShallowHosts:
 /// [`Config::supported_architectures`] at install time.
 #[test]
 fn parses_supported_architectures_from_yaml_and_applies() {
-    let yaml = r#"
+    let yaml = r"
 supportedArchitectures:
   os: [darwin, linux]
   cpu: [arm64, x64]
   libc: [glibc]
-"#;
+";
     let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
     let raw = settings.supported_architectures.clone().expect("field present");
     assert_eq!(raw.os.as_deref(), Some(&["darwin".to_string(), "linux".to_string()][..]));
@@ -619,10 +945,10 @@ fn omitting_supported_architectures_keeps_default() {
 /// is independently overridable.
 #[test]
 fn partial_supported_architectures_only_sets_listed_axes() {
-    let yaml = r#"
+    let yaml = r"
 supportedArchitectures:
   os: [darwin]
-"#;
+";
     let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
     let raw = settings.supported_architectures.expect("field present");
     assert_eq!(raw.os.as_deref(), Some(&["darwin".to_string()][..]));
@@ -637,7 +963,6 @@ supportedArchitectures:
 /// all three for both sides plus the `apply_to` plumbing.
 #[test]
 fn hoist_patterns_tri_state_round_trip() {
-    // Case 1: keys absent → defaults preserved.
     let yaml = "registry: https://example.test\n";
     let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
     assert_eq!(settings.hoist_pattern, None);
@@ -647,10 +972,6 @@ fn hoist_patterns_tri_state_round_trip() {
     settings.apply_to(&mut config, Path::new("/anywhere"));
     assert_eq!((config.hoist_pattern.clone(), config.public_hoist_pattern.clone()), defaults);
 
-    // Case 2: explicit null → `Config.* = None`. Verifies the
-    // upstream `!= null` semantics — null disables that side, and
-    // the install-time `is_some() || is_some()` guard short-circuits
-    // when both sides are None.
     let yaml = "hoistPattern: null\npublicHoistPattern: null\n";
     let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
     assert_eq!(settings.hoist_pattern, Some(None));
@@ -660,7 +981,6 @@ fn hoist_patterns_tri_state_round_trip() {
     assert_eq!(config.hoist_pattern, None);
     assert_eq!(config.public_hoist_pattern, None);
 
-    // Case 3: explicit list → wraps the inner Vec in `Some`.
     let yaml = "hoistPattern:\n  - 'foo*'\npublicHoistPattern: []\n";
     let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
     assert_eq!(settings.hoist_pattern, Some(Some(vec!["foo*".to_string()])));
@@ -682,7 +1002,6 @@ fn hoist_patterns_tri_state_round_trip() {
 /// (upstream doesn't nullify it either).
 #[test]
 fn hoist_false_disables_private_hoist_pattern() {
-    // `hoist: false` alone — the default `hoist_pattern` should drop.
     let yaml = "hoist: false\n";
     let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
     let mut config = Config::default();
@@ -695,8 +1014,6 @@ fn hoist_false_disables_private_hoist_pattern() {
         "hoist:false must NOT touch public_hoist_pattern",
     );
 
-    // `hoist: false` wins over an explicit `hoistPattern` — yaml
-    // sets a pattern, but `hoist: false` then nullifies it.
     let yaml = "hoist: false\nhoistPattern:\n  - 'foo*'\n";
     let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
     let mut config = Config::default();
@@ -712,11 +1029,11 @@ fn hoist_false_disables_private_hoist_pattern() {
 /// [`createOptionalDependenciesRemover`](https://github.com/pnpm/pnpm/blob/94240bc046/hooks/read-package-hook/src/createOptionalDependenciesRemover.ts).
 #[test]
 fn parses_ignored_optional_dependencies_from_yaml_and_applies() {
-    let yaml = r#"
+    let yaml = r"
 ignoredOptionalDependencies:
   - 'foo'
   - '@scope/bar'
-"#;
+";
     let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
     assert_eq!(
         settings.ignored_optional_dependencies.as_deref(),
@@ -752,12 +1069,12 @@ fn omitting_ignored_optional_dependencies_keeps_default() {
 /// downstream diagnostics reference the keys in user-supplied order.
 #[test]
 fn parses_overrides_from_yaml_and_applies() {
-    let yaml = r#"
+    let yaml = r"
 overrides:
   foo: '1.2.3'
   '@scope/bar': '^2.0.0'
   'baz>qux': '-'
-"#;
+";
     let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
     let overrides = settings.overrides.as_ref().expect("overrides parsed");
     let entries: Vec<_> =
@@ -819,30 +1136,87 @@ fn omitting_overrides_keeps_default() {
     assert!(config.overrides.is_none());
 }
 
-/// `hoistingLimits` deserializes as a map keyed by importer
-/// locator (e.g. `'.@'`); inner value is a list of alias names.
-/// Mirrors upstream's [`HoistingLimits`](https://github.com/pnpm/pnpm/blob/94240bc046/installing/linking/real-hoist/src/index.ts#L10)
-/// shape and threads straight into [`pacquet_real_hoist::HoistOpts`]
-/// via the install pipeline. Yaml-empty / missing keeps the
-/// `Config` field at its `BTreeMap::default()` empty value.
+/// `packageExtensions` parses as an ordered `selector → entry` map
+/// and applies onto [`Config::package_extensions`]. The entry uses
+/// camelCase field names so inner sections like
+/// `optionalDependencies` and `peerDependenciesMeta` round-trip
+/// through the deserializer.
 #[test]
-fn parses_hoisting_limits_from_yaml_and_applies() {
+fn parses_package_extensions_from_yaml_and_applies() {
     let yaml = r#"
-hoistingLimits:
-  ".@":
-    - foo
-    - bar
+packageExtensions:
+  is-positive:
+    dependencies:
+      "@pnpm.e2e/bar": 100.1.0
+  "@scope/foo@^2":
+    peerDependencies:
+      react: ">=16"
+    peerDependenciesMeta:
+      react:
+        optional: true
 "#;
     let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
-    let raw = settings.hoisting_limits.clone().expect("field present");
-    let aliases = raw.get(".@").expect("locator present");
-    assert!(aliases.contains("foo") && aliases.contains("bar"));
+    let extensions = settings.package_extensions.as_ref().expect("packageExtensions parsed");
+    let is_positive = extensions.get("is-positive").expect("is-positive entry");
+    assert_eq!(
+        is_positive
+            .dependencies
+            .as_ref()
+            .and_then(|map| map.get("@pnpm.e2e/bar"))
+            .map(String::as_str),
+        Some("100.1.0"),
+    );
+    let scoped = extensions.get("@scope/foo@^2").expect("scoped entry");
+    assert_eq!(
+        scoped.peer_dependencies.as_ref().and_then(|map| map.get("react")).map(String::as_str),
+        Some(">=16"),
+    );
+    let meta = scoped
+        .peer_dependencies_meta
+        .as_ref()
+        .and_then(|map| map.get("react"))
+        .expect("react peerDependenciesMeta entry");
+    assert_eq!(meta.optional, Some(true));
 
     let mut config = Config::new();
-    assert!(config.hoisting_limits.is_empty(), "default is empty");
+    assert!(config.package_extensions.is_none(), "default is None");
     settings.apply_to(&mut config, Path::new("/irrelevant"));
-    let aliases = config.hoisting_limits.get(".@").expect("locator present in config");
-    assert!(aliases.contains("foo") && aliases.contains("bar"));
+    let applied = config.package_extensions.expect("package_extensions applied");
+    assert_eq!(applied.len(), 2);
+}
+
+/// An empty `packageExtensions:` map collapses to `None` on
+/// `Config`, mirroring the `overrides` behavior. Without this
+/// collapse, an empty `{}` would diverge from "no key set" at the
+/// workspace-state drift comparison.
+#[test]
+fn empty_package_extensions_map_collapses_to_none() {
+    let yaml = "packageExtensions: {}\n";
+    let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+    assert!(settings.package_extensions.as_ref().is_some_and(indexmap::IndexMap::is_empty));
+
+    let mut config = Config::new();
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert!(config.package_extensions.is_none(), "empty map collapses to None");
+}
+
+/// `hoistingLimits` deserializes as one of the `none` / `workspaces`
+/// / `dependencies` modes. Mirrors upstream's
+/// [`HoistingLimits`](https://github.com/pnpm/pnpm/blob/89812a9353/installing/linking/real-hoist/src/index.ts)
+/// shape; the install pipeline translates the mode into the
+/// per-locator border map via `pacquet_package_manager::get_hoisting_limits`.
+/// Yaml-empty / missing keeps the `Config` field at its
+/// [`HoistingLimits::None`] default.
+#[test]
+fn parses_hoisting_limits_from_yaml_and_applies() {
+    let yaml = "hoistingLimits: dependencies\n";
+    let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+    assert_eq!(settings.hoisting_limits, Some(HoistingLimits::Dependencies));
+
+    let mut config = Config::new();
+    assert_eq!(config.hoisting_limits, HoistingLimits::None, "default is None");
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert_eq!(config.hoisting_limits, HoistingLimits::Dependencies);
 }
 
 /// `externalDependencies` deserializes as a flat list of names.
@@ -850,11 +1224,11 @@ hoistingLimits:
 /// `BTreeSet::default()` empty value.
 #[test]
 fn parses_external_dependencies_from_yaml_and_applies() {
-    let yaml = r#"
+    let yaml = r"
 externalDependencies:
   - bit-bin
   - some-other-external
-"#;
+";
     let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
     let raw = settings.external_dependencies.clone().expect("field present");
     assert!(raw.contains("bit-bin") && raw.contains("some-other-external"));
@@ -879,7 +1253,7 @@ fn omitting_hoisting_limits_and_external_dependencies_keeps_defaults() {
 
     let mut config = Config::new();
     settings.apply_to(&mut config, Path::new("/irrelevant"));
-    assert!(config.hoisting_limits.is_empty());
+    assert_eq!(config.hoisting_limits, HoistingLimits::None);
     assert!(config.external_dependencies.is_empty());
 }
 
@@ -956,4 +1330,214 @@ fn trust_policy_yaml_values_round_trip() {
     let mut config = Config::new();
     settings.apply_to(&mut config, Path::new("/irrelevant"));
     assert_eq!(config.trust_policy, TrustPolicy::Off, "default stays off when key is absent");
+}
+
+/// `resolutionMode` accepts the three upstream string values; an
+/// absent key leaves the [`ResolutionMode::Highest`] default in place.
+#[test]
+fn resolution_mode_yaml_values_round_trip() {
+    for (yaml, expected) in [
+        ("resolutionMode: highest\n", ResolutionMode::Highest),
+        ("resolutionMode: time-based\n", ResolutionMode::TimeBased),
+        ("resolutionMode: lowest-direct\n", ResolutionMode::LowestDirect),
+    ] {
+        let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+        assert_eq!(settings.resolution_mode, Some(expected));
+        let mut config = Config::new();
+        settings.apply_to(&mut config, Path::new("/irrelevant"));
+        assert_eq!(config.resolution_mode, expected);
+    }
+
+    let settings: WorkspaceSettings = serde_saphyr::from_str("").unwrap();
+    assert!(settings.resolution_mode.is_none());
+    let mut config = Config::new();
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert_eq!(
+        config.resolution_mode,
+        ResolutionMode::Highest,
+        "default stays highest when the key is absent",
+    );
+}
+
+/// `catalogMode` accepts the three upstream string values; an absent key
+/// leaves the [`CatalogMode::Manual`] default in place.
+#[test]
+fn catalog_mode_yaml_values_round_trip() {
+    for (yaml, expected) in [
+        ("catalogMode: manual\n", CatalogMode::Manual),
+        ("catalogMode: strict\n", CatalogMode::Strict),
+        ("catalogMode: prefer\n", CatalogMode::Prefer),
+    ] {
+        let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+        assert_eq!(settings.catalog_mode, Some(expected));
+        let mut config = Config::new();
+        settings.apply_to(&mut config, Path::new("/irrelevant"));
+        assert_eq!(config.catalog_mode, expected);
+    }
+
+    let settings: WorkspaceSettings = serde_saphyr::from_str("").unwrap();
+    assert!(settings.catalog_mode.is_none());
+    let mut config = Config::new();
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert_eq!(
+        config.catalog_mode,
+        CatalogMode::Manual,
+        "default stays manual when the key is absent",
+    );
+}
+
+/// `registrySupportsTimeField` is a camelCase boolean; default `false`.
+#[test]
+fn parses_registry_supports_time_field_from_yaml_and_applies() {
+    let yaml = "registrySupportsTimeField: true\n";
+    let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+    assert_eq!(settings.registry_supports_time_field, Some(true));
+
+    let mut config = Config::new();
+    assert!(!config.registry_supports_time_field, "the default is `false`");
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert!(config.registry_supports_time_field, "yaml override wins");
+}
+
+/// `allowedDeprecatedVersions` is a `name → semver-range` map parsed
+/// from camelCase yaml and applied verbatim onto `Config`.
+#[test]
+fn parses_allowed_deprecated_versions_from_yaml_and_applies() {
+    let yaml = r#"
+allowedDeprecatedVersions:
+  request: "^2.88.0"
+  lodash: "<5.0.0"
+"#;
+    let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+
+    let mut config = Config::new();
+    assert!(config.allowed_deprecated_versions.is_empty(), "default is empty");
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert_eq!(
+        config.allowed_deprecated_versions.get("request").map(String::as_str),
+        Some("^2.88.0"),
+    );
+    assert_eq!(
+        config.allowed_deprecated_versions.get("lodash").map(String::as_str),
+        Some("<5.0.0"),
+    );
+}
+
+/// `updateConfig.ignoreDependencies` parses from the nested camelCase
+/// shape and lands on `Config.update_config`.
+#[test]
+fn parses_update_config_ignore_dependencies_from_yaml_and_applies() {
+    let yaml = r#"
+updateConfig:
+  ignoreDependencies:
+    - "@pnpm.e2e/foo"
+    - "@pnpm.e2e/bar"
+"#;
+    let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+
+    let mut config = Config::new();
+    assert!(config.update_config.ignore_dependencies.is_none(), "default is unset");
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert_eq!(
+        config.update_config.ignore_dependencies.as_deref(),
+        Some(&["@pnpm.e2e/foo".to_string(), "@pnpm.e2e/bar".to_string()][..]),
+    );
+}
+
+/// `peerDependencyRules` parses its three sub-fields from camelCase
+/// yaml and lands on `Config.peer_dependency_rules`.
+#[test]
+fn parses_peer_dependency_rules_from_yaml_and_applies() {
+    let yaml = r#"
+peerDependencyRules:
+  ignoreMissing:
+    - ajv
+  allowAny:
+    - react
+  allowedVersions:
+    bbb: "2"
+    "xxx>@foo/bar": "2"
+"#;
+    let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+
+    let mut config = Config::new();
+    assert_eq!(
+        config.peer_dependency_rules,
+        crate::PeerDependencyRules::default(),
+        "default is empty",
+    );
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    let rules = &config.peer_dependency_rules;
+    assert_eq!(rules.ignore_missing.as_deref(), Some(&["ajv".to_string()][..]));
+    assert_eq!(rules.allow_any.as_deref(), Some(&["react".to_string()][..]));
+    let allowed = rules.allowed_versions.as_ref().expect("allowedVersions set");
+    assert_eq!(allowed.get("bbb").map(String::as_str), Some("2"));
+    assert_eq!(allowed.get("xxx>@foo/bar").map(String::as_str), Some("2"));
+}
+
+#[test]
+fn parses_script_shell_and_node_options_from_yaml_and_applies() {
+    let yaml = r"
+scriptShell: /usr/bin/bash
+nodeOptions: --max-old-space-size=4096
+";
+    let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+    assert_eq!(settings.script_shell, Some(Some("/usr/bin/bash".to_string())));
+    assert_eq!(settings.node_options, Some(Some("--max-old-space-size=4096".to_string())));
+
+    let mut config = Config::new();
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert_eq!(config.script_shell.as_deref(), Some("/usr/bin/bash"));
+    assert_eq!(config.node_options.as_deref(), Some("--max-old-space-size=4096"));
+}
+
+/// The tri-state distinguishes "absent" from "explicit null", matching
+/// pnpm: an explicit `scriptShell: null` / `nodeOptions: null` clears a
+/// value inherited from global `config.yaml`, while an absent key leaves
+/// the inherited value untouched.
+#[test]
+fn script_shell_and_node_options_null_clears_inherited_value() {
+    let absent: WorkspaceSettings = serde_saphyr::from_str("hoist: true").unwrap();
+    assert_eq!(absent.script_shell, None);
+    assert_eq!(absent.node_options, None);
+
+    let mut config = Config::new();
+    config.script_shell = Some("/inherited/sh".to_string());
+    config.node_options = Some("--inherited".to_string());
+    absent.apply_to(&mut config, Path::new("/irrelevant"));
+    assert_eq!(config.script_shell.as_deref(), Some("/inherited/sh"), "absent must inherit");
+    assert_eq!(config.node_options.as_deref(), Some("--inherited"), "absent must inherit");
+
+    let cleared: WorkspaceSettings =
+        serde_saphyr::from_str("scriptShell: null\nnodeOptions: null").unwrap();
+    assert_eq!(cleared.script_shell, Some(None));
+    assert_eq!(cleared.node_options, Some(None));
+
+    let mut config = Config::new();
+    config.script_shell = Some("/inherited/sh".to_string());
+    config.node_options = Some("--inherited".to_string());
+    cleared.apply_to(&mut config, Path::new("/irrelevant"));
+    assert_eq!(config.script_shell, None, "explicit null must clear the inherited shell");
+    assert_eq!(config.node_options, None, "explicit null must clear inherited NODE_OPTIONS");
+}
+
+/// `frozenStore` parses from `pnpm-workspace.yaml` as a camelCase
+/// boolean and `apply_to` pushes it onto the `Config`. Defaults to
+/// `false` when the key is absent, matching pnpm's `frozen-store`
+/// default. Drives the read-only-store open path (`immutable=1`) and
+/// the disabled `index.db` writer.
+#[test]
+fn parses_frozen_store_from_yaml_and_applies() {
+    let absent: WorkspaceSettings = serde_saphyr::from_str("hoist: true").unwrap();
+    assert_eq!(absent.frozen_store, None);
+    let mut config = Config::new();
+    assert!(!config.frozen_store, "frozen_store must default to false");
+    absent.apply_to(&mut config, Path::new("/irrelevant"));
+    assert!(!config.frozen_store, "absent frozenStore must leave the default in place");
+
+    let enabled: WorkspaceSettings = serde_saphyr::from_str("frozenStore: true").unwrap();
+    assert_eq!(enabled.frozen_store, Some(true));
+    let mut config = Config::new();
+    enabled.apply_to(&mut config, Path::new("/irrelevant"));
+    assert!(config.frozen_store, "frozenStore: true must apply onto the config");
 }

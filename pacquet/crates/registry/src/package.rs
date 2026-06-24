@@ -7,14 +7,16 @@ use pacquet_network::{AuthHeaders, ThrottledClient};
 use pipe_trait::Pipe;
 use serde::{Deserialize, Serialize};
 
-use crate::{NetworkError, RegistryError, package_version::PackageVersion};
+use crate::{
+    NetworkError, RegistryError, package_version::PackageVersion, package_versions::PackageVersions,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Package {
     pub name: String,
     #[serde(rename = "dist-tags")]
     pub dist_tags: HashMap<String, String>,
-    pub versions: HashMap<String, PackageVersion>,
+    pub versions: PackageVersions,
 
     /// Per-version publish timestamps as the npm registry reports
     /// them. Each key is either a version string (value: ISO-8601
@@ -55,15 +57,25 @@ pub struct Package {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
 
+    /// Package-level `homepage` URL, shown in the `Details` column of
+    /// `pacquet outdated --long`. Mirrors pnpm's
+    /// [`PackageManifest.homepage`](https://github.com/pnpm/pnpm/blob/2a9bd897bf/packages/types/src/package.ts).
+    ///
+    /// Only the full-metadata endpoint (`application/json`) carries this
+    /// field; the abbreviated install metadata pacquet fetches by default
+    /// (`application/vnd.npm.install-v1+json`) omits it, so it is `None`
+    /// unless the registry serves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homepage: Option<String>,
+
     #[serde(skip_serializing, skip_deserializing)]
     pub mutex: Arc<Mutex<u8>>,
 }
 
 impl Package {
     /// Resolved publish timestamp for `version`, or `None` when the
-    /// registry didn't report one for that pin. Filters out the
-    /// reserved `unpublished` key (which is an object, not a string)
-    /// and any version slot whose value isn't a string.
+    /// registry didn't report one for that pin.
+    #[must_use]
     pub fn published_at(&self, version: &str) -> Option<&str> {
         self.time.as_ref()?.get(version)?.as_str()
     }
@@ -78,7 +90,7 @@ impl Package {
 
     /// Iterator over all `dist-tags` entries. Used by the picker's
     /// publishedBy filter which rewrites tags after dropping versions
-    /// past the cutoff. Iteration order is undefined (HashMap), as it
+    /// past the cutoff. Iteration order is undefined (`HashMap`), as it
     /// is in upstream's JS where `Object.entries(distTags)` walks
     /// insertion order — neither stack guarantees a particular order
     /// to callers, so callers that need a stable rewrite are expected
@@ -111,11 +123,7 @@ impl Package {
             "accept",
             "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*",
         );
-        // Mirrors `fetchMetadataFromFromRegistry` in pnpm v11's
-        // [`resolving/npm-resolver/src/fetch.ts`](https://github.com/pnpm/pnpm/blob/601317e7a3/resolving/npm-resolver/src/fetch.ts):
-        // resolve the per-URL `Authorization` value before issuing the
-        // request and attach it when present.
-        if let Some(value) = auth_headers.for_url(&url) {
+        if let Some(value) = auth_headers.for_url_with_package(&url, Some(name)) {
             request = request.header("authorization", value);
         }
         request
@@ -128,25 +136,30 @@ impl Package {
             .pipe(Ok)
     }
 
-    pub fn pinned_version(&self, version_range: &str) -> Option<&PackageVersion> {
+    #[must_use]
+    pub fn pinned_version(&self, version_range: &str) -> Option<Arc<PackageVersion>> {
         let range: node_semver::Range = version_range.parse().unwrap(); // TODO: this step should have happened in PackageManifest
-        let mut satisfied_versions = self
+        // Match on the version *strings* so only winning manifests
+        // hydrate from their raw fragments.
+        let mut satisfying = self
             .versions
-            .values()
-            .filter(|version| version.version.satisfies(&range))
-            .collect::<Vec<&PackageVersion>>();
-
-        satisfied_versions.sort_by(|a, b| a.version.partial_cmp(&b.version).unwrap());
-
-        // Optimization opportunity:
-        // We can store this in a cache to remove filter operation and make this a O(1) operation.
-        satisfied_versions.last().copied()
+            .keys()
+            .filter_map(|key| {
+                key.parse::<node_semver::Version>()
+                    .ok()
+                    .filter(|version| version.satisfies(&range))
+                    .map(|version| (version, key))
+            })
+            .collect::<Vec<_>>();
+        satisfying.sort_by(|(left, _), (right, _)| right.partial_cmp(left).unwrap());
+        satisfying.into_iter().find_map(|(_, key)| self.versions.get(key))
     }
 
-    pub fn latest(&self) -> &PackageVersion {
-        let version =
-            self.dist_tags.get("latest").expect("latest tag is expected but not found for package");
-        self.versions.get(version).unwrap()
+    /// Manifest under `dist-tags.latest`, or `None` — registry-served
+    /// data must not be able to panic the process.
+    #[must_use]
+    pub fn latest(&self) -> Option<Arc<PackageVersion>> {
+        self.versions.get(self.dist_tags.get("latest")?)
     }
 }
 

@@ -17,8 +17,20 @@
 
 use crate::{Lockfile, ProjectSnapshot};
 use derive_more::{Display, Error};
+use pacquet_catalogs_types::Catalogs;
 use pacquet_package_manifest::{DependencyGroup, PackageManifest};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+#[derive(Clone, Copy)]
+pub struct LockfileSettingsCheck<'a> {
+    pub catalogs: &'a Catalogs,
+    pub overrides: Option<&'a HashMap<String, String>>,
+    pub package_extensions_checksum: Option<&'a str>,
+    pub ignored_optional_dependencies: Option<&'a [String]>,
+    pub patched_dependencies: Option<&'a BTreeMap<String, String>>,
+    pub inject_workspace_packages: bool,
+    pub peers_suffix_max_length: u64,
+}
 
 /// Why an importer's lockfile entry doesn't satisfy the on-disk
 /// `package.json`. Mirrors the discriminated cases upstream's
@@ -29,6 +41,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[derive(Debug, Display, Error, PartialEq)]
 #[non_exhaustive]
 pub enum StalenessReason {
+    /// A catalog entry recorded in the lockfile's `catalogs:` snapshot
+    /// no longer matches the current workspace catalog config. Mirrors
+    /// upstream's `getOutdatedLockfileSetting` first branch, which
+    /// returns `'catalogs'` when `allCatalogsAreUpToDate` fails.
+    #[display("`catalogs` in the lockfile don't match the current config")]
+    CatalogsChanged { lockfile: Option<crate::CatalogSnapshots>, config: Catalogs },
+
     /// The lockfile has no `importers["."]` (or whatever id) entry,
     /// so we can't even start the comparison. Mirrors upstream's
     /// "no importer" reason at
@@ -99,6 +118,62 @@ pub enum StalenessReason {
         "`overrides` in the lockfile ({lockfile:?}) doesn't match the current config ({config:?})"
     )]
     OverridesChanged { lockfile: BTreeMap<String, String>, config: BTreeMap<String, String> },
+
+    /// The lockfile's `settings.injectWorkspacePackages` differs from
+    /// the current install's `Config::inject_workspace_packages`.
+    /// Mirrors upstream's
+    /// [`getOutdatedLockfileSetting.ts:80-82`](https://github.com/pnpm/pnpm/blob/39101f5e37/lockfile/settings-checker/src/getOutdatedLockfileSetting.ts#L80-L82):
+    /// the gate normalizes both sides through `Boolean(...)` so an
+    /// absent setting equals an explicit `false`. Pacquet has no
+    /// resolver, so the matching action is to surface this as
+    /// `OutdatedLockfile`.
+    #[display(
+        "`injectWorkspacePackages` in the lockfile ({lockfile}) doesn't match the current config ({config})"
+    )]
+    InjectWorkspacePackagesChanged { lockfile: bool, config: bool },
+
+    /// `settings.peersSuffixMaxLength` in the lockfile differs from
+    /// the value the current install would use. Mirrors upstream's
+    /// [`getOutdatedLockfileSetting.ts`](https://github.com/pnpm/pnpm/blob/39101f5e37/lockfile/settings-checker/src/getOutdatedLockfileSetting.ts):
+    /// an unset field in the lockfile is treated as the default
+    /// (1000), so drift is "recorded value (or default) doesn't equal
+    /// the current config's value".
+    #[display(
+        "`peersSuffixMaxLength` in the lockfile ({lockfile}) doesn't match the current config ({config})"
+    )]
+    PeersSuffixMaxLengthChanged { lockfile: u64, config: u64 },
+
+    /// The lockfile's `packageExtensionsChecksum` doesn't match the
+    /// checksum derived from the current install's
+    /// `Config::package_extensions`. Mirrors upstream's
+    /// [`getOutdatedLockfileSetting.ts:53-55`](https://github.com/pnpm/pnpm/blob/39101f5e37/lockfile/settings-checker/src/getOutdatedLockfileSetting.ts#L53-L55):
+    /// upstream returns `'packageExtensionsChecksum'` and
+    /// `needsFullResolution` flips on. Pacquet has no resolver, so the
+    /// matching action is to surface this as `OutdatedLockfile`. Both
+    /// values are the prefixed `sha256-…` strings the writer emits.
+    #[display(
+        "`packageExtensionsChecksum` in the lockfile ({lockfile:?}) doesn't match the current config ({config:?})"
+    )]
+    PackageExtensionsChecksumChanged { lockfile: Option<String>, config: Option<String> },
+
+    /// The lockfile's `patchedDependencies` (key → patch-file hash)
+    /// doesn't match the map the current install would write. Mirrors
+    /// upstream's
+    /// [`getOutdatedLockfileSetting.ts:61-63`](https://github.com/pnpm/pnpm/blob/39101f5e37/lockfile/settings-checker/src/getOutdatedLockfileSetting.ts#L61-L63):
+    /// upstream returns `'patchedDependencies'` and `needsFullResolution`
+    /// flips on. Pacquet has no resolver, so the matching action is to
+    /// surface this as `OutdatedLockfile`. A changed patch file changes
+    /// its hash here, which is what catches an edited patch whose
+    /// `(patch_hash=...)` depPath suffix would otherwise go stale. Both
+    /// values are normalized into a `BTreeMap` so the comparison is
+    /// order-insensitive (matching upstream's Ramda `equals`).
+    #[display(
+        "`patchedDependencies` in the lockfile ({lockfile:?}) doesn't match the current config ({config:?})"
+    )]
+    PatchedDependenciesChanged {
+        lockfile: BTreeMap<String, String>,
+        config: BTreeMap<String, String>,
+    },
 }
 
 /// Per-bucket diff against the manifest's flat union of deps.
@@ -169,6 +244,7 @@ fn noun_verb_for(n: usize) -> (&'static str, &'static str) {
 /// `true` when the flat-record diff is empty in all three buckets —
 /// the manifest and the lockfile agree on the set of specifiers.
 impl SpecDiff {
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.added.is_empty() && self.removed.is_empty() && self.modified.is_empty()
     }
@@ -176,10 +252,11 @@ impl SpecDiff {
 
 /// Verify that lockfile-level settings the install pipeline reads
 /// from `pnpm-workspace.yaml` haven't drifted since the lockfile
-/// was written. Today this covers `overrides` and
-/// `ignoredOptionalDependencies` (umbrella #434 slice 7); the
-/// variants below will grow as more upstream settings land
-/// (`catalogs`, `patchedDependencies`, `pnpmfileChecksum`, etc.).
+/// was written. Today this covers `catalogs`, `overrides`,
+/// `packageExtensionsChecksum`, `ignoredOptionalDependencies`,
+/// `patchedDependencies`, and the relevant `settings.*` keys (umbrella
+/// [#434] slice 7); the variants below will grow as more upstream
+/// settings land (`pnpmfileChecksum`, etc.).
 ///
 /// Mirrors upstream's
 /// [`getOutdatedLockfileSetting`](https://github.com/pnpm/pnpm/blob/606f53e78f/lockfile/settings-checker/src/getOutdatedLockfileSetting.ts).
@@ -189,17 +266,54 @@ impl SpecDiff {
 /// matches upstream's so the *first* drifted field is reported on
 /// both sides — which matters for tests and for CI logs that quote
 /// the reason verbatim.
+///
+/// [#434]: https://github.com/pnpm/pacquet/issues/434
 pub fn check_lockfile_settings(
     lockfile: &Lockfile,
     overrides: Option<&HashMap<String, String>>,
+    package_extensions_checksum: Option<&str>,
     ignored_optional_dependencies: Option<&[String]>,
+    patched_dependencies: Option<&BTreeMap<String, String>>,
+    inject_workspace_packages: bool,
+    peers_suffix_max_length: u64,
 ) -> Result<(), StalenessReason> {
-    // Upstream checks `overrides` before `ignoredOptionalDependencies`,
-    // so an install that changed both surfaces the overrides drift
-    // first — preserving that for parity with pnpm error reports.
-    // `BTreeMap` normalizes ordering so the order-insensitive `equals`
-    // upstream uses lines up with `==` here, and the `Display` impl
-    // renders the diff stably.
+    check_lockfile_settings_with_catalogs(
+        lockfile,
+        LockfileSettingsCheck {
+            catalogs: &Catalogs::new(),
+            overrides,
+            package_extensions_checksum,
+            ignored_optional_dependencies,
+            patched_dependencies,
+            inject_workspace_packages,
+            peers_suffix_max_length,
+        },
+    )
+}
+
+/// Catalog-aware variant of [`check_lockfile_settings`] used by install paths
+/// that have already loaded `pnpm-workspace.yaml`.
+pub fn check_lockfile_settings_with_catalogs(
+    lockfile: &Lockfile,
+    check: LockfileSettingsCheck<'_>,
+) -> Result<(), StalenessReason> {
+    let LockfileSettingsCheck {
+        catalogs,
+        overrides,
+        package_extensions_checksum,
+        ignored_optional_dependencies,
+        patched_dependencies,
+        inject_workspace_packages,
+        peers_suffix_max_length,
+    } = check;
+
+    if !all_catalogs_are_up_to_date(catalogs, lockfile.catalogs.as_ref()) {
+        return Err(StalenessReason::CatalogsChanged {
+            lockfile: lockfile.catalogs.clone(),
+            config: catalogs.clone(),
+        });
+    }
+
     let empty: HashMap<String, String> = HashMap::new();
     let lockfile_overrides: BTreeMap<String, String> = lockfile
         .overrides
@@ -215,10 +329,13 @@ pub fn check_lockfile_settings(
         });
     }
 
-    // Comparison is order-insensitive — upstream sorts both sides
-    // before calling Ramda's `equals`. Empty `None` and empty `[]`
-    // are equivalent (matches upstream's `?? []` default on both
-    // sides).
+    if lockfile.package_extensions_checksum.as_deref() != package_extensions_checksum {
+        return Err(StalenessReason::PackageExtensionsChecksumChanged {
+            lockfile: lockfile.package_extensions_checksum.clone(),
+            config: package_extensions_checksum.map(str::to_string),
+        });
+    }
+
     let mut lockfile_set: Vec<String> =
         lockfile.ignored_optional_dependencies.clone().unwrap_or_default();
     let mut config_set: Vec<String> = ignored_optional_dependencies.unwrap_or(&[]).to_vec();
@@ -230,7 +347,54 @@ pub fn check_lockfile_settings(
             config: config_set,
         });
     }
+
+    // A changed patch file changes its hash here, which is what
+    // invalidates a lockfile whose `(patch_hash=...)` depPath suffixes
+    // would otherwise go stale.
+    let empty_patches: BTreeMap<String, String> = BTreeMap::new();
+    let lockfile_patches = lockfile.patched_dependencies.as_ref().unwrap_or(&empty_patches);
+    let config_patches = patched_dependencies.unwrap_or(&empty_patches);
+    if lockfile_patches != config_patches {
+        return Err(StalenessReason::PatchedDependenciesChanged {
+            lockfile: lockfile_patches.clone(),
+            config: config_patches.clone(),
+        });
+    }
+
+    let lockfile_inject =
+        lockfile.settings.as_ref().is_some_and(|settings| settings.inject_workspace_packages);
+    if lockfile_inject != inject_workspace_packages {
+        return Err(StalenessReason::InjectWorkspacePackagesChanged {
+            lockfile: lockfile_inject,
+            config: inject_workspace_packages,
+        });
+    }
+
+    let lockfile_peers_suffix_max_length = lockfile
+        .settings
+        .as_ref()
+        .and_then(|s| s.peers_suffix_max_length)
+        .unwrap_or(crate::DEFAULT_PEERS_SUFFIX_MAX_LENGTH);
+    if lockfile_peers_suffix_max_length != peers_suffix_max_length {
+        return Err(StalenessReason::PeersSuffixMaxLengthChanged {
+            lockfile: lockfile_peers_suffix_max_length,
+            config: peers_suffix_max_length,
+        });
+    }
+
     Ok(())
+}
+
+fn all_catalogs_are_up_to_date(
+    catalogs_config: &Catalogs,
+    snapshot: Option<&crate::CatalogSnapshots>,
+) -> bool {
+    snapshot.iter().flat_map(|catalogs| catalogs.iter()).all(|(catalog_name, catalog)| {
+        catalog.iter().all(|(alias, entry)| {
+            catalogs_config.get(catalog_name).and_then(|catalog| catalog.get(alias))
+                == Some(&entry.specifier)
+        })
+    })
 }
 
 /// Verify the on-disk `package.json` is still satisfied by the
@@ -239,7 +403,7 @@ pub fn check_lockfile_settings(
 /// describing the first detected mismatch otherwise.
 ///
 /// Single-importer only today (pacquet doesn't have workspace support
-/// — see #431). Callers thread the root importer entry directly.
+/// — see [#431]). Callers thread the root importer entry directly.
 ///
 /// What is checked (in order, short-circuiting on the first failure):
 ///
@@ -254,20 +418,22 @@ pub fn check_lockfile_settings(
 ///
 /// Mirrors upstream's
 /// [`satisfiesPackageManifest`](https://github.com/pnpm/pnpm/blob/94240bc046/lockfile/verification/src/satisfiesPackageManifest.ts).
-/// Scoped to what pacquet supports today: no catalogs (#?), no
-/// `auto-install-peers` pre-pass (pacquet has no separate
-/// auto-install-peers mode), no `excludeLinksFromLockfile` (`link:`
-/// resolutions aren't supported yet — #431 territory), and no
-/// version-range-satisfies check (covered in pnpm's
+/// Scoped to what pacquet supports today: no `auto-install-peers`
+/// pre-pass (pacquet has no separate auto-install-peers mode), no
+/// `excludeLinksFromLockfile` (`link:` resolutions aren't supported
+/// yet — [#431] territory), and no version-range-satisfies check
+/// (covered in pnpm's
 /// `localTarballDepsAreUpToDate` for file: / tarball deps; out of
 /// scope here).
+///
+/// [#431]: https://github.com/pnpm/pacquet/issues/431
 pub fn satisfies_package_manifest(
     importer: &ProjectSnapshot,
     manifest: &PackageManifest,
     importer_id: &str,
     is_ignored_optional: &dyn Fn(&str) -> bool,
 ) -> Result<(), StalenessReason> {
-    let _ = importer_id; // reserved for the multi-importer path once #431 lands.
+    let _ = importer_id; // reserved for the multi-importer path once <https://github.com/pnpm/pacquet/issues/431> lands.
 
     // Phase 1: flat-record diff against the manifest's union of
     // dependency fields. Matches the upstream
@@ -308,28 +474,14 @@ pub fn satisfies_package_manifest(
     let importer_meta = importer.dependencies_meta.as_ref();
     if !dependencies_meta_equal(importer_meta, manifest_meta) {
         return Err(StalenessReason::DependenciesMetaMismatch {
-            lockfile: importer_meta.map_or_else(|| "{}".to_string(), |v| v.to_string()),
-            manifest: manifest_meta.map_or_else(|| "{}".to_string(), |v| v.to_string()),
+            lockfile: importer_meta
+                .map_or_else(|| "{}".to_string(), std::string::ToString::to_string),
+            manifest: manifest_meta
+                .map_or_else(|| "{}".to_string(), std::string::ToString::to_string),
         });
     }
 
-    // Phase 4: per-field name-set + specifier match. The flat-record
-    // diff catches added/removed/modified specifiers across the
-    // *union*, but doesn't catch the case where a dep keeps its
-    // specifier but moves between fields (e.g. `react` moved from
-    // `dependencies` to `devDependencies`) — the union stays the
-    // same in both. Run the per-field comparison unconditionally
-    // here to catch that and the same-cardinality cross-field-swap
-    // case (lockfile prod={a}, dev={b} vs manifest prod={b}, dev={a}).
-    //
-    // A dep listed in *multiple* manifest fields is counted only in
-    // the highest-precedence one: `optionalDependencies` >
-    // `dependencies` > `devDependencies`. Matches upstream's
-    // `pkgDepNames` filter at
-    // <https://github.com/pnpm/pnpm/blob/94240bc046/lockfile/verification/src/satisfiesPackageManifest.ts#L69-L84>.
-    // Without this, a manifest with the same dep in both `deps` and
-    // `devDeps` would fail the `devDeps` check even though the
-    // lockfile records it under `deps` only.
+    // Phase 4: per-field name-set + specifier match.
     let manifest_prod: BTreeMap<&str, &str> = manifest
         .dependencies([DependencyGroup::Prod])
         .filter(|(name, _)| !is_ignored_optional(name))
@@ -342,24 +494,11 @@ pub fn satisfies_package_manifest(
         let field_name = <&'static str>::from(field);
         let manifest_field: BTreeMap<&str, &str> = manifest
             .dependencies([field])
-            // `ignoredOptionalDependencies` (umbrella #434 slice 7):
-            // upstream's read-package-hook strips matching entries
-            // from `optionalDependencies` AND `dependencies` before
-            // the resolver sees the manifest, so the lockfile never
-            // carries them. `devDependencies` is intentionally
-            // untouched by the hook — see
-            // <https://github.com/pnpm/pnpm/blob/94240bc046/hooks/read-package-hook/src/createOptionalDependenciesRemover.ts>:
-            // the hook iterates `optionalDependencies` keys and
-            // deletes from `optionalDependencies` plus
-            // `dependencies` only.
             .filter(|(name, _)| {
                 !matches!(field, DependencyGroup::Prod | DependencyGroup::Optional)
                     || !is_ignored_optional(name)
             })
             .filter(|(name, _)| match field {
-                // `dev` deps are dropped if also listed in `prod` or
-                // `optional`. `prod` deps are dropped if also in
-                // `optional`. `optional` always wins.
                 DependencyGroup::Dev => {
                     !manifest_prod.contains_key(*name) && !manifest_optional.contains_key(*name)
                 }
@@ -457,15 +596,6 @@ fn flat_manifest_specs(
     let mut out = BTreeMap::new();
     for group in [DependencyGroup::Dev, DependencyGroup::Prod, DependencyGroup::Optional] {
         for (name, spec) in manifest.dependencies([group]) {
-            // `ignoredOptionalDependencies` filter — only applies to
-            // `Prod` and `Optional`, matching upstream's
-            // [`createOptionalDependenciesRemover`](https://github.com/pnpm/pnpm/blob/94240bc046/hooks/read-package-hook/src/createOptionalDependenciesRemover.ts).
-            // The hook iterates `optionalDependencies` and deletes
-            // matches from there AND from `dependencies`, but
-            // leaves `devDependencies` untouched. Mirroring that
-            // exactly: the same name listed in `devDependencies`
-            // is kept here so the lockfile-side dev entry doesn't
-            // falsely surface as drift.
             if matches!(group, DependencyGroup::Prod | DependencyGroup::Optional)
                 && is_ignored_optional(name)
             {

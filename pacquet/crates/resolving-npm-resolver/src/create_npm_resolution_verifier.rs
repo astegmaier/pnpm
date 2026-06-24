@@ -4,11 +4,13 @@
 //! [`createNpmResolutionVerifier.ts`](https://github.com/pnpm/pnpm/blob/2a9bd897bf/resolving/npm-resolver/src/createNpmResolutionVerifier.ts).
 //!
 //! The factory takes the install-time policy (cutoff time, exclude
-//! patterns, trust policy, named registries) and returns a verifier
-//! when at least one policy is active. The verifier inspects each
-//! npm-registry-resolved lockfile entry, applies the
-//! `minimumReleaseAge` and/or `trustPolicy='no-downgrade'` checks,
-//! and surfaces violations through [`ResolutionVerification::Err`].
+//! patterns, trust policy, named registries) and returns a verifier.
+//! The verifier inspects each npm-registry-resolved lockfile entry: it
+//! always binds the recorded tarball URL to the artifact the registry's
+//! metadata lists (an anti-tamper check independent of any policy), and
+//! additionally applies the `minimumReleaseAge` and/or
+//! `trustPolicy='no-downgrade'` checks when those are configured.
+//! Violations surface through [`ResolutionVerification::Err`].
 //!
 //! The publish-timestamp lookup walks a 4-layer fallback chain
 //! (abbreviated-modified shortcut → local mirror → attestation
@@ -21,12 +23,13 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use pacquet_config::{TrustPolicy, version_policy::PackageVersionPolicy};
 use pacquet_lockfile::{LockfileResolution, PkgName};
-use pacquet_network::{AuthHeaders, ThrottledClient};
-use pacquet_registry::{NpmUser, Package, PackageDistribution, PackageVersion};
+use pacquet_network::{AuthHeaders, RetryOpts, ThrottledClient};
+use pacquet_registry::{Approver, NpmUser, Package, PackageDistribution, PackageVersion};
 use pacquet_resolving_resolver_base::{
-    ResolutionVerification, ResolutionVerifier, VerifyCtx, VerifyFuture,
+    ResolutionVerification, ResolutionVerifier, VerifyCtx, VerifyFuture, parse_packument_timestamp,
 };
 use pipe_trait::Pipe;
 use serde_json::Value as JsonValue;
@@ -39,8 +42,36 @@ use crate::{
     named_registry::{build_named_registry_prefixes, pick_registry_for_package},
     pick_package::PackageMetaCache,
     trust_checks::fail_if_trust_downgraded,
-    violation_codes::{MINIMUM_RELEASE_AGE_VIOLATION_CODE, TRUST_DOWNGRADE_VIOLATION_CODE},
+    violation_codes::{
+        MINIMUM_RELEASE_AGE_VIOLATION_CODE, TARBALL_URL_MISMATCH_VIOLATION_CODE,
+        TRUST_DOWNGRADE_VIOLATION_CODE,
+    },
 };
+
+/// Per-version `dist` statistics that estimate a tarball's pipeline
+/// work: `unpackedSize` (transfer + decompress + hash bytes) and
+/// `fileCount` (per-file CAS-write overhead). Either may be absent —
+/// registries only publish them for packages uploaded since npm 6.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DistStats {
+    pub unpacked_size: Option<usize>,
+    pub file_count: Option<usize>,
+}
+
+/// `(package name, version) → dist` work statistics filled by the
+/// verifier as a side product of the tarball-URL binding check. The
+/// metadata is already in hand per entry, so collecting costs no extra
+/// fetch; consumers (the pnpr server's frozen fast path) use the stats
+/// to schedule the most expensive tarball downloads first. Shared as an
+/// `Arc` so the caller keeps a handle while the verifier fan-out writes.
+pub type ObservedDistStats = Arc<DashMap<(String, String), DistStats>>;
+
+/// Construct a fresh sink for
+/// [`CreateNpmResolutionVerifierOptions::observed_dist_stats`].
+#[must_use]
+pub fn observed_dist_stats_sink() -> ObservedDistStats {
+    Arc::new(DashMap::new())
+}
 
 /// Options bundle for [`create_npm_resolution_verifier`]. Mirrors
 /// upstream's
@@ -101,10 +132,18 @@ pub struct CreateNpmResolutionVerifierOptions {
     /// unit tests don't have a resolver running alongside, in which
     /// case the verifier falls back to its own fetch chain.
     pub meta_cache: Option<Arc<dyn PackageMetaCache>>,
+    /// Retry budget for the verifier's metadata and attestation
+    /// fetches. Sourced from the same `fetch-retries` config the
+    /// resolver and tarball paths use.
+    pub retry_opts: RetryOpts,
     /// Override for `Utc::now()` when computing the age cutoff and
     /// the `trustPolicyIgnoreAfter` window. `None` falls back to
     /// wall-clock at construction time.
     pub now: Option<DateTime<Utc>>,
+    /// Optional sink the verifier fills with each verified entry's
+    /// `dist` work statistics (see [`ObservedDistStats`]). `None`
+    /// skips collection.
+    pub observed_dist_stats: Option<ObservedDistStats>,
 }
 
 /// Verifier returned by [`create_npm_resolution_verifier`]. Stores
@@ -130,9 +169,11 @@ pub struct NpmResolutionVerifier {
     auth_headers: Arc<AuthHeaders>,
     cache_dir: Option<PathBuf>,
     meta_cache: Option<Arc<dyn PackageMetaCache>>,
+    retry_opts: RetryOpts,
     now: Option<DateTime<Utc>>,
     policy_snapshot: serde_json::Map<String, JsonValue>,
     lookup_context: PublishedAtLookupContext,
+    observed_dist_stats: Option<ObservedDistStats>,
 }
 
 impl std::fmt::Debug for NpmResolutionVerifier {
@@ -150,21 +191,18 @@ impl std::fmt::Debug for NpmResolutionVerifier {
     }
 }
 
-/// Returns an [`NpmResolutionVerifier`] when at least one policy is
-/// active, [`None`] otherwise. The empty case lets the install side
-/// skip building a verifier list, which collapses the fan-out to a
-/// straight pass — every lockfile entry yields `Ok`.
+/// Builds the [`NpmResolutionVerifier`]. It always binds each entry's
+/// recorded tarball URL to the artifact the registry's metadata lists (an
+/// anti-tamper check independent of any policy), and additionally applies
+/// the `minimum_release_age` / `trust_policy='no-downgrade'` checks when
+/// those are configured.
 ///
 /// Mirrors upstream's
 /// [`createNpmResolutionVerifier`](https://github.com/pnpm/pnpm/blob/2a9bd897bf/resolving/npm-resolver/src/createNpmResolutionVerifier.ts#L98-L253).
 pub fn create_npm_resolution_verifier(
     opts: CreateNpmResolutionVerifierOptions,
-) -> Option<NpmResolutionVerifier> {
+) -> NpmResolutionVerifier {
     let age_check_active = opts.minimum_release_age.is_some_and(|minutes| minutes > 0);
-    let trust_check_active = matches!(opts.trust_policy, Some(TrustPolicy::NoDowngrade));
-    if !age_check_active && !trust_check_active {
-        return None;
-    }
 
     let cutoff = if age_check_active {
         let minutes = opts.minimum_release_age.unwrap_or(0);
@@ -196,7 +234,7 @@ pub fn create_npm_resolution_verifier(
         opts.trust_policy_ignore_after,
     );
 
-    Some(NpmResolutionVerifier {
+    NpmResolutionVerifier {
         minimum_release_age_minutes: opts.minimum_release_age,
         cutoff,
         minimum_release_age_exclude: opts.minimum_release_age_exclude,
@@ -212,13 +250,28 @@ pub fn create_npm_resolution_verifier(
         auth_headers: opts.auth_headers,
         cache_dir: opts.cache_dir,
         meta_cache: opts.meta_cache,
+        retry_opts: opts.retry_opts,
         now: opts.now,
         policy_snapshot,
         lookup_context: PublishedAtLookupContext::new(),
-    })
+        observed_dist_stats: opts.observed_dist_stats,
+    }
 }
 
 impl ResolutionVerifier for NpmResolutionVerifier {
+    fn might_verify(&self, resolution: &LockfileResolution, ctx: VerifyCtx<'_>) -> bool {
+        let Some(tarball_url) = npm_registry_tarball(resolution) else {
+            return false;
+        };
+        if tarball_url.is_some() {
+            return true;
+        }
+        self.age_check_active()
+            && !is_excluded(self.minimum_release_age_exclude.as_ref(), ctx.name, ctx.version)
+            || self.trust_check_active()
+                && !is_excluded(self.trust_policy_exclude.as_ref(), ctx.name, ctx.version)
+    }
+
     fn verify<'a>(
         &'a self,
         resolution: &'a LockfileResolution,
@@ -232,6 +285,13 @@ impl ResolutionVerifier for NpmResolutionVerifier {
     }
 
     fn can_trust_past_check(&self, cached_policy: &serde_json::Map<String, JsonValue>) -> bool {
+        // The tarball-URL binding is unconditional today; a cached run
+        // that didn't record it (e.g. written before this rule existed)
+        // can't be trusted to have enforced it, so force a re-check.
+        if cached_policy.get("tarballUrlBinding").and_then(JsonValue::as_bool) != Some(true) {
+            return false;
+        }
+
         // Maturity: a previously cached run under a larger cutoff
         // (stricter window) is trustworthy under a smaller current one
         // — the set of accepted versions is a subset of today's.
@@ -293,8 +353,6 @@ impl NpmResolutionVerifier {
         let Some(tarball_url) = npm_registry_tarball(resolution) else {
             return ResolutionVerification::Ok;
         };
-        // Non-semver versions identify URL tarballs, file: refs, git refs,
-        // etc. Neither policy applies, and a registry lookup would 404.
         if node_semver::Version::parse(ctx.version).is_err() {
             return ResolutionVerification::Ok;
         }
@@ -303,11 +361,29 @@ impl NpmResolutionVerifier {
             && !is_excluded(self.minimum_release_age_exclude.as_ref(), ctx.name, ctx.version);
         let trust_applies = self.trust_check_active()
             && !is_excluded(self.trust_policy_exclude.as_ref(), ctx.name, ctx.version);
-        if !age_applies && !trust_applies {
+        if tarball_url.is_none() && !age_applies && !trust_applies {
             return ResolutionVerification::Ok;
         }
 
         let registry = self.pick_registry(ctx.name, tarball_url);
+
+        // A registry entry that pins an explicit tarball URL must point at
+        // the artifact the registry's own metadata lists. Otherwise a trusted
+        // name@version could front bytes from an attacker-chosen URL (with a
+        // matching integrity for those bytes). This binding is unconditional —
+        // it does not depend on the minimum-release-age / trust policies and
+        // isn't narrowed by their exclude lists, since it guards integrity
+        // rather than maturity/trust.
+        if let Some(url) = tarball_url
+            && let Some(violation) =
+                self.run_tarball_url_check(&registry, ctx.name, ctx.version, url).await
+        {
+            return violation;
+        }
+
+        if !age_applies && !trust_applies {
+            return ResolutionVerification::Ok;
+        }
 
         if age_applies
             && let Some(violation) = self.run_age_check(&registry, ctx.name, ctx.version).await
@@ -340,17 +416,72 @@ impl NpmResolutionVerifier {
     }
 
     fn pick_registry(&self, name: &PkgName, tarball_url: Option<&str>) -> String {
-        if let Some(url) = tarball_url
-            && let Ok(parsed) = reqwest::Url::parse(url)
-        {
-            let normalized = parsed.as_str();
+        if let Some(url) = tarball_url {
+            // Match on the same canonical form the tarball comparison uses, so
+            // a named-registry tarball that differs from the configured base
+            // only by scheme or `%2f` encoding still routes to its registry
+            // instead of falling back (and then failing closed against the
+            // wrong packument).
+            let normalized = canonical_tarball_url(url);
             for prefix in &self.named_registry_prefixes {
-                if normalized.starts_with(prefix) {
+                if normalized.starts_with(&canonical_tarball_url(prefix)) {
                     return prefix.clone();
                 }
             }
         }
         pick_registry_for_package(&self.registries, &name.to_string(), None)
+    }
+
+    /// Confirm the lockfile-pinned tarball URL is the artifact the
+    /// registry's own metadata lists for this exact `name@version`.
+    ///
+    /// Fail-closed: the entry passes only when the registry metadata
+    /// affirmatively lists this version with a matching tarball URL. If the
+    /// metadata can't be fetched, doesn't list the version, or omits
+    /// `dist.tarball`, the entry can't be confirmed and is rejected —
+    /// otherwise a tampered lockfile could smuggle a malicious URL past the
+    /// check by pointing it at a `name@version` the registry can't vouch for.
+    async fn run_tarball_url_check(
+        &self,
+        registry: &str,
+        name: &PkgName,
+        version: &str,
+        lockfile_tarball: &str,
+    ) -> Option<ResolutionVerification> {
+        let registry_tarball = match self.fetch_abbreviated_meta(registry, name).await {
+            Ok(meta) => {
+                if let Some(sink) = self.observed_dist_stats.as_ref()
+                    && let Some(stats) =
+                        meta.version_dist_stats.as_ref().and_then(|stats| stats.get(version))
+                {
+                    sink.insert((name.to_string(), version.to_string()), *stats);
+                }
+                meta.version_tarballs.and_then(|tarballs| tarballs.get(version).cloned())
+            }
+            Err(message) => {
+                // Couldn't reach the registry to verify (auth/network/5xx).
+                // Propagate the registry's own fetch error (already
+                // credential-redacted) so the install aborts with it rather
+                // than mislabeling a transport failure as a tampering-style URL
+                // mismatch. Still fail-closed: the entry never reaches the
+                // filesystem because the install never proceeds.
+                return Some(ResolutionVerification::FetchFailed { message });
+            }
+        };
+        match registry_tarball {
+            Some(url) if same_tarball_url(lockfile_tarball, &url) => None,
+            Some(url) => Some(ResolutionVerification::Err {
+                code: TARBALL_URL_MISMATCH_VIOLATION_CODE,
+                reason: format!(
+                    "has a tarball URL ({lockfile_tarball}) that does not match the registry's published metadata ({url})",
+                ),
+            }),
+            None => Some(ResolutionVerification::Err {
+                code: TARBALL_URL_MISMATCH_VIOLATION_CODE,
+                reason: "could not be verified against the registry's published metadata"
+                    .to_string(),
+            }),
+        }
     }
 
     async fn run_age_check(
@@ -362,12 +493,10 @@ impl NpmResolutionVerifier {
         let cutoff = self.cutoff.expect("cutoff is Some when age check is active");
         let published = match self.fetch_published_at(registry, name, version).await {
             Ok(value) => value,
-            Err(reason) => {
-                return Some(ResolutionVerification::Err {
-                    code: MINIMUM_RELEASE_AGE_VIOLATION_CODE,
-                    reason: uncheckable("minimumReleaseAge", &reason),
-                });
-            }
+            // A transport failure propagates the registry's own fetch error so
+            // the install aborts with it; a successful fetch that merely lacks a
+            // timestamp is handled below.
+            Err(message) => return Some(ResolutionVerification::FetchFailed { message }),
         };
         let Some(published) = published else {
             // No source surfaced a publish timestamp; mirror the
@@ -383,13 +512,12 @@ impl NpmResolutionVerifier {
                 ),
             });
         };
-        let Ok(parsed) = DateTime::parse_from_rfc3339(&published) else {
+        let Some(parsed) = parse_packument_timestamp(&published) else {
             return Some(ResolutionVerification::Err {
                 code: MINIMUM_RELEASE_AGE_VIOLATION_CODE,
                 reason: "publish timestamp is not a valid date".to_string(),
             });
         };
-        let parsed = parsed.with_timezone(&Utc);
         if parsed > cutoff {
             return Some(ResolutionVerification::Err {
                 code: MINIMUM_RELEASE_AGE_VIOLATION_CODE,
@@ -405,12 +533,6 @@ impl NpmResolutionVerifier {
     /// Run the resolver-time `failIfTrustDowngraded` check against the
     /// pinned lockfile version. Mirrors upstream's
     /// [`runTrustCheck`](https://github.com/pnpm/pnpm/blob/2a9bd897bf/resolving/npm-resolver/src/createNpmResolutionVerifier.ts#L325-L359).
-    ///
-    /// No attestation fast-path: presence of provenance on the current
-    /// version is not sufficient to clear a downgrade. The package may
-    /// have shipped earlier versions under a `trustedPublisher` with
-    /// provenance (the higher-rank evidence) and then dropped to plain
-    /// provenance — `fail_if_trust_downgraded` correctly flags that.
     async fn run_trust_check(
         &self,
         registry: &str,
@@ -419,12 +541,10 @@ impl NpmResolutionVerifier {
     ) -> Option<ResolutionVerification> {
         let meta = match self.fetch_full_meta_for_trust(registry, name).await {
             Ok(meta) => meta,
-            Err(reason) => {
-                return Some(ResolutionVerification::Err {
-                    code: TRUST_DOWNGRADE_VIOLATION_CODE,
-                    reason: uncheckable("trustPolicy", &reason),
-                });
-            }
+            // A transport failure propagates the registry's own fetch error so
+            // the install aborts with it rather than folding it into a policy
+            // violation.
+            Err(message) => return Some(ResolutionVerification::FetchFailed { message }),
         };
         let trust_opts = TrustCheckOptions {
             trust_policy_exclude: self.trust_policy_exclude.as_ref(),
@@ -443,10 +563,6 @@ impl NpmResolutionVerifier {
     /// Per-`(registry, name, version)` lookup with a layered fallback.
     /// Ports upstream's
     /// [`fetchPublishedAt`](https://github.com/pnpm/pnpm/blob/2a9bd897bf/resolving/npm-resolver/src/createNpmResolutionVerifier.ts#L456-L491).
-    ///
-    /// Phase 4 stubs the abbreviated-shortcut and on-disk-mirror layers
-    /// (return `None`); Phase 5 swaps the full-meta call behind the
-    /// cached fetcher and ports the abbreviated/mirror layers.
     async fn fetch_published_at(
         &self,
         registry: &str,
@@ -488,8 +604,7 @@ impl NpmResolutionVerifier {
         name: &PkgName,
         version: &str,
     ) -> Result<Option<String>, String> {
-        if let Some(value) = self.try_abbreviated_modified_shortcut(registry, name, version).await?
-        {
+        if let Some(value) = self.try_abbreviated_modified_shortcut(registry, name, version).await {
             return Ok(Some(value));
         }
         if let Some(map) = self.read_local_meta_time(registry, name).await
@@ -520,20 +635,23 @@ impl NpmResolutionVerifier {
         registry: &str,
         name: &PkgName,
         version: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> Option<String> {
         let cutoff = self.cutoff.expect("cutoff is Some when age check is active");
-        let Some(meta) = self.fetch_abbreviated_meta(registry, name).await? else {
-            return Ok(None);
+        // A fetch failure here is fine: ignore the error and fall back to
+        // per-version lookups, the same as a successful-but-uninformative
+        // metadata response.
+        let Ok(meta) = self.fetch_abbreviated_meta(registry, name).await else {
+            return None;
         };
-        let Some(modified) = meta.modified else { return Ok(None) };
-        let Ok(parsed) = DateTime::parse_from_rfc3339(&modified) else { return Ok(None) };
-        if parsed.with_timezone(&Utc) >= cutoff {
-            return Ok(None);
+        let modified = meta.modified?;
+        let parsed = parse_packument_timestamp(&modified)?;
+        if parsed >= cutoff {
+            return None;
         }
-        if !meta.version_names.as_ref().is_some_and(|set| set.contains(version)) {
-            return Ok(None);
+        if !meta.version_tarballs.as_ref().is_some_and(|map| map.contains_key(version)) {
+            return None;
         }
-        Ok(Some(modified))
+        Some(modified)
     }
 
     /// Per-`(registry, name)` abbreviated-meta lookup. The result is
@@ -550,9 +668,11 @@ impl NpmResolutionVerifier {
     /// 2. The on-disk + network cached fetcher
     ///    ([`fetch_full_metadata_cached()`] with `full_metadata: false`)
     ///    when no shared entry is available.
-    /// 3. A failure (decode / network / cache-write IO) caches
-    ///    `None` so subsequent calls fall through to the next layer
-    ///    of [`Self::resolve_published_at`] without retrying.
+    /// 3. A failure (decode / network / cache-write IO) caches a
+    ///    credential-safe `Err(reason)` so subsequent calls reuse the
+    ///    same verdict without retrying. The tarball-URL check surfaces
+    ///    this error; the age shortcut ignores it and falls through to
+    ///    the next layer of [`Self::resolve_published_at`].
     ///
     /// Mirrors upstream's
     /// [`fetchAbbreviatedMeta`](https://github.com/pnpm/pnpm/blob/2a9bd897bf/resolving/npm-resolver/src/createNpmResolutionVerifier.ts#L626-L653).
@@ -560,7 +680,7 @@ impl NpmResolutionVerifier {
         &self,
         registry: &str,
         name: &PkgName,
-    ) -> Result<Option<crate::lookup_context::AbbreviatedMetaProjection>, String> {
+    ) -> Result<crate::lookup_context::AbbreviatedMetaProjection, String> {
         let key = package_key(registry, &name.to_string());
         let cell = {
             let mut cache = self.lookup_context.abbreviated_meta.lock().await;
@@ -569,7 +689,7 @@ impl NpmResolutionVerifier {
         let value = cell
             .get_or_init(|| async {
                 if let Some(shared) = self.read_shared_meta(name) {
-                    return Some(project_abbreviated_meta(&shared));
+                    return Ok(project_abbreviated_meta(&shared));
                 }
                 let opts = FetchFullMetadataCachedOptions {
                     registry,
@@ -577,14 +697,21 @@ impl NpmResolutionVerifier {
                     auth_headers: &self.auth_headers,
                     cache_dir: self.cache_dir.as_deref(),
                     full_metadata: false,
+                    filter_metadata: false,
+                    retry_opts: self.retry_opts,
                 };
+                // Carry a fetch failure (auth/network/5xx) as the `Err` value
+                // instead of collapsing it to a missing projection: the
+                // tarball-URL check needs to tell a transport failure apart
+                // from a version genuinely absent from the metadata, otherwise
+                // it reports a 403 as a tampering-style mismatch.
                 match fetch_full_metadata_cached(&name.to_string(), &opts).await {
-                    Ok(meta) => Some(project_abbreviated_meta(&meta)),
-                    Err(_) => None,
+                    Ok(meta) => Ok(project_abbreviated_meta(&meta)),
+                    Err(error) => Err(redact_url_credentials(&error.to_string())),
                 }
             })
             .await;
-        Ok(value.clone())
+        value.clone()
     }
 
     /// Try the resolver's shared [`PackageMetaCache`] for a packument
@@ -657,7 +784,7 @@ impl NpmResolutionVerifier {
         };
         fetch_attestation_published_at(&name.to_string(), version, &opts)
             .await
-            .map_err(|err| err.to_string())
+            .map_err(|err| redact_url_credentials(&err.to_string()))
     }
 
     async fn fetch_full_meta_time(
@@ -716,7 +843,7 @@ impl NpmResolutionVerifier {
             // on multi-thousand-entry workspaces OOMs CI runners with a 2GB heap
             // cap (see [#11860]).
             //
-            // [#11860]: https://github.com/pnpm/pnpm/issues/11860
+            // [#11860]: <https://github.com/pnpm/pnpm/issues/11860>
             self.fetch_full_meta(registry, name)
                 .await
                 .map(|meta| project_trust_meta(&meta))
@@ -735,8 +862,12 @@ impl NpmResolutionVerifier {
             // The verifier reads `time` and trust evidence per-version,
             // both of which the abbreviated form drops. Always full.
             full_metadata: true,
+            filter_metadata: false,
+            retry_opts: self.retry_opts,
         };
-        fetch_full_metadata_cached(&name.to_string(), &opts).await.map_err(|err| err.to_string())
+        fetch_full_metadata_cached(&name.to_string(), &opts)
+            .await
+            .map_err(|err| redact_url_credentials(&err.to_string()))
     }
 }
 
@@ -756,6 +887,12 @@ fn npm_registry_tarball(resolution: &LockfileResolution) -> Option<Option<&str>>
             // packument lookup; skip them.
             if t.git_hosted.unwrap_or(false) {
                 return None;
+            }
+            if let Ok(parsed) = reqwest::Url::parse(&t.tarball) {
+                let scheme = parsed.scheme();
+                if scheme != "http" && scheme != "https" {
+                    return None;
+                }
             }
             Some(Some(t.tarball.as_str()))
         }
@@ -803,6 +940,9 @@ fn build_policy_snapshot(
     trust_policy_ignore_after: Option<u64>,
 ) -> serde_json::Map<String, JsonValue> {
     let mut map = serde_json::Map::new();
+    // Marks runs that enforced the (unconditional) tarball-URL binding so
+    // `can_trust_past_check` rejects pre-rule cache records and re-verifies.
+    map.insert("tarballUrlBinding".to_string(), JsonValue::Bool(true));
     map.insert("minimumReleaseAge".to_string(), JsonValue::from(minimum_release_age));
     map.insert(
         "minimumReleaseAgeExclude".to_string(),
@@ -835,8 +975,9 @@ fn build_policy_snapshot(
 
 /// Build a [`Package`] that retains only the fields
 /// [`fail_if_trust_downgraded`] reads: the package name, the per-version
-/// `time` map, and per-version trust evidence (`_npmUser.trustedPublisher`
-/// and `dist.attestations.provenance`). Drops everything else — dependency
+/// `time` map, and per-version trust evidence (`_npmUser.approver`,
+/// `_npmUser.trustedPublisher`, and `dist.attestations.provenance`).
+/// Drops everything else — dependency
 /// graphs, scripts, READMEs — so the per-install trust-meta cache stays
 /// bounded by the trust-evidence footprint, not the full packument size.
 ///
@@ -853,7 +994,7 @@ fn project_trust_meta(meta: &Package) -> Package {
     let versions = meta
         .versions
         .iter()
-        .map(|(version, manifest)| (version.clone(), project_trust_package_version(manifest)))
+        .map(|(version, manifest)| (version.clone(), project_trust_package_version(&manifest)))
         .collect();
     Package {
         name: meta.name.clone(),
@@ -862,6 +1003,10 @@ fn project_trust_meta(meta: &Package) -> Package {
         time: meta.time.clone(),
         modified: meta.modified.clone(),
         etag: meta.etag.clone(),
+        // `homepage` is only read by `outdated --long`, never by trust
+        // verification, so it is dropped here to keep the trust-meta cache
+        // bounded by the trust-evidence footprint (see the fn doc).
+        homepage: None,
         mutex: std::sync::Arc::new(std::sync::Mutex::new(0)),
     }
 }
@@ -871,14 +1016,20 @@ fn project_trust_package_version(version: &PackageVersion) -> PackageVersion {
         version.dist.attestations.as_ref().and_then(|att| att.provenance.as_ref()).map(|prov| {
             pacquet_registry::AttestationsDist { provenance: Some(prov.clone()), url: None }
         });
-    // `get_trust_evidence` only reads `npm_user.trusted_publisher`; drop
-    // the maintainer `name` / `email` PII so the projected cache entry
+    // `get_trust_evidence` only reads `npm_user.approver` (presence) and
+    // `npm_user.trusted_publisher`; drop the maintainer `name` / `email`
+    // PII — including the approver's — so the projected cache entry
     // doesn't hold per-version publisher metadata that downstream
     // doesn't need.
-    let npm_user =
-        version.npm_user.as_ref().and_then(|user| user.trusted_publisher.as_ref()).map(|trusted| {
-            NpmUser { name: None, email: None, trusted_publisher: Some(trusted.clone()) }
-        });
+    let approver = version.npm_user.as_ref().and_then(|user| user.approver.as_ref());
+    let trusted_publisher =
+        version.npm_user.as_ref().and_then(|user| user.trusted_publisher.as_ref());
+    let npm_user = (approver.is_some() || trusted_publisher.is_some()).then(|| NpmUser {
+        name: None,
+        email: None,
+        approver: approver.map(|_| Approver { name: None, email: None }),
+        trusted_publisher: trusted_publisher.cloned(),
+    });
     PackageVersion {
         // `fail_if_trust_downgraded` keys off the outer `meta.versions`
         // map and the version-level npm_user / attestations fields. The
@@ -903,20 +1054,99 @@ fn project_trust_package_version(version: &PackageVersion) -> PackageVersion {
         peer_dependencies_meta: None,
         npm_user,
         deprecated: None,
+        other: HashMap::new(),
     }
 }
 
-/// Pull the `(modified, versionNames)` projection the abbreviated
-/// shortcut needs out of a packument document. Works against either
-/// the abbreviated or the full form — both carry `modified` and a
-/// `versions` map.
+/// Pull the `(modified, versionTarballs)` projection the verifier
+/// needs out of a packument document. Works against either the
+/// abbreviated or the full form — both carry `modified` and a
+/// `versions` map with per-version `dist.tarball`.
 ///
 /// Mirrors upstream's
 /// [`projectAbbreviatedMeta`](https://github.com/pnpm/pnpm/blob/2a9bd897bf/resolving/npm-resolver/src/createNpmResolutionVerifier.ts#L702-L707).
 fn project_abbreviated_meta(meta: &Package) -> crate::lookup_context::AbbreviatedMetaProjection {
+    let version_tarballs = meta
+        .versions
+        .iter()
+        .map(|(version, manifest)| (version.clone(), manifest.dist.tarball.clone()))
+        .collect();
+    let version_dist_stats = meta
+        .versions
+        .iter()
+        .filter_map(|(version, manifest)| {
+            let stats = DistStats {
+                unpacked_size: manifest.dist.unpacked_size,
+                file_count: manifest.dist.file_count,
+            };
+            (stats.unpacked_size.is_some() || stats.file_count.is_some())
+                .then(|| (version.clone(), stats))
+        })
+        .collect();
     crate::lookup_context::AbbreviatedMetaProjection {
         modified: meta.modified.clone(),
-        version_names: Some(meta.versions.keys().cloned().collect()),
+        version_tarballs: Some(version_tarballs),
+        version_dist_stats: Some(version_dist_stats),
+    }
+}
+
+/// Strip `user:pass@` (or `user@`) that appears right after a URL scheme in
+/// any message text, e.g. `… https://user:pass@host/pkg …` →
+/// `… https://host/pkg …`. A registry configured as `https://user:pass@host/`
+/// would otherwise leak its embedded basic-auth into the fetch error the
+/// verifier surfaces when it aborts on a transport failure.
+fn redact_url_credentials(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find("://") {
+        let (before, after) = rest.split_at(pos + "://".len());
+        out.push_str(before);
+        // Only treat "://" as a URL authority boundary when a scheme character
+        // (schemes end in an ASCII alphanumeric) precedes it, so an unrelated
+        // "://" in the message isn't mangled.
+        let has_scheme = pos > 0 && rest.as_bytes()[pos - 1].is_ascii_alphanumeric();
+        rest = strip_leading_userinfo(after).filter(|_| has_scheme).unwrap_or(after);
+    }
+    out.push_str(rest);
+    out
+}
+
+/// If the authority leading `text` contains `userinfo@`, return the slice after
+/// the **last** `@` within it; otherwise `None`. The authority ends at the first
+/// `/`, `?`, `#`, or whitespace. Stripping to the last `@` keeps a raw `@` inside
+/// the password (`user:p@ss@host`) from leaking its tail.
+fn strip_leading_userinfo(authority: &str) -> Option<&str> {
+    let mut last_at = None;
+    for (idx, ch) in authority.char_indices() {
+        match ch {
+            '@' => last_at = Some(idx + ch.len_utf8()),
+            '/' | '?' | '#' => break,
+            c if c.is_whitespace() => break,
+            _ => {}
+        }
+    }
+    last_at.map(|end| &authority[end..])
+}
+
+fn same_tarball_url(left: &str, right: &str) -> bool {
+    canonical_tarball_url(left) == canonical_tarball_url(right)
+}
+
+/// Mirror upstream's `canonicalTarballUrl`: parse-and-reserialize to drop
+/// default ports (`:443`/`:80`, what pnpm's `normalizeRegistryUrl` does via
+/// `new URL(...).toString()`), decode the `%2f` scoped-name separator, then
+/// ignore the scheme — so a benign http/https, default-port, or encoding
+/// difference between the lockfile URL and the registry metadata isn't read
+/// as tampering.
+fn canonical_tarball_url(url: &str) -> String {
+    let normalized = reqwest::Url::parse(url)
+        .map_or_else(|_error| url.to_string(), |parsed| parsed.to_string())
+        // `%2f` may survive re-serialization in either case; normalize both.
+        .replace("%2F", "/")
+        .replace("%2f", "/");
+    match normalized.split_once("://") {
+        Some((_scheme, rest)) => rest.to_string(),
+        None => normalized,
     }
 }
 

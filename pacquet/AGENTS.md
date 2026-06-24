@@ -186,13 +186,15 @@ Warnings are errors (`--deny warnings` in lint). Do not silence them with
 ## Tests
 
 - Tests live alongside the code they exercise (standard Cargo layout) plus
-  integration tests under each crate's `tests/`. Shared test fixtures live
-  under `crates/testing-utils/src/fixtures/`.
+  integration tests under each crate's `tests/`. Shared pacquet fixtures live
+  under `crates/testing-utils/src/fixtures/`; registry package fixtures live
+  under `../pnpr/.fixtures/packages/`.
 - Snapshot tests use `insta`. When an intentional change alters a snapshot,
   review the diff carefully, then accept with `cargo insta review`. Never
   accept snapshot changes blindly.
-- Some tests require the mocked registry. Start it with
-  `just registry-mock launch` if a test needs it.
+- Tests that need the mocked registry start `pnpr` through
+  `pacquet-testing-utils`; `cargo test` / `cargo nextest run` should not
+  require a separate `just registry-mock launch` step.
 - When porting behavior from pnpm, port the relevant pnpm tests too (as Rust
   tests) whenever they translate. Matching test coverage is the easiest way
   to prove behavioral parity.
@@ -295,6 +297,7 @@ Rust-specific defaults:
 
 -   **Doc comments (`///`, `//!`) document the contract.** Preconditions, postconditions, panics, the reason the function exists. They are not a re-narration of the body.
 -   **Do not restate at call sites what the callee's doc comment already says.** If `///` on the function says "no-op when …", the caller should not repeat that. Update the doc once; let every call site benefit.
+-   **Put a shared *why* in one place.** When the same rationale underlies several related functions — peers that delegate to a common helper, or a type and its methods — document it once at that common home and reference it from the rest, instead of re-deriving it in each. This is the call-site rule applied sideways across peers, not just upward to a callee.
 -   **Tests are documentation. Do not duplicate them in prose.** If a behavioral scenario, edge case, failure mode, or worked example is already captured by a test (its name, its setup, its assertions), do not also narrate it in the doc comment on the implementation. The doc comment should state the contract once; the test demonstrates the behavior. The same applies in reverse: a test's own doc comment should not re-explain what the asserts already say, only the *why* if it is not obvious.
 -   **`// SAFETY:`, `// TODO:`, and similar prefixes are the exception.** They signal hidden invariants or known follow-ups that a reader cannot recover from the code alone.
 
@@ -377,9 +380,12 @@ are part of the public contract, not implementation detail. See
   reformat unrelated code.
 - Reference the upstream pnpm commit/PR you ported from, when applicable.
 - Run `just ready` before pushing.
-- The repo installs a pre-push hook via `just install-hooks` that runs
-  `rustfmt` and `taplo`. Make sure your environment can run cargo (the
-  hook needs it) before pushing.
+- The repo-wide husky `pre-push` hook runs `pacquet/scripts/pre-push-rust.sh`,
+  which checks `rustfmt`, `taplo`, `cargo clippy` (with `--all-targets -D
+  warnings`), `cargo doc` (with `RUSTDOCFLAGS=-D warnings`), and `cargo
+  dylint`. Make sure your environment
+  can run cargo (the hook needs it) before pushing; `cargo-dylint` is
+  detected at runtime and skipped with a warning if not installed.
 
 ### Commit messages
 

@@ -1,9 +1,9 @@
-#[cfg(unix)]
-use super::LINK_STATE_COPY;
 use super::{
     LINK_STATE_CLONE, LINK_STATE_HARDLINK, LinkFileError, auto_link, clone_or_copy_link,
     is_call_error, is_cross_device, link_file,
 };
+#[cfg(unix)]
+use super::{LINK_STATE_COPY, import_into_fresh_target};
 use pacquet_config::PackageImportMethod;
 use pacquet_reporter::SilentReporter;
 use pretty_assertions::assert_eq;
@@ -33,7 +33,6 @@ fn copy_materializes_the_file_contents() {
         .expect("link_file should succeed");
 
     assert_eq!(fs::read(&dst).unwrap(), b"hello");
-    // A plain copy leaves the two files as independent inodes.
     let src_ino = fs::metadata(&src).unwrap();
     let dst_ino = fs::metadata(&dst).unwrap();
     #[cfg(unix)]
@@ -45,9 +44,104 @@ fn copy_materializes_the_file_contents() {
     let _ = (src_ino, dst_ino);
 }
 
+/// A CAS entry stored as executable carries the `-exec` suffix in its
+/// store path. Copying it out must land an executable file even when
+/// the copy tier dropped the exec bit (overlayfs etc.) — the suffix is
+/// the source of truth, so the copied binary ends up `0o755`.
+#[test]
+#[cfg(unix)]
+fn copy_restores_executable_mode_from_cas_suffix() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempdir().unwrap();
+    let src = write_source(tmp.path(), "1b59d9-exec", b"#!/usr/bin/env node\n");
+    fs::set_permissions(&src, fs::Permissions::from_mode(0o644)).unwrap();
+    let dst = tmp.path().join("nested/dst");
+    fs::create_dir_all(dst.parent().unwrap()).unwrap();
+
+    link_file::<SilentReporter>(&AtomicU8::new(0), PackageImportMethod::Copy, &src, &dst)
+        .expect("copy should restore executable CAS mode");
+
+    let dst_mode = fs::metadata(&dst).unwrap().permissions().mode() & 0o777;
+    assert_eq!(dst_mode, 0o755, "copied executable file must stay executable");
+}
+
+/// A non-executable CAS entry has no `-exec` suffix, so the copy must
+/// leave its mode untouched. Guards against widening permissions on the
+/// restrictive end — a `0o600` source stays `0o600`, never `0o711`.
+#[test]
+#[cfg(unix)]
+fn copy_does_not_widen_non_exec_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempdir().unwrap();
+    let src = write_source(tmp.path(), "1b59d9", b"private data\n");
+    fs::set_permissions(&src, fs::Permissions::from_mode(0o600)).unwrap();
+    let dst = tmp.path().join("nested/dst");
+    fs::create_dir_all(dst.parent().unwrap()).unwrap();
+
+    link_file::<SilentReporter>(&AtomicU8::new(0), PackageImportMethod::Copy, &src, &dst)
+        .expect("copy should succeed");
+
+    let dst_mode = fs::metadata(&dst).unwrap().permissions().mode() & 0o777;
+    assert_eq!(dst_mode, 0o600, "non-executable file must not gain exec bits");
+}
+
+/// On EEXIST the import adopts the racing writer's dirent, but re-asserts
+/// the exec bit from the `-exec` suffix — so a target a prior failed
+/// restore left at `0o644` is healed rather than adopted broken. Driven
+/// through `Hardlink` for a deterministic EEXIST without needing reflink
+/// (copy-on-write) support on the test filesystem.
+#[test]
+#[cfg(unix)]
+fn eexist_restores_executable_mode_from_cas_suffix() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempdir().unwrap();
+    let src = write_source(tmp.path(), "1b59d9-exec", b"#!/usr/bin/env node\n");
+    fs::set_permissions(&src, fs::Permissions::from_mode(0o755)).unwrap();
+    let dst = write_source(tmp.path(), "dst", b"#!/usr/bin/env node\n");
+    fs::set_permissions(&dst, fs::Permissions::from_mode(0o644)).unwrap();
+
+    import_into_fresh_target::<SilentReporter>(
+        &AtomicU8::new(0),
+        PackageImportMethod::Hardlink,
+        &src,
+        &dst,
+    )
+    .expect("EEXIST import should heal the exec bit");
+
+    let dst_mode = fs::metadata(&dst).unwrap().permissions().mode() & 0o777;
+    assert_eq!(dst_mode, 0o755, "stale 0o644 target must be restored to 0o755 on EEXIST");
+}
+
+/// The EEXIST exec-bit re-assertion must not widen a non-executable
+/// entry: a `-exec`-less source leaves an existing `0o600` target alone.
+#[test]
+#[cfg(unix)]
+fn eexist_does_not_widen_non_exec_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempdir().unwrap();
+    let src = write_source(tmp.path(), "1b59d9", b"private data\n");
+    fs::set_permissions(&src, fs::Permissions::from_mode(0o644)).unwrap();
+    let dst = write_source(tmp.path(), "dst", b"private data\n");
+    fs::set_permissions(&dst, fs::Permissions::from_mode(0o600)).unwrap();
+
+    import_into_fresh_target::<SilentReporter>(
+        &AtomicU8::new(0),
+        PackageImportMethod::Hardlink,
+        &src,
+        &dst,
+    )
+    .expect("EEXIST import should be a no-op for a non-exec entry");
+
+    let dst_mode = fs::metadata(&dst).unwrap().permissions().mode() & 0o777;
+    assert_eq!(dst_mode, 0o600, "non-exec EEXIST target must not gain exec bits");
+}
+
 /// Hardlinking in the same directory on the same filesystem works on
-/// every mainstream OS the project supports. We verify the post-link
-/// inodes match (on unix) or that the contents match (otherwise).
+/// every mainstream OS the project supports.
 #[test]
 fn hardlink_shares_contents_with_source() {
     let tmp = tempdir().unwrap();
@@ -247,7 +341,7 @@ fn auto_call_errors_propagate_without_downgrading() {
 
 /// Same propagation rule at the hardlink tier. `fs::hard_link`
 /// doesn't get the same error-rewriting treatment that reflink
-/// does, so we can use the simpler "missing source → NotFound"
+/// does, so we can use the simpler "missing source → `NotFound`"
 /// trigger here.
 #[test]
 fn auto_hardlink_tier_call_errors_propagate() {

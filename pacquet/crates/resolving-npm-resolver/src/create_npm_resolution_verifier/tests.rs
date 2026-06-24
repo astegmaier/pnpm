@@ -3,12 +3,15 @@ use std::{collections::HashMap, sync::Arc};
 use chrono::{DateTime, Utc};
 use pacquet_config::{TrustPolicy, version_policy::create_package_version_policy};
 use pacquet_lockfile::{LockfileResolution, PkgName, RegistryResolution, TarballResolution};
-use pacquet_network::{AuthHeaders, ThrottledClient};
+use pacquet_network::{AuthHeaders, RetryOpts, ThrottledClient};
 use pacquet_resolving_resolver_base::{ResolutionVerification, ResolutionVerifier, VerifyCtx};
 use pretty_assertions::assert_eq;
 use ssri::Integrity;
 
-use super::{CreateNpmResolutionVerifierOptions, create_npm_resolution_verifier};
+use super::{
+    CreateNpmResolutionVerifierOptions, create_npm_resolution_verifier, observed_dist_stats_sink,
+    redact_url_credentials,
+};
 
 const FAKE_INTEGRITY: &str = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
 
@@ -48,7 +51,12 @@ fn default_opts(registry_url: &str) -> CreateNpmResolutionVerifierOptions {
         auth_headers: Arc::new(AuthHeaders::default()),
         cache_dir: None,
         meta_cache: None,
+        // No retries: tests that point an endpoint at an unmocked /
+        // erroring upstream would otherwise wait out the full pnpm
+        // backoff (10 s + 60 s) on every run.
+        retry_opts: RetryOpts { retries: 0, ..RetryOpts::default() },
         now: None,
+        observed_dist_stats: None,
     }
 }
 
@@ -156,65 +164,97 @@ fn ctx<'a>(name: &'a PkgName, version: &'a str) -> VerifyCtx<'a> {
     VerifyCtx { name, version }
 }
 
-/// `create_npm_resolution_verifier` returns `None` when neither
-/// the maturity nor trust check is active — the install side then
-/// skips fan-out entirely.
-#[test]
-fn returns_none_when_no_policy_active() {
-    let server_url = "https://registry.example/";
-    let opts = default_opts(server_url);
-    assert!(create_npm_resolution_verifier(opts).is_none());
+#[tokio::test]
+async fn verifies_tarball_url_when_no_policy_active() {
+    let mut server = mockito::Server::new_async().await;
+    let registry = format!("{}/", server.url());
+    let server_url = server.url();
+    let packument = serde_json::json!({
+        "name": "aged-pkg",
+        "dist-tags": { "latest": "1.0.0" },
+        "time": { "1.0.0": "2020-01-01T00:00:00.000Z" },
+        "versions": {
+            "1.0.0": {
+                "name": "aged-pkg",
+                "version": "1.0.0",
+                "dist": {
+                    "integrity": FAKE_INTEGRITY,
+                    "shasum": "0000000000000000000000000000000000000000",
+                    "tarball": format!("{server_url}/aged-pkg/-/aged-pkg-1.0.0.tgz"),
+                }
+            }
+        }
+    });
+    let _meta_mock = server
+        .mock("GET", "/aged-pkg")
+        .with_status(200)
+        .with_body(packument.to_string())
+        .create_async()
+        .await;
+    let opts = default_opts(&registry);
+    let verifier = create_npm_resolution_verifier(opts);
+    let resolution = LockfileResolution::Tarball(TarballResolution {
+        tarball: "https://attacker.example/aged-pkg-1.0.0.tgz".to_string(),
+        integrity: Some(fake_integrity()),
+        git_hosted: None,
+        path: None,
+    });
+    let name: PkgName = "aged-pkg".parse().expect("parse");
+    assert!(verifier.might_verify(&resolution, ctx(&name, "1.0.0")));
+    let result = verifier.verify(&resolution, ctx(&name, "1.0.0")).await;
+    let ResolutionVerification::Err { code, .. } = result else {
+        panic!("expected Err, got {result:?}");
+    };
+    assert_eq!(code, "TARBALL_URL_MISMATCH");
 }
 
-/// `minimum_release_age = 0` is treated the same as `None` — upstream's
-/// `Boolean(opts.minimumReleaseAge)` returns `false` for `0`, so the
-/// verifier stays inactive.
-#[test]
-fn returns_none_when_min_age_is_zero() {
-    let server_url = "https://registry.example/";
-    let mut opts = default_opts(server_url);
+#[tokio::test]
+async fn registry_resolution_with_no_active_policy_skips_metadata_lookup() {
+    let mut server = mockito::Server::new_async().await;
+    let registry = format!("{}/", server.url());
+    let _meta_mock = server.mock("GET", "/acme").expect(0).create_async().await;
+
+    let opts = default_opts(&registry);
+    let verifier = create_npm_resolution_verifier(opts);
+    let name: PkgName = "acme".parse().expect("parse");
+    assert!(!verifier.might_verify(&registry_resolution(), ctx(&name, "1.0.0")));
+    let result = verifier.verify(&registry_resolution(), ctx(&name, "1.0.0")).await;
+
+    assert_eq!(result, ResolutionVerification::Ok);
+}
+
+/// `minimum_release_age = 0` keeps the age check inactive. The bogus
+/// registry URL is a tripwire: a fetch would fail, so the `Ok` result
+/// proves the verifier never attempted an age lookup.
+#[tokio::test]
+async fn min_age_zero_keeps_age_check_inactive() {
+    let mut opts = default_opts("http://nonexistent.example.invalid/");
     opts.minimum_release_age = Some(0);
-    assert!(create_npm_resolution_verifier(opts).is_none());
+    let verifier = create_npm_resolution_verifier(opts);
+    let result = verifier
+        .verify(&registry_resolution(), ctx(&"acme".parse::<PkgName>().expect("parse"), "1.0.0"))
+        .await;
+    assert_eq!(result, ResolutionVerification::Ok);
 }
 
-/// `trust_policy = Off` keeps the verifier inactive even when set
-/// explicitly. Mirrors upstream's `opts.trustPolicy === 'no-downgrade'`
-/// gating.
-#[test]
-fn returns_none_when_trust_policy_off() {
-    let server_url = "https://registry.example/";
-    let mut opts = default_opts(server_url);
+/// `trust_policy = Off` keeps the trust check inactive (same tripwire
+/// rationale as the age-check test above).
+#[tokio::test]
+async fn trust_off_keeps_trust_check_inactive() {
+    let mut opts = default_opts("http://nonexistent.example.invalid/");
     opts.trust_policy = Some(TrustPolicy::Off);
-    assert!(create_npm_resolution_verifier(opts).is_none());
+    let verifier = create_npm_resolution_verifier(opts);
+    let result = verifier
+        .verify(&registry_resolution(), ctx(&"acme".parse::<PkgName>().expect("parse"), "1.0.0"))
+        .await;
+    assert_eq!(result, ResolutionVerification::Ok);
 }
 
-/// Setting `minimum_release_age` returns an active verifier even
-/// without a trust policy.
-#[test]
-fn returns_some_when_min_age_set() {
-    let server_url = "https://registry.example/";
-    let mut opts = default_opts(server_url);
-    opts.minimum_release_age = Some(60 * 24);
-    assert!(create_npm_resolution_verifier(opts).is_some());
-}
-
-/// `trust_policy = NoDowngrade` alone activates the verifier.
-#[test]
-fn returns_some_when_trust_policy_no_downgrade() {
-    let server_url = "https://registry.example/";
-    let mut opts = default_opts(server_url);
-    opts.trust_policy = Some(TrustPolicy::NoDowngrade);
-    assert!(create_npm_resolution_verifier(opts).is_some());
-}
-
-/// A git / directory / binary resolution short-circuits to
-/// `Ok` without issuing any network calls — neither policy applies
-/// outside the npm-registry protocol.
 #[tokio::test]
 async fn verify_short_circuits_non_registry_resolution() {
     let mut opts = default_opts("https://registry.example/");
     opts.minimum_release_age = Some(60 * 24 * 365);
-    let verifier = create_npm_resolution_verifier(opts).expect("verifier");
+    let verifier = create_npm_resolution_verifier(opts);
     let directory = LockfileResolution::Directory(pacquet_lockfile::DirectoryResolution {
         directory: "/some/path".into(),
     });
@@ -223,23 +263,135 @@ async fn verify_short_circuits_non_registry_resolution() {
     assert_eq!(result, ResolutionVerification::Ok);
 }
 
-/// Non-semver version (URL spec, git ref, file: ref) → pass without
-/// asking the registry. Mirrors upstream's `!semver.valid(version)`
-/// gate.
 #[tokio::test]
 async fn verify_short_circuits_non_semver_version() {
     let mut opts = default_opts("https://registry.example/");
     opts.minimum_release_age = Some(60 * 24 * 365);
-    let verifier = create_npm_resolution_verifier(opts).expect("verifier");
+    let verifier = create_npm_resolution_verifier(opts);
     let resolution = registry_resolution();
     let name: PkgName = "acme".parse().expect("parse");
     let result = verifier.verify(&resolution, ctx(&name, "not-semver")).await;
     assert_eq!(result, ResolutionVerification::Ok);
 }
 
-/// When the exclude policy covers the package, age check skips —
-/// the version is treated as opted out regardless of its publish
-/// timestamp.
+#[tokio::test]
+async fn verify_short_circuits_file_tarball_resolution() {
+    let mut opts = default_opts("http://nonexistent.example.invalid/");
+    opts.minimum_release_age = Some(60 * 24 * 365);
+    let verifier = create_npm_resolution_verifier(opts);
+    let resolution = LockfileResolution::Tarball(TarballResolution {
+        tarball: "file:vendor/types__my-cool-lib-v1.0.0.tgz".to_string(),
+        integrity: Some(fake_integrity()),
+        git_hosted: None,
+        path: None,
+    });
+    let name: PkgName = "@types/my-cool-lib".parse().expect("parse");
+    let result = verifier.verify(&resolution, ctx(&name, "1.0.0")).await;
+    assert_eq!(result, ResolutionVerification::Ok);
+}
+
+/// A registry entry whose pinned tarball URL is not the artifact the
+/// registry's metadata lists is rejected before the age check passes it.
+/// Guards against a tampered lockfile pairing an aged, trusted
+/// name@version with attacker-hosted bytes.
+#[tokio::test]
+async fn verify_flags_tarball_url_mismatch() {
+    let mut server = mockito::Server::new_async().await;
+    let registry = format!("{}/", server.url());
+    let server_url = server.url();
+    let packument = serde_json::json!({
+        "name": "aged-pkg",
+        "dist-tags": { "latest": "1.0.0" },
+        "time": { "1.0.0": "2020-01-01T00:00:00.000Z" },
+        "versions": {
+            "1.0.0": {
+                "name": "aged-pkg",
+                "version": "1.0.0",
+                "dist": {
+                    "integrity": FAKE_INTEGRITY,
+                    "shasum": "0000000000000000000000000000000000000000",
+                    "tarball": format!("{server_url}/aged-pkg/-/aged-pkg-1.0.0.tgz"),
+                }
+            }
+        }
+    });
+    let _meta_mock = server
+        .mock("GET", "/aged-pkg")
+        .with_status(200)
+        .with_body(packument.to_string())
+        .create_async()
+        .await;
+    let mut opts = default_opts(&registry);
+    opts.minimum_release_age = Some(60 * 24);
+    opts.now = Some(now_at("2025-12-01T00:00:00Z"));
+    let verifier = create_npm_resolution_verifier(opts);
+    let resolution = LockfileResolution::Tarball(TarballResolution {
+        tarball: "https://attacker.example/aged-pkg-1.0.0.tgz".to_string(),
+        integrity: Some(fake_integrity()),
+        git_hosted: None,
+        path: None,
+    });
+    let result = verifier
+        .verify(&resolution, ctx(&"aged-pkg".parse::<PkgName>().expect("parse"), "1.0.0"))
+        .await;
+    let ResolutionVerification::Err { code, reason } = result else {
+        panic!("expected Err, got {result:?}");
+    };
+    assert_eq!(code, "TARBALL_URL_MISMATCH");
+    assert!(
+        reason.contains("does not match the registry's published metadata"),
+        "got reason: {reason}",
+    );
+}
+
+/// A lockfile URL that differs from the registry metadata only by an
+/// explicit default port and the http/https scheme is a benign
+/// normalization, not tampering — `same_tarball_url` must canonicalize
+/// it away (this is what `canonical_tarball_url`'s URL parse buys over a
+/// plain string compare).
+#[tokio::test]
+async fn tarball_url_default_port_and_scheme_difference_is_a_match() {
+    let mut server = mockito::Server::new_async().await;
+    let registry = format!("{}/", server.url());
+    // The served metadata lists the artifact on a different host with an
+    // explicit default port and the http scheme; the lockfile pins the
+    // canonical https/no-port form of the same URL.
+    let packument = serde_json::json!({
+        "name": "aged-pkg",
+        "dist-tags": { "latest": "1.0.0" },
+        "time": { "1.0.0": "2020-01-01T00:00:00.000Z" },
+        "versions": {
+            "1.0.0": {
+                "name": "aged-pkg",
+                "version": "1.0.0",
+                "dist": {
+                    "integrity": FAKE_INTEGRITY,
+                    "shasum": "0000000000000000000000000000000000000000",
+                    "tarball": "http://registry.npmjs.org:80/aged-pkg/-/aged-pkg-1.0.0.tgz",
+                }
+            }
+        }
+    });
+    let _meta_mock = server
+        .mock("GET", "/aged-pkg")
+        .with_status(200)
+        .with_body(packument.to_string())
+        .create_async()
+        .await;
+    let opts = default_opts(&registry);
+    let verifier = create_npm_resolution_verifier(opts);
+    let resolution = LockfileResolution::Tarball(TarballResolution {
+        tarball: "https://registry.npmjs.org/aged-pkg/-/aged-pkg-1.0.0.tgz".to_string(),
+        integrity: Some(fake_integrity()),
+        git_hosted: None,
+        path: None,
+    });
+    let result = verifier
+        .verify(&resolution, ctx(&"aged-pkg".parse::<PkgName>().expect("parse"), "1.0.0"))
+        .await;
+    assert_eq!(result, ResolutionVerification::Ok);
+}
+
 #[tokio::test]
 async fn verify_skips_age_check_when_package_excluded() {
     // No mockito needed: if the exclude were ignored, the verifier
@@ -249,15 +401,13 @@ async fn verify_skips_age_check_when_package_excluded() {
     opts.minimum_release_age_exclude =
         Some(create_package_version_policy(["acme".to_string()]).expect("policy"));
     opts.minimum_release_age_exclude_patterns = vec!["acme".to_string()];
-    let verifier = create_npm_resolution_verifier(opts).expect("verifier");
+    let verifier = create_npm_resolution_verifier(opts);
     let resolution = registry_resolution();
     let name: PkgName = "acme".parse().expect("parse");
     let result = verifier.verify(&resolution, ctx(&name, "1.0.0")).await;
     assert_eq!(result, ResolutionVerification::Ok);
 }
 
-/// Full-metadata path: registry reports a publish time well before
-/// the cutoff → verify returns `Ok`.
 #[tokio::test]
 async fn min_age_pass_when_published_before_cutoff() {
     let mut server = mockito::Server::new_async().await;
@@ -281,15 +431,13 @@ async fn min_age_pass_when_published_before_cutoff() {
     let mut opts = default_opts(&registry);
     opts.minimum_release_age = Some(60 * 24); // 1 day
     opts.now = Some(now_at("2025-12-01T00:00:00Z"));
-    let verifier = create_npm_resolution_verifier(opts).expect("verifier");
+    let verifier = create_npm_resolution_verifier(opts);
     let result = verifier
         .verify(&registry_resolution(), ctx(&"acme".parse::<PkgName>().expect("parse"), "1.0.0"))
         .await;
     assert_eq!(result, ResolutionVerification::Ok);
 }
 
-/// Within-cutoff publish time → fail with the verifier's
-/// `MINIMUM_RELEASE_AGE_VIOLATION` code.
 #[tokio::test]
 async fn min_age_fail_when_published_within_cutoff() {
     let mut server = mockito::Server::new_async().await;
@@ -310,7 +458,7 @@ async fn min_age_fail_when_published_within_cutoff() {
     let mut opts = default_opts(&registry);
     opts.minimum_release_age = Some(60 * 24); // 1 day
     opts.now = Some(now_at("2025-12-01T00:00:00Z"));
-    let verifier = create_npm_resolution_verifier(opts).expect("verifier");
+    let verifier = create_npm_resolution_verifier(opts);
     let result = verifier
         .verify(&registry_resolution(), ctx(&"acme".parse::<PkgName>().expect("parse"), "1.0.0"))
         .await;
@@ -321,8 +469,6 @@ async fn min_age_fail_when_published_within_cutoff() {
     assert!(reason.contains("within the minimumReleaseAge cutoff"), "got reason: {reason}");
 }
 
-/// Registry strips per-version `time`. With `ignore_missing_time_field`
-/// off (the default), the verifier fails closed.
 #[tokio::test]
 async fn min_age_missing_time_fails_closed_by_default() {
     let mut server = mockito::Server::new_async().await;
@@ -358,7 +504,7 @@ async fn min_age_missing_time_fails_closed_by_default() {
     let mut opts = default_opts(&registry);
     opts.minimum_release_age = Some(60 * 24);
     opts.now = Some(now_at("2025-12-01T00:00:00Z"));
-    let verifier = create_npm_resolution_verifier(opts).expect("verifier");
+    let verifier = create_npm_resolution_verifier(opts);
     let result = verifier
         .verify(&registry_resolution(), ctx(&"acme".parse::<PkgName>().expect("parse"), "1.0.0"))
         .await;
@@ -372,9 +518,6 @@ async fn min_age_missing_time_fails_closed_by_default() {
     );
 }
 
-/// Opting in to `ignore_missing_time_field` flips the missing-time
-/// case from a fail-closed violation to a pass. Mirrors upstream's
-/// `minimumReleaseAgeIgnoreMissingTime` resolver flag.
 #[tokio::test]
 async fn min_age_missing_time_passes_when_ignored() {
     let mut server = mockito::Server::new_async().await;
@@ -411,17 +554,13 @@ async fn min_age_missing_time_passes_when_ignored() {
     opts.minimum_release_age = Some(60 * 24);
     opts.ignore_missing_time_field = true;
     opts.now = Some(now_at("2025-12-01T00:00:00Z"));
-    let verifier = create_npm_resolution_verifier(opts).expect("verifier");
+    let verifier = create_npm_resolution_verifier(opts);
     let result = verifier
         .verify(&registry_resolution(), ctx(&"acme".parse::<PkgName>().expect("parse"), "1.0.0"))
         .await;
     assert_eq!(result, ResolutionVerification::Ok);
 }
 
-/// `trust_policy = NoDowngrade` rejects a version whose evidence is
-/// weaker than an earlier-published version's. Earlier 1.0.0 had
-/// `trustedPublisher`; current 1.1.0 has only `provenance` →
-/// `TRUST_DOWNGRADE`.
 #[tokio::test]
 async fn trust_downgrade_publisher_to_provenance_fails() {
     let mut server = mockito::Server::new_async().await;
@@ -436,7 +575,7 @@ async fn trust_downgrade_publisher_to_provenance_fails() {
     let mut opts = default_opts(&registry);
     opts.trust_policy = Some(TrustPolicy::NoDowngrade);
     opts.now = Some(now_at("2025-12-01T00:00:00Z"));
-    let verifier = create_npm_resolution_verifier(opts).expect("verifier");
+    let verifier = create_npm_resolution_verifier(opts);
     let result = verifier
         .verify(&registry_resolution(), ctx(&"acme".parse::<PkgName>().expect("parse"), "1.1.0"))
         .await;
@@ -447,8 +586,6 @@ async fn trust_downgrade_publisher_to_provenance_fails() {
     assert!(reason.contains("trust downgrade"), "got reason: {reason}");
 }
 
-/// When every prior version's evidence equals or precedes the
-/// current version's, the trust check passes.
 #[tokio::test]
 async fn trust_downgrade_pass_when_no_weaker_evidence() {
     let mut server = mockito::Server::new_async().await;
@@ -463,16 +600,13 @@ async fn trust_downgrade_pass_when_no_weaker_evidence() {
     let mut opts = default_opts(&registry);
     opts.trust_policy = Some(TrustPolicy::NoDowngrade);
     opts.now = Some(now_at("2025-12-01T00:00:00Z"));
-    let verifier = create_npm_resolution_verifier(opts).expect("verifier");
+    let verifier = create_npm_resolution_verifier(opts);
     let result = verifier
         .verify(&registry_resolution(), ctx(&"acme".parse::<PkgName>().expect("parse"), "1.1.0"))
         .await;
     assert_eq!(result, ResolutionVerification::Ok);
 }
 
-/// Tarball resolutions whose URL falls under a named-registry
-/// prefix route to that registry's metadata endpoint. Here `gh:` →
-/// the mocked GitHub Packages base URL.
 #[tokio::test]
 async fn verify_routes_via_named_registry_prefix() {
     let mut server = mockito::Server::new_async().await;
@@ -483,10 +617,29 @@ async fn verify_routes_via_named_registry_prefix() {
         .expect(1)
         .create_async()
         .await;
+    // The packument lists the same tarball URL the lockfile pins, so the
+    // tarball-URL binding passes and the test stays focused on registry
+    // routing.
+    let packument = serde_json::json!({
+        "name": "acme",
+        "dist-tags": { "latest": "1.0.0" },
+        "time": { "1.0.0": "2024-01-01T00:00:00.000Z" },
+        "versions": {
+            "1.0.0": {
+                "name": "acme",
+                "version": "1.0.0",
+                "dist": {
+                    "integrity": FAKE_INTEGRITY,
+                    "shasum": "0000000000000000000000000000000000000000",
+                    "tarball": format!("{server_url}/acme/-/acme-1.0.0.tgz"),
+                }
+            }
+        }
+    });
     let _full_mock = server
         .mock("GET", "/acme")
         .with_status(200)
-        .with_body(min_age_packument_json("acme", "1.0.0", "2024-01-01T00:00:00.000Z").to_string())
+        .with_body(packument.to_string())
         .expect(1)
         .create_async()
         .await;
@@ -500,7 +653,7 @@ async fn verify_routes_via_named_registry_prefix() {
     opts.named_registries = named;
     opts.minimum_release_age = Some(60 * 24);
     opts.now = Some(now_at("2025-12-01T00:00:00Z"));
-    let verifier = create_npm_resolution_verifier(opts).expect("verifier");
+    let verifier = create_npm_resolution_verifier(opts);
     let tarball = LockfileResolution::Tarball(TarballResolution {
         tarball: format!("{server_url}/acme/-/acme-1.0.0.tgz"),
         integrity: Some(fake_integrity()),
@@ -529,10 +682,10 @@ fn policy_snapshot_records_all_fields_sorted_and_deduped() {
     opts.trust_policy_exclude =
         Some(create_package_version_policy(["@scope/foo".to_string()]).expect("policy"));
     opts.trust_policy_ignore_after = Some(60 * 24 * 30);
-    let verifier = create_npm_resolution_verifier(opts).expect("verifier");
+    let verifier = create_npm_resolution_verifier(opts);
 
     let policy = verifier.policy();
-    assert_eq!(policy.get("minimumReleaseAge").and_then(|value| value.as_u64()), Some(60 * 24));
+    assert_eq!(policy.get("minimumReleaseAge").and_then(serde_json::Value::as_u64), Some(60 * 24));
     let min_age_excludes =
         policy.get("minimumReleaseAgeExclude").and_then(|value| value.as_array()).expect("array");
     assert_eq!(
@@ -545,7 +698,7 @@ fn policy_snapshot_records_all_fields_sorted_and_deduped() {
     );
     assert_eq!(policy.get("trustPolicy").and_then(|value| value.as_str()), Some("no-downgrade"));
     assert_eq!(
-        policy.get("trustPolicyIgnoreAfter").and_then(|value| value.as_u64()),
+        policy.get("trustPolicyIgnoreAfter").and_then(serde_json::Value::as_u64),
         Some(60 * 24 * 30),
     );
 }
@@ -557,15 +710,35 @@ fn policy_snapshot_records_all_fields_sorted_and_deduped() {
 fn can_trust_past_check_accepts_looser_min_age() {
     let mut opts = default_opts("https://registry.example/");
     opts.minimum_release_age = Some(60 * 24); // today: 1 day
-    let verifier = create_npm_resolution_verifier(opts).expect("verifier");
+    let verifier = create_npm_resolution_verifier(opts);
 
     let mut cached = serde_json::Map::new();
+    cached.insert("tarballUrlBinding".to_string(), true.into());
     cached.insert("minimumReleaseAge".to_string(), (60 * 24 * 7).into()); // past: 7 days
     cached.insert("minimumReleaseAgeExclude".to_string(), serde_json::Value::Array(vec![]));
     cached.insert("trustPolicy".to_string(), serde_json::Value::Null);
     cached.insert("trustPolicyExclude".to_string(), serde_json::Value::Array(vec![]));
     cached.insert("trustPolicyIgnoreAfter".to_string(), serde_json::Value::Null);
     assert!(verifier.can_trust_past_check(&cached));
+}
+
+/// A cache record that predates the tarball-URL binding rule (no
+/// `tarballUrlBinding` marker) can't be trusted to have enforced it,
+/// so it's rejected and forces a re-verification.
+#[test]
+fn can_trust_past_check_rejects_missing_tarball_url_binding() {
+    let mut opts = default_opts("https://registry.example/");
+    opts.minimum_release_age = Some(60 * 24);
+    let verifier = create_npm_resolution_verifier(opts);
+
+    // Otherwise-compatible cached policy, but without the binding marker.
+    let mut cached = serde_json::Map::new();
+    cached.insert("minimumReleaseAge".to_string(), (60 * 24 * 7).into());
+    cached.insert("minimumReleaseAgeExclude".to_string(), serde_json::Value::Array(vec![]));
+    cached.insert("trustPolicy".to_string(), serde_json::Value::Null);
+    cached.insert("trustPolicyExclude".to_string(), serde_json::Value::Array(vec![]));
+    cached.insert("trustPolicyIgnoreAfter".to_string(), serde_json::Value::Null);
+    assert!(!verifier.can_trust_past_check(&cached));
 }
 
 /// Tightening the cutoff invalidates the cached run — versions
@@ -575,9 +748,10 @@ fn can_trust_past_check_accepts_looser_min_age() {
 fn can_trust_past_check_rejects_tighter_min_age() {
     let mut opts = default_opts("https://registry.example/");
     opts.minimum_release_age = Some(60 * 24 * 7); // today: 7 days
-    let verifier = create_npm_resolution_verifier(opts).expect("verifier");
+    let verifier = create_npm_resolution_verifier(opts);
 
     let mut cached = serde_json::Map::new();
+    cached.insert("tarballUrlBinding".to_string(), true.into());
     cached.insert("minimumReleaseAge".to_string(), (60 * 24).into()); // past: 1 day
     cached.insert("minimumReleaseAgeExclude".to_string(), serde_json::Value::Array(vec![]));
     cached.insert("trustPolicy".to_string(), serde_json::Value::Null);
@@ -596,9 +770,10 @@ fn can_trust_past_check_rejects_changed_exclude_list() {
     opts.minimum_release_age_exclude_patterns = vec!["acme".to_string()];
     opts.minimum_release_age_exclude =
         Some(create_package_version_policy(["acme".to_string()]).expect("policy"));
-    let verifier = create_npm_resolution_verifier(opts).expect("verifier");
+    let verifier = create_npm_resolution_verifier(opts);
 
     let mut cached = serde_json::Map::new();
+    cached.insert("tarballUrlBinding".to_string(), true.into());
     cached.insert("minimumReleaseAge".to_string(), (60 * 24).into());
     cached.insert("minimumReleaseAgeExclude".to_string(), serde_json::Value::Array(vec![]));
     cached.insert("trustPolicy".to_string(), serde_json::Value::Null);
@@ -612,9 +787,10 @@ fn can_trust_past_check_rejects_changed_exclude_list() {
 fn can_trust_past_check_rejects_changed_trust_policy() {
     let mut opts = default_opts("https://registry.example/");
     opts.trust_policy = Some(TrustPolicy::NoDowngrade);
-    let verifier = create_npm_resolution_verifier(opts).expect("verifier");
+    let verifier = create_npm_resolution_verifier(opts);
 
     let mut cached = serde_json::Map::new();
+    cached.insert("tarballUrlBinding".to_string(), true.into());
     cached.insert("minimumReleaseAge".to_string(), 0.into());
     cached.insert("minimumReleaseAgeExclude".to_string(), serde_json::Value::Array(vec![]));
     cached.insert("trustPolicy".to_string(), serde_json::Value::Null);
@@ -630,9 +806,10 @@ fn can_trust_past_check_rejects_changed_ignore_after() {
     let mut opts = default_opts("https://registry.example/");
     opts.trust_policy = Some(TrustPolicy::NoDowngrade);
     opts.trust_policy_ignore_after = Some(60 * 24 * 14);
-    let verifier = create_npm_resolution_verifier(opts).expect("verifier");
+    let verifier = create_npm_resolution_verifier(opts);
 
     let mut cached = serde_json::Map::new();
+    cached.insert("tarballUrlBinding".to_string(), true.into());
     cached.insert("minimumReleaseAge".to_string(), 0.into());
     cached.insert("minimumReleaseAgeExclude".to_string(), serde_json::Value::Array(vec![]));
     cached.insert("trustPolicy".to_string(), serde_json::Value::String("no-downgrade".into()));
@@ -692,7 +869,7 @@ async fn min_age_pass_via_abbreviated_modified_shortcut() {
     let mut opts = default_opts(&registry);
     opts.minimum_release_age = Some(60 * 24); // 1 day
     opts.now = Some(now_at("2025-12-01T00:00:00Z"));
-    let verifier = create_npm_resolution_verifier(opts).expect("verifier");
+    let verifier = create_npm_resolution_verifier(opts);
     let result = verifier
         .verify(&registry_resolution(), ctx(&"acme".parse::<PkgName>().expect("parse"), "1.0.0"))
         .await;
@@ -743,7 +920,7 @@ async fn min_age_shortcut_falls_through_when_modified_within_cutoff() {
     let mut opts = default_opts(&registry);
     opts.minimum_release_age = Some(60 * 24); // 1 day
     opts.now = Some(now_at("2025-12-01T00:00:00Z"));
-    let verifier = create_npm_resolution_verifier(opts).expect("verifier");
+    let verifier = create_npm_resolution_verifier(opts);
     let result = verifier
         .verify(&registry_resolution(), ctx(&"acme".parse::<PkgName>().expect("parse"), "1.0.0"))
         .await;
@@ -798,7 +975,7 @@ async fn min_age_shortcut_falls_through_when_version_not_listed() {
     let mut opts = default_opts(&registry);
     opts.minimum_release_age = Some(60 * 24);
     opts.now = Some(now_at("2025-12-01T00:00:00Z"));
-    let verifier = create_npm_resolution_verifier(opts).expect("verifier");
+    let verifier = create_npm_resolution_verifier(opts);
     let result = verifier
         .verify(&registry_resolution(), ctx(&"acme".parse::<PkgName>().expect("parse"), "2.0.0"))
         .await;
@@ -834,7 +1011,7 @@ async fn concurrent_verifications_share_one_fetch() {
     let mut opts = default_opts(&registry);
     opts.minimum_release_age = Some(60 * 24); // 1 day
     opts.now = Some(now_at("2025-12-01T00:00:00Z"));
-    let verifier = create_npm_resolution_verifier(opts).expect("verifier");
+    let verifier = create_npm_resolution_verifier(opts);
     let name: PkgName = "acme".parse().expect("parse");
     let resolution = registry_resolution();
     let results = futures_util::future::join_all(
@@ -845,4 +1022,171 @@ async fn concurrent_verifications_share_one_fetch() {
         assert_eq!(result, ResolutionVerification::Ok);
     }
     abbreviated_mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn binding_check_records_dist_stats_into_the_sink() {
+    let mut server = mockito::Server::new_async().await;
+    let registry = format!("{}/", server.url());
+    let server_url = server.url();
+    let tarball_url = format!("{server_url}/acme/-/acme-1.0.0.tgz");
+    let packument = serde_json::json!({
+        "name": "acme",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "acme",
+                "version": "1.0.0",
+                "dist": {
+                    "integrity": FAKE_INTEGRITY,
+                    "tarball": tarball_url,
+                    "unpackedSize": 123_456,
+                    "fileCount": 42,
+                }
+            }
+        }
+    });
+    let _meta_mock = server
+        .mock("GET", "/acme")
+        .with_status(200)
+        .with_body(packument.to_string())
+        .create_async()
+        .await;
+
+    let sink = observed_dist_stats_sink();
+    let mut opts = default_opts(&registry);
+    opts.observed_dist_stats = Some(Arc::clone(&sink));
+    let verifier = create_npm_resolution_verifier(opts);
+    let resolution = LockfileResolution::Tarball(TarballResolution {
+        tarball: tarball_url.clone(),
+        integrity: Some(fake_integrity()),
+        git_hosted: None,
+        path: None,
+    });
+    let name: PkgName = "acme".parse().expect("parse");
+    let result = verifier.verify(&resolution, ctx(&name, "1.0.0")).await;
+
+    assert_eq!(result, ResolutionVerification::Ok);
+    let recorded = sink
+        .get(&("acme".to_string(), "1.0.0".to_string()))
+        .map(|entry| *entry.value())
+        .expect("stats recorded");
+    assert_eq!(recorded.unpacked_size, Some(123_456));
+    assert_eq!(recorded.file_count, Some(42));
+}
+
+/// A 403 on the metadata fetch (e.g. a CI token that is authenticated but not
+/// authorized to read a private package) must not be reported as a lockfile
+/// tarball-URL mismatch: the lockfile is correct, the fetch is the problem. The
+/// verifier propagates the registry's own fetch error so the install aborts.
+#[tokio::test]
+async fn propagates_metadata_fetch_failure_instead_of_a_tampering_mismatch() {
+    let mut server = mockito::Server::new_async().await;
+    let registry = format!("{}/", server.url());
+    let server_url = server.url();
+    let _meta_mock = server
+        .mock("GET", "/private-pkg")
+        .with_status(403)
+        .with_body(r#"{"error":"Forbidden"}"#)
+        .create_async()
+        .await;
+
+    let opts = default_opts(&registry);
+    let verifier = create_npm_resolution_verifier(opts);
+    let resolution = LockfileResolution::Tarball(TarballResolution {
+        tarball: format!("{server_url}/private-pkg/-/private-pkg-1.0.0.tgz"),
+        integrity: Some(fake_integrity()),
+        git_hosted: None,
+        path: None,
+    });
+    let name: PkgName = "private-pkg".parse().expect("parse");
+    let result = verifier.verify(&resolution, ctx(&name, "1.0.0")).await;
+
+    // A transport failure aborts via FetchFailed, never a tampering-style
+    // TARBALL_URL_MISMATCH.
+    let ResolutionVerification::FetchFailed { message } = result else {
+        panic!("expected FetchFailed, got {result:?}");
+    };
+    assert!(message.contains("403"), "message: {message}");
+}
+
+/// The metadata fetch succeeds but does not list the pinned version. That is a
+/// genuine verification failure (not a transport error), so it stays
+/// `TARBALL_URL_MISMATCH` rather than aborting via `FetchFailed`.
+#[tokio::test]
+async fn version_absent_from_fetched_metadata_stays_tarball_url_mismatch() {
+    let mut server = mockito::Server::new_async().await;
+    let registry = format!("{}/", server.url());
+    let server_url = server.url();
+    let packument = serde_json::json!({
+        "name": "present-pkg",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "present-pkg",
+                "version": "1.0.0",
+                "dist": {
+                    "integrity": FAKE_INTEGRITY,
+                    "shasum": "0000000000000000000000000000000000000000",
+                    "tarball": format!("{server_url}/present-pkg/-/present-pkg-1.0.0.tgz"),
+                }
+            }
+        }
+    });
+    let _meta_mock = server
+        .mock("GET", "/present-pkg")
+        .with_status(200)
+        .with_body(packument.to_string())
+        .create_async()
+        .await;
+
+    let opts = default_opts(&registry);
+    let verifier = create_npm_resolution_verifier(opts);
+    let resolution = LockfileResolution::Tarball(TarballResolution {
+        tarball: format!("{server_url}/present-pkg/-/present-pkg-2.0.0.tgz"),
+        integrity: Some(fake_integrity()),
+        git_hosted: None,
+        path: None,
+    });
+    let name: PkgName = "present-pkg".parse().expect("parse");
+    let result = verifier.verify(&resolution, ctx(&name, "2.0.0")).await;
+
+    let ResolutionVerification::Err { code, .. } = result else {
+        panic!("expected Err, got {result:?}");
+    };
+    assert_eq!(code, "TARBALL_URL_MISMATCH");
+}
+
+#[test]
+fn redact_url_credentials_strips_embedded_basic_auth() {
+    assert_eq!(
+        redact_url_credentials(
+            "Failed to fetch metadata from https://user:pass@host/pkg: timed out"
+        ),
+        "Failed to fetch metadata from https://host/pkg: timed out",
+    );
+    // user-only userinfo (no password) is stripped too.
+    assert_eq!(
+        redact_url_credentials("got https://token@registry.example/foo"),
+        "got https://registry.example/foo",
+    );
+    // A raw "@" inside the password is stripped up to the last "@" in the
+    // authority, so the password tail can't leak.
+    assert_eq!(
+        redact_url_credentials("Failed to fetch metadata from https://user:p@ss@host/pkg: 403"),
+        "Failed to fetch metadata from https://host/pkg: 403",
+    );
+    // An "@" in the path/query (after the authority) is preserved.
+    assert_eq!(
+        redact_url_credentials("got https://host/path?to=a@b"),
+        "got https://host/path?to=a@b",
+    );
+    // A credential-free URL is left untouched.
+    assert_eq!(
+        redact_url_credentials("Failed to fetch metadata from https://host/pkg: timed out"),
+        "Failed to fetch metadata from https://host/pkg: timed out",
+    );
+    // A bare "://" with no preceding scheme character is not treated as a URL
+    // authority, so an "@" further along is preserved.
+    assert_eq!(redact_url_credentials("a :// b@c"), "a :// b@c");
 }

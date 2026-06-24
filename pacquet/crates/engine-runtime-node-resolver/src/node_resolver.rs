@@ -6,11 +6,18 @@
 //! default-resolver dispatcher can route `node@runtime:<spec>`
 //! dependencies through it.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use derive_more::{Display, Error};
 use miette::Diagnostic;
-use pacquet_crypto_shasums_file::{FetchShasumsFileError, fetch_shasums_file};
+use node_semver::Version;
+use pacquet_crypto_shasums_file::{
+    FetchShasumsFileError, FetchVerifiedNodeShasumsError, fetch_shasums_file,
+    fetch_verified_node_shasums_file,
+};
 use pacquet_lockfile::{
     BinaryArchive, BinaryResolution, BinarySpec, LockfileResolution, PlatformAssetResolution,
     PlatformAssetTarget, VariationsResolution,
@@ -62,6 +69,9 @@ pub enum NodeResolverError {
     #[diagnostic(transparent)]
     FetchShasumsFile(#[error(source)] FetchShasumsFileError),
 
+    #[diagnostic(transparent)]
+    FetchVerifiedNodeShasums(#[error(source)] FetchVerifiedNodeShasumsError),
+
     #[display("Failed to parse integrity {integrity} for {file_name}")]
     #[diagnostic(code(NODE_INTEGRITY_PARSE_FAILED))]
     ParseIntegrity {
@@ -87,6 +97,7 @@ pub struct NodeResolver {
 }
 
 impl NodeResolver {
+    #[must_use]
     pub fn new(http_client: Arc<ThrottledClient>) -> Self {
         Self { http_client, node_download_mirrors: HashMap::new(), offline: false }
     }
@@ -142,8 +153,12 @@ impl NodeResolver {
                     Box::new(NodeResolverError::VersionNotFound { spec: version_spec.to_string() })
                         as ResolveError
                 })?;
-        let variants = self.read_node_assets(&mirror, &version).await?;
-        let range = if version == version_spec { version.clone() } else { format!("^{version}") };
+        let variants = self.read_node_assets(&mirror, &version, &parsed.release_channel).await?;
+        let range = normalize_node_runtime_version_specifier(
+            version_spec,
+            &version,
+            wanted_dependency.prev_specifier.as_deref(),
+        );
         let resolution = LockfileResolution::Variations(VariationsResolution { variants });
         let manifest = serde_json::json!({
             "name": "node",
@@ -214,12 +229,14 @@ impl NodeResolver {
         &self,
         mirror: &str,
         version: &str,
+        release_channel: &str,
     ) -> Result<Vec<PlatformAssetResolution>, ResolveError> {
         let mut assets = read_node_assets_from_mirror(
             &self.http_client,
             mirror,
             version,
             /* musl_only */ false,
+            /* verify_signature */ release_channel == "release",
         )
         .await?;
         if mirror == DEFAULT_NODE_MIRROR_BASE_URL
@@ -228,6 +245,7 @@ impl NodeResolver {
                 UNOFFICIAL_NODE_MIRROR_BASE_URL,
                 version,
                 /* musl_only */ true,
+                /* verify_signature */ false,
             )
             .await
         {
@@ -247,6 +265,30 @@ fn bare_runtime_spec<'a>(wanted: &'a WantedDependency, expected_alias: &str) -> 
     wanted.bare_specifier.as_deref().and_then(|spec| spec.strip_prefix(BARE_SPEC_PREFIX))
 }
 
+fn normalize_node_runtime_version_specifier(
+    version_spec: &str,
+    resolved_version: &str,
+    prev_specifier: Option<&str>,
+) -> String {
+    if resolved_version == version_spec
+        || matches!(Version::parse(resolved_version), Ok(version) if !version.pre_release.is_empty())
+    {
+        return resolved_version.to_string();
+    }
+    let source = prev_specifier
+        .and_then(|specifier| specifier.strip_prefix(BARE_SPEC_PREFIX))
+        .unwrap_or(version_spec);
+    let spec = source.split_once('/').map_or(source, |(_, spec)| spec);
+    let prefix = if spec.starts_with('^') {
+        "^"
+    } else if spec.starts_with('~') {
+        "~"
+    } else {
+        ""
+    };
+    format!("{prefix}{resolved_version}")
+}
+
 /// Read the asset list for one mirror version and decode each row
 /// into a [`PlatformAssetResolution`].
 ///
@@ -260,11 +302,18 @@ async fn read_node_assets_from_mirror(
     node_mirror_base_url: &str,
     version: &str,
     musl_only: bool,
+    verify_signature: bool,
 ) -> Result<Vec<PlatformAssetResolution>, ResolveError> {
     let integrities_url = format!("{node_mirror_base_url}v{version}/SHASUMS256.txt");
-    let items = fetch_shasums_file(http_client, &integrities_url)
-        .await
-        .map_err(|err| Box::new(NodeResolverError::FetchShasumsFile(err)) as ResolveError)?;
+    let items = if verify_signature {
+        fetch_verified_node_shasums_file(http_client, &integrities_url).await.map_err(|err| {
+            Box::new(NodeResolverError::FetchVerifiedNodeShasums(err)) as ResolveError
+        })?
+    } else {
+        fetch_shasums_file(http_client, &integrities_url)
+            .await
+            .map_err(|err| Box::new(NodeResolverError::FetchShasumsFile(err)) as ResolveError)?
+    };
     let mut assets = Vec::new();
     for item in items {
         let Some(parsed) = parse_node_file_name(&item.file_name, version) else { continue };
@@ -320,20 +369,15 @@ struct NodeFileName {
 /// Match upstream's
 /// `^node-v<version>-([^-.]+)-([^.-]+)(-musl)?\.(tar\.gz|zip)$` —
 /// implemented by hand so the resolver doesn't pay the regex crate
-/// dependency for a single pattern. The version segment is matched
-/// literally; the platform and arch each disallow `.` and `-`, and
-/// `-musl` is the only legal third segment.
+/// dependency for a single pattern.
 fn parse_node_file_name(file_name: &str, version: &str) -> Option<NodeFileName> {
     let prefix = format!("node-v{version}-");
     let rest = file_name.strip_prefix(&prefix)?;
-    let (head, suffix) = if let Some(head) = rest.strip_suffix(".tar.gz") {
-        (head, ".tar.gz")
-    } else if let Some(head) = rest.strip_suffix(".zip") {
-        (head, ".zip")
+    let head = if let Some(head) = rest.strip_suffix(".tar.gz") {
+        head
     } else {
-        return None;
+        rest.strip_suffix(".zip")?
     };
-    let _ = suffix;
     let (platform, after_platform) = head.split_once('-')?;
     if platform.is_empty() || platform.contains('.') {
         return None;
@@ -349,7 +393,8 @@ fn parse_node_file_name(file_name: &str, version: &str) -> Option<NodeFileName> 
 }
 
 fn bin_spec_for_platform(platform: &str) -> BinarySpec {
-    BinarySpec::Single(if platform == "win32" { "node.exe" } else { "bin/node" }.to_string())
+    let path = if platform == "win32" { "node.exe" } else { "bin/node" };
+    BinarySpec::Map(BTreeMap::from([("node".to_string(), path.to_string())]))
 }
 
 fn node_bins_for_current_os(platform: &str) -> serde_json::Value {
@@ -357,7 +402,7 @@ fn node_bins_for_current_os(platform: &str) -> serde_json::Value {
 }
 
 /// Host platform string in pnpm's normalised form (`win32`, `darwin`,
-/// `linux`, …). Reads `std::env::consts::OS` rather than spawning a
+/// `linux`, ...). Reads `std::env::consts::OS` rather than spawning a
 /// helper so the lookup is allocation-free.
 fn current_platform() -> &'static str {
     match std::env::consts::OS {

@@ -12,11 +12,12 @@
 //! channels are added incrementally as the surrounding code starts using
 //! them.
 
-use std::io::Write;
-use std::sync::LazyLock;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use serde::Serialize;
+use std::{
+    io::Write,
+    sync::LazyLock,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 /// One log channel from `@pnpm/core-loggers`.
 ///
@@ -64,23 +65,17 @@ pub enum LogEvent {
     #[serde(rename = "pnpm:package-import-method")]
     PackageImportMethod(PackageImportMethodLog),
 
-    /// Per-package status transitions (`pnpm:progress`). One of four
-    /// `status` values per record: `resolved`, `fetched`,
-    /// `found_in_store`, or `imported`. The first three carry
-    /// `{ packageId, requester }`; `imported` carries
-    /// `{ method, requester, to }`. Together they drive the
-    /// "X/Y resolved, X/Y fetched, X/Y imported" counters in the
-    /// default reporter.
+    /// Per-package status transitions (`pnpm:progress`). Together they
+    /// drive the "X/Y resolved, X/Y fetched, X/Y imported" counters in
+    /// the default reporter.
     ///
     /// Upstream: <https://github.com/pnpm/pnpm/blob/086c5e91e8/core/core-loggers/src/progressLogger.ts>.
     #[serde(rename = "pnpm:progress")]
     Progress(ProgressLog),
 
-    /// Per-tarball download progress (`pnpm:fetching-progress`). Two
-    /// `status` values: `started` (one-shot per fetch attempt with
-    /// `attempt`, `packageId`, and `size` from the response's
-    /// `Content-Length`) and `in_progress` (throttled to ~200ms while
-    /// the body streams, with `downloaded` and `packageId`).
+    /// Per-tarball download progress (`pnpm:fetching-progress`). The
+    /// `in_progress` events are throttled to ~200ms while the body
+    /// streams.
     ///
     /// Upstream: <https://github.com/pnpm/pnpm/blob/086c5e91e8/core/core-loggers/src/fetchingProgressLogger.ts>.
     /// Emit site: <https://github.com/pnpm/pnpm/blob/086c5e91e8/installing/package-requester/src/packageRequester.ts#L560>.
@@ -129,11 +124,9 @@ pub enum LogEvent {
     #[serde(rename = "pnpm:request-retry")]
     RequestRetry(RequestRetryLog),
 
-    /// Per-script lifecycle output (`pnpm:lifecycle`). Three flavors,
-    /// distinguished by which optional fields the record carries:
-    /// `Script` fires once before the script spawns, `Stdio` fires per
-    /// stdout/stderr line, and `Exit` fires once after the script
-    /// returns. All three carry `depPath`, `stage`, and `wd`.
+    /// Per-script lifecycle output (`pnpm:lifecycle`). `Script` fires
+    /// once before the script spawns, `Stdio` fires per stdout/stderr
+    /// line, and `Exit` fires once after the script returns.
     ///
     /// Upstream: <https://github.com/pnpm/pnpm/blob/80037699fb/core/core-loggers/src/lifecycleLogger.ts>.
     /// Emit site: <https://github.com/pnpm/pnpm/blob/80037699fb/exec/lifecycle/src/runLifecycleHook.ts>.
@@ -159,9 +152,21 @@ pub enum LogEvent {
     /// phases that haven't landed in pacquet yet.
     ///
     /// Upstream: <https://github.com/pnpm/pnpm/blob/b4f8f47ac2/core/core-loggers/src/skippedOptionalDependencyLogger.ts>.
-    /// Emit site (build_failure): <https://github.com/pnpm/pnpm/blob/b4f8f47ac2/building/during-install/src/index.ts#L218-L240>.
+    /// Emit site (`build_failure)`: <https://github.com/pnpm/pnpm/blob/b4f8f47ac2/building/during-install/src/index.ts#L218-L240>.
     #[serde(rename = "pnpm:skipped-optional-dependency")]
     SkippedOptionalDependency(SkippedOptionalDependencyLog),
+
+    /// Bracketing events for the configurational-dependency install
+    /// (`pnpm:installing-config-deps`): a `started` before any
+    /// fetch/link work, then a single `done` carrying the installed
+    /// `{ name, version }` list. Both are suppressed entirely when an
+    /// install finds every config dependency already materialized, so a
+    /// no-op install emits nothing on this channel.
+    ///
+    /// Upstream: <https://github.com/pnpm/pnpm/blob/31858c544b/core/core-loggers/src/installingConfigDeps.ts>.
+    /// Emit site: <https://github.com/pnpm/pnpm/blob/31858c544b/installing/env-installer/src/installConfigDeps.ts#L43-L127>.
+    #[serde(rename = "pnpm:installing-config-deps")]
+    InstallingConfigDeps(InstallingConfigDepsLog),
 
     /// One per snapshot whose `<virtual_store_dir>/...` directory
     /// has gone missing on disk even though the current lockfile
@@ -199,6 +204,26 @@ pub enum LogEvent {
     /// [`cli/default-reporter/src/index.ts:222`](https://github.com/pnpm/pnpm/blob/a456dc78fb/cli/default-reporter/src/index.ts#L222).
     #[serde(rename = "pnpm")]
     Pnpm(PnpmLog),
+
+    /// One per `context.log(...)` call a pnpmfile hook makes while it
+    /// runs (`pnpm:hook`). `readPackage` and `afterAllResolved` hooks
+    /// receive a `context` whose `log` forwards here, so a pnpmfile can
+    /// surface why it rewrote a manifest or lockfile. `@pnpm/cli.default-reporter`
+    /// routes these into the "other" log stream.
+    ///
+    /// Upstream: <https://github.com/pnpm/pnpm/blob/3b12eb27de/core/core-loggers/src/hookLogger.ts>.
+    /// Emit site: <https://github.com/pnpm/pnpm/blob/3b12eb27de/hooks/pnpmfile/src/requireHooks.ts#L244-L249>.
+    #[serde(rename = "pnpm:hook")]
+    Hook(HookLog),
+
+    /// Total command wall-clock time (`pnpm:execution-time`). Emitted once
+    /// per CLI run after the command finishes; the default reporter renders
+    /// it as the `Done in <time> using <pkg> v<version>` footer.
+    ///
+    /// Upstream: <https://github.com/pnpm/pnpm/blob/086c5e91e8/core/core-loggers/src/executionTimeLogger.ts>.
+    /// Emit site: <https://github.com/pnpm/pnpm/blob/086c5e91e8/pnpm/src/main.ts>.
+    #[serde(rename = "pnpm:execution-time")]
+    ExecutionTime(ExecutionTimeLog),
 }
 
 /// `pnpm:context` payload.
@@ -283,9 +308,7 @@ pub struct ProgressLog {
     pub message: ProgressMessage,
 }
 
-/// `pnpm:progress` discriminated payload. `Resolved` / `Fetched` /
-/// `FoundInStore` share `{ packageId, requester }`; `Imported` differs
-/// (`{ method, requester, to }` — no `packageId`).
+/// `pnpm:progress` discriminated payload.
 ///
 /// `requester` is the install root — same value as the
 /// [`StageLog::prefix`] threaded through `Install::run`.
@@ -323,12 +346,10 @@ pub struct FetchingProgressLog {
     pub message: FetchingProgressMessage,
 }
 
-/// `pnpm:fetching-progress` discriminated payload. `Started` carries
-/// the retry-attempt index and the `Content-Length`-derived size
-/// (`null` when chunked / unknown — preserved as JSON `null`).
-/// `InProgress` carries the running byte count; pacquet throttles
-/// these to ~200ms per package, mirroring pnpm's reporter coalescing
-/// window.
+/// `pnpm:fetching-progress` discriminated payload. `size` is derived
+/// from the response's `Content-Length`, and is unknown when the
+/// response is chunked. pacquet throttles `InProgress` events to ~200ms
+/// per package, mirroring pnpm's reporter coalescing window.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum FetchingProgressMessage {
@@ -565,6 +586,15 @@ pub enum LifecycleStdio {
 pub struct IgnoredScriptsLog {
     pub level: LogLevel,
     pub package_names: Vec<String>,
+    /// `strictDepBuilds` at emit time. Carried in-memory only —
+    /// `#[serde(skip)]` keeps it out of the `pnpm:ignored-scripts` NDJSON
+    /// wire shape — so the default reporter can suppress the warning box
+    /// under strict mode (where the install fails with
+    /// `ERR_PNPM_IGNORED_BUILDS` instead) without relying on a stale
+    /// global flag. The structured event itself is always emitted with
+    /// the package names, matching pnpm's `ignoredScriptsLogger.debug`.
+    #[serde(skip)]
+    pub strict_dep_builds: bool,
 }
 
 /// `pnpm:skipped-optional-dependency` payload.
@@ -659,6 +689,36 @@ pub enum SkippedOptionalReason {
     ResolutionFailure,
 }
 
+/// `pnpm:installing-config-deps` payload. `status` is `started` (no
+/// `deps`) or `done` (with the installed list). Mirrors upstream's
+/// `InstallingConfigDepsMessage` union at
+/// <https://github.com/pnpm/pnpm/blob/31858c544b/core/core-loggers/src/installingConfigDeps.ts#L8-L21>.
+#[derive(Debug, Clone, Serialize)]
+pub struct InstallingConfigDepsLog {
+    pub level: LogLevel,
+    pub status: InstallingConfigDepsStatus,
+    /// Empty (and omitted from the wire shape) on `started`; the
+    /// installed packages on `done`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub deps: Vec<InstalledConfigDep>,
+}
+
+/// `status` discriminator on a [`InstallingConfigDepsLog`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallingConfigDepsStatus {
+    Started,
+    Done,
+}
+
+/// One installed config dependency in a `done`
+/// [`InstallingConfigDepsLog`].
+#[derive(Debug, Clone, Serialize)]
+pub struct InstalledConfigDep {
+    pub name: String,
+    pub version: String,
+}
+
 /// `pnpm:_broken_node_modules` payload. `missing` is the absolute
 /// path to the snapshot's `node_modules/<pkg>` slot that the current-
 /// lockfile lookup expected on disk but didn't find. Mirrors the
@@ -686,7 +746,10 @@ pub struct LockfileVerificationLog {
 /// `pnpm:lockfile-verification` discriminated payload. `Started`
 /// fires once before the per-candidate fan-out begins; exactly one
 /// terminal `Done` or `Failed` fires after, with `elapsed_ms`
-/// measured against the matching `Started`.
+/// measured against the matching `Started`. `Cached` fires instead
+/// of the pair when the verification cache short-circuits the gate;
+/// it carries no `entries` count because the short-circuit happens
+/// before candidates are collected.
 ///
 /// `lockfile_path` is the absolute path of the lockfile being
 /// verified. It's `Option` because the runner is invoked without a
@@ -715,6 +778,15 @@ pub enum LockfileVerificationMessage {
         #[serde(rename = "lockfilePath", skip_serializing_if = "Option::is_none")]
         lockfile_path: Option<String>,
     },
+    Cached {
+        /// ISO-8601 timestamp of the verification run the cached
+        /// verdict was recorded by. Omitted when the cache record
+        /// predates the field.
+        #[serde(rename = "verifiedAt", skip_serializing_if = "Option::is_none")]
+        verified_at: Option<String>,
+        #[serde(rename = "lockfilePath", skip_serializing_if = "Option::is_none")]
+        lockfile_path: Option<String>,
+    },
 }
 
 /// Generic-channel (`name: "pnpm"`) payload, used for `logger.info`-style
@@ -725,6 +797,32 @@ pub struct PnpmLog {
     pub level: LogLevel,
     pub message: String,
     pub prefix: String,
+}
+
+/// `pnpm:hook` payload. Field names match pnpm's `HookMessage` so
+/// `@pnpm/cli.default-reporter` accepts the record unchanged. `from`
+/// is the pnpmfile that defined the hook, `hook` is the hook name
+/// (`readPackage` / `afterAllResolved`), `prefix` is the project the
+/// hook ran for, and `message` is the string passed to `context.log`.
+/// The hook context logger emits at `debug`.
+#[derive(Debug, Clone, Serialize)]
+pub struct HookLog {
+    pub level: LogLevel,
+    pub from: String,
+    pub hook: String,
+    pub message: String,
+    pub prefix: String,
+}
+
+/// `pnpm:execution-time` payload. `started_at` / `ended_at` are
+/// Unix-epoch milliseconds; the reporter renders their difference. Field
+/// names match pnpm's wire shape (`startedAt` / `endedAt`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionTimeLog {
+    pub level: LogLevel,
+    pub started_at: u128,
+    pub ended_at: u128,
 }
 
 /// Severity level on the [bunyan]-shaped envelope.
@@ -817,7 +915,7 @@ struct Envelope<'a> {
 }
 
 fn now_millis() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis())
 }
 
 /// Capability for obtaining the host name written into the [bunyan]-shaped

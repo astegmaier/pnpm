@@ -63,9 +63,7 @@ pub enum PacklistError {
     },
 }
 
-/// Error type of the git fetcher itself. Reserved for the next patch in
-/// this PR — defined now so `lib.rs` can re-export the full error surface
-/// without churn when the fetcher module lands.
+/// Error type of the git fetcher itself.
 #[derive(Debug, Display, Error, Diagnostic)]
 #[non_exhaustive]
 pub enum GitFetcherError {
@@ -88,6 +86,17 @@ pub enum GitFetcherError {
     #[display("received commit {received} does not match expected value {expected}")]
     #[diagnostic(code(GIT_CHECKOUT_FAILED))]
     CheckoutMismatch { expected: String, received: String },
+
+    /// `resolution.commit` is not a 40-character hexadecimal SHA. A
+    /// commit value beginning with `-` would otherwise be parsed by
+    /// `git fetch` / `git checkout` as an option (e.g. `--upload-pack`),
+    /// allowing a malicious lockfile to execute arbitrary commands on
+    /// SSH or local-file transports.
+    #[display(
+        "Invalid git commit hash {commit:?} for repository {repo:?}. Expected a 40-character hexadecimal SHA."
+    )]
+    #[diagnostic(code(INVALID_GIT_COMMIT))]
+    InvalidCommit { commit: String, repo: String },
 
     #[display("I/O error during git fetch: {_0}")]
     #[diagnostic(code(pacquet_git_fetcher::io))]

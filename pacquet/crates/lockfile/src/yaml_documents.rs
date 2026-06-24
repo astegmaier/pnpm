@@ -13,22 +13,17 @@
 /// Document-stream marker that ends one YAML document and starts the
 /// next. Matches upstream's
 /// [`YAML_DOCUMENT_SEPARATOR`](https://github.com/pnpm/pnpm/blob/31858c544b/lockfile/fs/src/yamlDocuments.ts#L6).
-const YAML_DOCUMENT_SEPARATOR: &str = "\n---\n";
+pub(crate) const YAML_DOCUMENT_SEPARATOR: &str = "\n---\n";
 
 /// Document-stream marker at the very start of a file. Matches
 /// upstream's
 /// [`YAML_DOCUMENT_START`](https://github.com/pnpm/pnpm/blob/31858c544b/lockfile/fs/src/yamlDocuments.ts#L7).
-const YAML_DOCUMENT_START: &str = "---\n";
+pub(crate) const YAML_DOCUMENT_START: &str = "---\n";
 
 /// Extract the main lockfile document (second YAML document) from a
 /// combined file. Mirrors upstream's
-/// [`extractMainDocument`](https://github.com/pnpm/pnpm/blob/31858c544b/lockfile/fs/src/yamlDocuments.ts#L63-L68):
-///
-/// - If the content starts with `---\n`, returns the slice after the
-///   next `\n---\n` separator. An empty slice (no second document
-///   present) means the file is env-only.
-/// - Otherwise the file is single-document and the input is returned
-///   verbatim.
+/// [`extractMainDocument`](https://github.com/pnpm/pnpm/blob/31858c544b/lockfile/fs/src/yamlDocuments.ts#L63-L68).
+#[must_use]
 pub fn extract_main_document(content: &str) -> &str {
     let Some(rest) = content.strip_prefix(YAML_DOCUMENT_START) else {
         return content;
@@ -39,26 +34,25 @@ pub fn extract_main_document(content: &str) -> &str {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::extract_main_document;
-
-    #[test]
-    fn returns_entire_content_when_it_does_not_start_with_separator() {
-        let content = "lockfileVersion: 9.0\npackages: {}\n";
-        assert_eq!(extract_main_document(content), content);
-    }
-
-    #[test]
-    fn returns_empty_string_when_content_starts_with_separator_but_has_no_second_separator() {
-        let content = "---\nfoo: bar\n";
-        assert_eq!(extract_main_document(content), "");
-    }
-
-    #[test]
-    fn returns_the_second_document_from_a_combined_file() {
-        let main = "lockfileVersion: 9.0\npackages: {}\n";
-        let combined = format!("---\nfoo: bar\n---\n{main}");
-        assert_eq!(extract_main_document(&combined), main);
-    }
+/// Extract the env lockfile document (first YAML document) from a
+/// combined file. The synchronous counterpart to upstream's streaming
+/// [`streamReadFirstYamlDocument`](https://github.com/pnpm/pnpm/blob/31858c544b/lockfile/fs/src/yamlDocuments.ts#L15-L60):
+///
+/// - The file must begin with `---\n`; otherwise it carries no env
+///   document and this returns `None`.
+/// - Returns the slice between the leading `---\n` and the next
+///   `\n---\n` separator. A leading `---\n` with no following separator
+///   (an env-only file with no main document) also yields `None`,
+///   matching upstream's fall-through to `return null`.
+///
+/// pacquet reads the whole lockfile into memory rather than streaming,
+/// so this skips upstream's chunked BOM/CRLF handling — the only
+/// callers pass content pacquet itself wrote with LF line endings.
+#[must_use]
+pub fn extract_env_document(content: &str) -> Option<&str> {
+    let rest = content.strip_prefix(YAML_DOCUMENT_START)?;
+    rest.find(YAML_DOCUMENT_SEPARATOR).map(|idx| &rest[..idx])
 }
+
+#[cfg(test)]
+mod tests;

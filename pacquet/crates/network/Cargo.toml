@@ -15,12 +15,14 @@ derive_more = { workspace = true }
 miette      = { workspace = true }
 pipe-trait  = { workspace = true }
 reqwest     = { workspace = true }
-tokio       = { workspace = true }
+tokio       = { workspace = true, features = ["time"] }
+tracing     = { workspace = true }
 
 [dev-dependencies]
-mockito           = { workspace = true }
-pretty_assertions = { workspace = true }
-tokio             = { workspace = true, features = ["macros", "rt-multi-thread"] }
+mockito               = { workspace = true }
+pacquet-testing-utils = { workspace = true }
+pretty_assertions     = { workspace = true }
+tokio                 = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

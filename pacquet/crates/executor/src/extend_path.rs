@@ -39,6 +39,7 @@ pub enum ScriptsPrependNodePath {
 /// 5. `dirname(node_execpath)` when `scripts_prepend_node_path` is
 ///    [`Always`](ScriptsPrependNodePath::Always),
 /// 6. `original_path` (typically the inherited system PATH).
+#[must_use]
 pub fn extend_path(
     wd: &Path,
     original_path: Option<&OsString>,
@@ -112,9 +113,7 @@ fn join_paths_lossy(paths: &[PathBuf]) -> OsString {
 ///
 /// The walk mirrors upstream's `wd.split(/[\\/]node_modules[\\/]/)`
 /// scheme: it does *not* walk parent directories beyond the first
-/// `node_modules/` ancestor of `wd`. If `wd` contains no
-/// `node_modules/` segment, only `<wd>/node_modules/.bin` is
-/// produced.
+/// `node_modules/` ancestor of `wd`.
 fn ancestor_node_modules_bins(wd: &Path) -> Vec<PathBuf> {
     let normalized = normalize_for_split(wd);
     let parts: Vec<&str> = normalized.split("/node_modules/").collect();

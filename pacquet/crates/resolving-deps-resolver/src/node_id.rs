@@ -1,5 +1,7 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 /// Per-occurrence identifier for a node in the [`DependenciesTree`].
 /// Mirrors pnpm's [`NodeId`](https://github.com/pnpm/pnpm/blob/097983fbca/installing/deps-resolver/src/nextNodeId.ts).
@@ -35,6 +37,7 @@ impl NodeId {
     /// Build a leaf `NodeId` from a package id. Every occurrence of a
     /// leaf shares the same `NodeId`, so the tree carries one node
     /// instead of one per parent edge.
+    #[must_use]
     pub fn leaf(id: &str) -> NodeId {
         NodeId::Leaf(Arc::from(id))
     }
