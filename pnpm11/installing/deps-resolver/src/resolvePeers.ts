@@ -232,28 +232,112 @@ function nodeDepsCount (node: GenericDependenciesGraphNodeWithResolvedChildren):
   return Object.keys(node.children!).length + node.resolvedPeerNames.size
 }
 
-function deduplicateAll<T extends PartialResolvedPackage> (
+export function deduplicateAll<T extends PartialResolvedPackage> (
   depGraph: GenericDependenciesGraphWithResolvedChildren<T>,
   duplicates: Array<Set<DepPath>>
 ): Record<DepPath, DepPath> {
   const { depPathsMap, remainingDuplicates } = deduplicateDepPaths(duplicates, depGraph)
-  if (remainingDuplicates.length === duplicates.length) {
-    return depPathsMap
+  let effectiveMap = depPathsMap
+  let effectiveRemaining = remainingDuplicates
+
+  // When the pairwise strict-superset pass made zero progress, the remaining
+  // groups may form a peer cycle: two same-package snapshots whose only
+  // children difference is the matching pair of snapshots in another group
+  // that is itself blocked on this one. Neither pair satisfies the strict
+  // check before children are rewritten. Break the cycle by tentatively
+  // mapping all members of each group to their richest member, then
+  // dropping any mapping that doesn't hold once the other tentative
+  // mappings are applied.
+  if (Object.keys(effectiveMap).length === 0 && remainingDuplicates.length > 0) {
+    const cycleMap = deduplicatePeerCycles(depGraph, remainingDuplicates)
+    if (Object.keys(cycleMap).length > 0) {
+      effectiveMap = cycleMap
+      effectiveRemaining = remainingDuplicates
+        .map((group) => new Set([...group].filter((dp) => !cycleMap[dp])))
+        .filter((group) => group.size > 1)
+    }
   }
+
+  if (Object.keys(effectiveMap).length === 0) {
+    return effectiveMap
+  }
+
   for (const node of Object.values(depGraph)) {
     for (const [alias, childDepPath] of Object.entries<DepPath>(node.children)) {
-      if (depPathsMap[childDepPath]) {
-        node.children[alias] = depPathsMap[childDepPath]
+      if (effectiveMap[childDepPath]) {
+        node.children[alias] = effectiveMap[childDepPath]
       }
     }
   }
-  if (Object.keys(depPathsMap).length > 0) {
-    return {
-      ...depPathsMap,
-      ...deduplicateAll(depGraph, remainingDuplicates),
+  const innerMap = deduplicateAll(depGraph, effectiveRemaining)
+  // Compose with results from deeper recursion levels so that any depPath that
+  // maps via effectiveMap to a node that was itself merged away in a later
+  // iteration ends up pointing directly at the terminal winner. Required for
+  // callers that apply allDepPathsMap with a single lookup (e.g., the importer
+  // direct-deps rewrite).
+  for (const k of Object.keys(effectiveMap) as DepPath[]) {
+    const v = effectiveMap[k]
+    if (innerMap[v] != null) {
+      effectiveMap[k] = innerMap[v]
     }
   }
-  return depPathsMap
+  return {
+    ...innerMap,
+    ...effectiveMap,
+  }
+}
+
+function deduplicatePeerCycles<T extends PartialResolvedPackage> (
+  depGraph: GenericDependenciesGraphWithResolvedChildren<T>,
+  duplicates: Array<Set<DepPath>>
+): Record<DepPath, DepPath> {
+  const candidates: Record<DepPath, DepPath> = {}
+  for (const group of duplicates) {
+    const sorted = [...group].sort((a, b) => {
+      const diff = nodeDepsCount(depGraph[b]) - nodeDepsCount(depGraph[a])
+      return diff !== 0 ? diff : a.localeCompare(b)
+    })
+    const winner = sorted[0]
+    for (let i = 1; i < sorted.length; i++) {
+      candidates[sorted[i]] = winner
+    }
+  }
+
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const loser of Object.keys(candidates) as DepPath[]) {
+      if (!isCompatibleUnderMap(depGraph, candidates[loser], loser, candidates)) {
+        delete candidates[loser]
+        changed = true
+      }
+    }
+  }
+  return candidates
+}
+
+function isCompatibleUnderMap<T extends PartialResolvedPackage> (
+  depGraph: GenericDependenciesGraphWithResolvedChildren<T>,
+  winnerDepPath: DepPath,
+  loserDepPath: DepPath,
+  map: Record<DepPath, DepPath>
+): boolean {
+  const winner = depGraph[winnerDepPath]
+  const loser = depGraph[loserDepPath]
+  if (nodeDepsCount(winner) < nodeDepsCount(loser)) return false
+
+  const winnerChildren = new Set<DepPath>()
+  for (const childDepPath of Object.values<DepPath>(winner.children)) {
+    winnerChildren.add(map[childDepPath] ?? childDepPath)
+  }
+  for (const childDepPath of Object.values<DepPath>(loser.children)) {
+    const mapped = map[childDepPath] ?? childDepPath
+    if (!winnerChildren.has(mapped)) return false
+  }
+  for (const peerName of loser.resolvedPeerNames) {
+    if (!winner.resolvedPeerNames.has(peerName)) return false
+  }
+  return true
 }
 
 interface DeduplicateDepPathsResult {
@@ -289,7 +373,12 @@ function deduplicateDepPaths<T extends PartialResolvedPackage> (
         const depPath2 = currentDepPaths.pop()!
         if (isCompatibleAndHasMoreDeps(depGraph, depPath1, depPath2)) {
           depPathsMap[depPath2] = depPath1
-          unresolvedDepPaths.delete(depPath1)
+          // Keep depPath1 (the winner) in unresolvedDepPaths so that, on a
+          // subsequent recursion of deduplicateAll, it can still be compared
+          // against other surviving members of the same dedup group. Without
+          // this, peer cycles like webpack ↔ terser-webpack-plugin leave two
+          // winners (W3 and W4) that never get re-considered together, and
+          // the dedup pass terminates prematurely. See #11834.
           unresolvedDepPaths.delete(depPath2)
         } else {
           nextDepPaths.push(depPath2)
@@ -299,7 +388,7 @@ function deduplicateDepPaths<T extends PartialResolvedPackage> (
       currentDepPaths = nextDepPaths.sort(depCountSorter)
     }
 
-    if (unresolvedDepPaths.size) {
+    if (unresolvedDepPaths.size > 1) {
       remainingDuplicates.push(unresolvedDepPaths)
     }
   }
