@@ -551,7 +551,7 @@ test('do not append a deeper required peer when autoInstallPeers is disabled', a
   assertProject(path.resolve('project2')).hasNot('@pnpm.e2e/peer-c')
 })
 
-test('resolve newly discovered required peers to a fixpoint', async () => {
+test('resolve newly discovered required peers to a fixed point', async () => {
   const project = prepareEmpty()
   const { allProjects, mutations } = createSharedDepthWorkspace(undefined, {
     'is-positive': '1.0.0',
