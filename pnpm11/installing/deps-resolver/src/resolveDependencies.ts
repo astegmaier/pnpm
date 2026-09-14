@@ -376,7 +376,9 @@ type PostponedPeersResolutionFunction = (parentPkgAliases: ParentPkgAliases) => 
 
 interface ResolvedRootDependenciesResult {
   pkgAddressesByImporters: PkgAddressOrLink[][]
+  publishedBy?: Date
   time?: Record<string, string>
+  workspaceRootDeps: HoistableRootDep[]
 }
 
 export async function resolveRootDependencies (
@@ -393,7 +395,9 @@ export async function resolveRootDependencies (
   if (!ctx.hoistPeers) {
     return {
       pkgAddressesByImporters: pkgAddressesByImportersWithoutPeers.map(({ pkgAddresses }) => pkgAddresses),
+      publishedBy,
       time,
+      workspaceRootDeps: [],
     }
   }
   let workspaceRootDeps: HoistableRootDep[]
@@ -500,7 +504,9 @@ export async function resolveRootDependencies (
   /* eslint-enable no-await-in-loop */
   return {
     pkgAddressesByImporters: pkgAddressesByImportersWithoutPeers.map(({ pkgAddresses }) => pkgAddresses),
+    publishedBy,
     time,
+    workspaceRootDeps,
   }
 }
 
@@ -954,7 +960,7 @@ async function startResolvingPeers (
   }
 }
 
-function mergePkgsDeps (pkgsDeps: MissingPeers[], opts: { autoInstallPeersFromHighestMatch: boolean }): MissingPeers {
+export function mergePkgsDeps (pkgsDeps: MissingPeers[], opts: { autoInstallPeersFromHighestMatch: boolean }): MissingPeers {
   const groupedRanges: Record<string, { ranges: string[], optional: boolean }> = {}
   for (const deps of pkgsDeps) {
     for (const [name, { range, optional }] of Object.entries(deps)) {

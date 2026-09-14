@@ -177,16 +177,6 @@ export async function resolveDependencies (
     noDependencySelectors: importers.every(({ wantedDependencies }) => wantedDependencies.length === 0),
   })
   const projectsToResolve = await Promise.all(importers.map(async (project) => _toResolveImporter(project)))
-  const {
-    dependenciesTree,
-    outdatedDependencies,
-    resolvedImporters,
-    resolvedPkgsById,
-    wantedToBeSkippedPackageIds,
-    time,
-    allPeerDepNames,
-    resolutionPolicyViolations,
-  } = await resolveDependencyTree(projectsToResolve, opts)
 
   // Resolver-policy gate between main resolution and peer-dep
   // resolution: every resolver records its own policy violations
@@ -202,102 +192,168 @@ export async function resolveDependencies (
   // pick that trips a check produces a violation that gets handled";
   // a missing handler means the caller forgot to opt in and would
   // otherwise see policy-rejected versions land in the lockfile.
-  if (resolutionPolicyViolations.length > 0) {
+  async function handleResolutionPolicyViolations (violations: readonly ResolutionPolicyViolation[]): Promise<void> {
+    if (violations.length === 0) return
     if (!opts.handleResolutionPolicyViolations) {
       throw new PnpmError(
         'RESOLUTION_POLICY_VIOLATIONS_UNHANDLED',
-        `${resolutionPolicyViolations.length} resolution-policy ${resolutionPolicyViolations.length === 1 ? 'violation was' : 'violations were'} produced but no handleResolutionPolicyViolations callback was wired to react to them.`,
+        `${violations.length} resolution-policy ${violations.length === 1 ? 'violation was' : 'violations were'} produced but no handleResolutionPolicyViolations callback was wired to react to them.`,
         {
           hint: 'Internal: resolveDependencies needs a handleResolutionPolicyViolations callback whenever a policy that can produce violations (today: minimumReleaseAge) is active. Wire setupPolicyHandlers (in @pnpm/installing.commands) or supply a callback directly.',
         }
       )
     }
-    await opts.handleResolutionPolicyViolations(resolutionPolicyViolations)
+    await opts.handleResolutionPolicyViolations(violations)
   }
 
-  opts.storeController.clearResolutionCache()
-
-  const projectsToLink = await Promise.all<ProjectToLink>(projectsToResolve.map(async (project) => {
-    const resolvedImporter = resolvedImporters[project.id]
-
-    const topParents: Array<{ name: string, version: string, alias?: string, linkedDir?: string }> = project.manifest
-      ? await getTopParents(
-        difference(
-          Object.keys(getAllDependenciesFromManifest(project.manifest)),
-          resolvedImporter.directDependencies.map(({ alias }) => alias) || []
-        ),
-        project.modulesDir
-      )
-      : []
-    for (const linkedDependency of resolvedImporter.linkedDependencies) {
-      // The location of the external link may vary on different machines, so it is better not to include it in the lockfile.
-      // As a workaround, we symlink to the root of node_modules, which is a symlink to the actual location of the external link.
-      const target = !opts.excludeLinksFromLockfile || isSubdir(opts.lockfileDir, linkedDependency.resolution.directory)
-        ? linkedDependency.resolution.directory
-        : path.join(project.modulesDir, linkedDependency.alias)
-      const linkedDir = createNodeIdForLinkedLocalPkg(opts.lockfileDir, target) as string
-      topParents.push({
-        name: linkedDependency.alias,
-        version: linkedDependency.version,
-        linkedDir,
-      })
-    }
-
-    return {
-      binsDir: project.binsDir,
-      declaredDirectDependencies: new Set([
-        ...Object.keys(project.manifest == null ? {} : getAllDependenciesFromManifest(project.manifest)),
-        ...project.wantedDependencies.flatMap(({ alias, isNew }) => isNew && alias != null ? [alias] : []),
-      ]),
-      directNodeIdsByAlias: resolvedImporter.directNodeIdsByAlias,
-      hoistedPeerProviderNodeIds: resolvedImporter.hoistedPeerProviderNodeIds,
-      explicitlyRequestedDirectDependencies: new Set(
-        project.wantedDependencies.flatMap(({ alias, bareSpecifier, isNew, prevSpecifier, updateSpec }) =>
-          alias != null && (isNew === true || updateSpec === true || (prevSpecifier != null && bareSpecifier !== prevSpecifier))
-            ? [alias]
-            : []
-        )
-      ),
-      id: project.id,
-      linkedDependencies: resolvedImporter.linkedDependencies,
-      manifest: project.manifest,
-      modulesDir: project.modulesDir,
-      rootDir: project.rootDir,
-      topParents,
-    }
-  }))
-
-  const peerResolutionOpts = {
-    allPeerDepNames,
-    dependenciesTree,
-    dedupePeerDependents: opts.dedupePeerDependents,
-    dedupePeers: opts.dedupePeers,
-    dedupeInjectedDeps: opts.dedupeInjectedDeps,
-    lockfileDir: opts.lockfileDir,
-    projects: projectsToLink,
-    virtualStoreDir: opts.virtualStoreDir,
-    virtualStoreDirMaxLength: opts.virtualStoreDirMaxLength,
-    resolvePeersFromWorkspaceRoot: Boolean(opts.resolvePeersFromWorkspaceRoot),
-    resolvedImporters,
-    peersSuffixMaxLength: opts.peersSuffixMaxLength,
-    workspaceProjectIds: new Set([...opts.allProjectIds, ...Object.keys(opts.wantedLockfile.importers)]),
-  }
-  const initiallyResolvedPeers = await resolvePeers(peerResolutionOpts)
-  // A second pass reuses the peer contexts already recorded in the lockfile so a
-  // writable install does not rewrite dependency instances whose locked provider
-  // is still valid and present. It can only differ from the first pass for nodes
-  // that carry a locked peer context, so it is skipped when none do (e.g. a fresh
-  // install) to avoid resolving peers twice for no benefit.
   const {
-    dependenciesGraph,
-    dependenciesByProjectId,
-    peerDependencyIssuesByProjects,
-  } = treeHasLockedPeerContexts(dependenciesTree)
-    ? await resolvePeers({
-      ...peerResolutionOpts,
-      resolvedPeerProviderPaths: initiallyResolvedPeers.pathsByNodeId,
-    })
-    : initiallyResolvedPeers
+    dependencyTreeResult: {
+      outdatedDependencies,
+      resolvedImporters,
+      resolvedPkgsById,
+      wantedToBeSkippedPackageIds,
+      time,
+      resolutionPolicyViolations,
+    },
+    peerResolution: {
+      dependenciesGraph,
+      dependenciesByProjectId,
+      peerDependencyIssuesByProjects,
+    },
+  } = await (async () => {
+    let resolutionCacheCleared = false
+    try {
+      const dependencyTreeResult = await resolveDependencyTree(projectsToResolve, opts)
+      const {
+        allPeerDepNames,
+        dependenciesTree,
+        resolvedImporters,
+        resolutionPolicyViolations,
+        resolveAdditionalPeers,
+      } = dependencyTreeResult
+
+      await handleResolutionPolicyViolations(resolutionPolicyViolations)
+      if (!opts.autoInstallPeers) {
+        opts.storeController.clearResolutionCache()
+        resolutionCacheCleared = true
+      }
+
+      async function createProjectToLink (
+        project: (typeof projectsToResolve)[number]
+      ): Promise<ProjectToLink> {
+        const resolvedImporter = resolvedImporters[project.id]
+
+        const topParents: Array<{ name: string, version: string, alias?: string, linkedDir?: string }> = project.manifest
+          ? await getTopParents(
+            difference(
+              Object.keys(getAllDependenciesFromManifest(project.manifest)),
+              resolvedImporter.directDependencies.map(({ alias }) => alias) || []
+            ),
+            project.modulesDir
+          )
+          : []
+        for (const linkedDependency of resolvedImporter.linkedDependencies) {
+          // The location of the external link may vary on different machines, so it is better not to include it in the lockfile.
+          // As a workaround, we symlink to the root of node_modules, which is a symlink to the actual location of the external link.
+          const target = !opts.excludeLinksFromLockfile || isSubdir(opts.lockfileDir, linkedDependency.resolution.directory)
+            ? linkedDependency.resolution.directory
+            : path.join(project.modulesDir, linkedDependency.alias)
+          const linkedDir = createNodeIdForLinkedLocalPkg(opts.lockfileDir, target) as string
+          topParents.push({
+            name: linkedDependency.alias,
+            version: linkedDependency.version,
+            linkedDir,
+          })
+        }
+
+        return {
+          binsDir: project.binsDir,
+          declaredDirectDependencies: new Set([
+            ...Object.keys(project.manifest == null ? {} : getAllDependenciesFromManifest(project.manifest)),
+            ...project.wantedDependencies.flatMap(({ alias, isNew }) => isNew && alias != null ? [alias] : []),
+          ]),
+          directNodeIdsByAlias: resolvedImporter.directNodeIdsByAlias,
+          hoistedPeerProviderNodeIds: resolvedImporter.hoistedPeerProviderNodeIds,
+          explicitlyRequestedDirectDependencies: new Set(
+            project.wantedDependencies.flatMap(({ alias, bareSpecifier, isNew, prevSpecifier, updateSpec }) =>
+              alias != null && (isNew === true || updateSpec === true || (prevSpecifier != null && bareSpecifier !== prevSpecifier))
+                ? [alias]
+                : []
+            )
+          ),
+          id: project.id,
+          linkedDependencies: resolvedImporter.linkedDependencies,
+          manifest: project.manifest,
+          modulesDir: project.modulesDir,
+          rootDir: project.rootDir,
+          topParents,
+        }
+      }
+
+      const projectsToLink = await Promise.all<ProjectToLink>(projectsToResolve.map(createProjectToLink))
+      const peerResolutionOpts = {
+        allPeerDepNames,
+        dependenciesTree,
+        dedupePeerDependents: opts.dedupePeerDependents,
+        dedupePeers: opts.dedupePeers,
+        dedupeInjectedDeps: opts.dedupeInjectedDeps,
+        lockfileDir: opts.lockfileDir,
+        virtualStoreDir: opts.virtualStoreDir,
+        virtualStoreDirMaxLength: opts.virtualStoreDirMaxLength,
+        resolvePeersFromWorkspaceRoot: Boolean(opts.resolvePeersFromWorkspaceRoot),
+        resolvedImporters,
+        peersSuffixMaxLength: opts.peersSuffixMaxLength,
+        workspaceProjectIds: new Set([...opts.allProjectIds, ...Object.keys(opts.wantedLockfile.importers)]),
+      }
+      let peerResolution = await resolvePeers({
+        ...peerResolutionOpts,
+        projects: projectsToLink,
+      })
+
+      if (opts.autoInstallPeers) {
+        const projectIndexById = new Map(projectsToResolve.map(({ id }, index) => [id, index]))
+        while (true) {
+          // eslint-disable-next-line no-await-in-loop
+          const additionalPeerResolution = await resolveAdditionalPeers(peerResolution.missingRequiredPeersByProject)
+          // eslint-disable-next-line no-await-in-loop
+          await handleResolutionPolicyViolations(additionalPeerResolution.resolutionPolicyViolations)
+          if (additionalPeerResolution.updatedImporterIds.length === 0) break
+          // eslint-disable-next-line no-await-in-loop
+          await Promise.all(additionalPeerResolution.updatedImporterIds.map(async (importerId) => {
+            const projectIndex = projectIndexById.get(importerId)
+            if (projectIndex == null) {
+              throw new Error(`Cannot refresh unknown importer ${importerId}`)
+            }
+            projectsToLink[projectIndex] = await createProjectToLink(projectsToResolve[projectIndex])
+          }))
+          // eslint-disable-next-line no-await-in-loop
+          peerResolution = await resolvePeers({
+            ...peerResolutionOpts,
+            projects: projectsToLink,
+          })
+        }
+      }
+
+      // A second pass reuses the peer contexts already recorded in the lockfile so a
+      // writable install does not rewrite dependency instances whose locked provider
+      // is still valid and present. It runs once after auto-installed peers converge.
+      if (treeHasLockedPeerContexts(dependenciesTree)) {
+        peerResolution = await resolvePeers({
+          ...peerResolutionOpts,
+          projects: projectsToLink,
+          resolvedPeerProviderPaths: peerResolution.pathsByNodeId,
+        })
+      }
+      return {
+        dependencyTreeResult,
+        peerResolution,
+      }
+    } finally {
+      if (!resolutionCacheCleared) {
+        opts.storeController.clearResolutionCache()
+      }
+    }
+  })()
 
   const preserveDedupedWorkspaceLinks = Boolean(opts.dedupeInjectedDeps)
   const linkedDependenciesByProjectId: Record<string, LinkedDependency[]> = {}

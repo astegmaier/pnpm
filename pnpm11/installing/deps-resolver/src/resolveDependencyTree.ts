@@ -8,10 +8,12 @@ import type { PatchGroupRecord } from '@pnpm/patching.config'
 import { BUILTIN_REGISTRIES_BY_PREFIX } from '@pnpm/resolving.npm-resolver'
 import type { PreferredVersions, Resolution, ResolutionPolicyViolation, WorkspacePackages } from '@pnpm/resolving.resolver-base'
 import type { StoreController } from '@pnpm/store.controller-types'
-import type { AllowBuild, AllowedDeprecatedVersions, PkgResolutionId, ProjectId, ProjectManifest, ProjectRootDir, RangeSpecStyle, ReadPackageHook, RegistryContext, SupportedArchitectures, TrustPolicy } from '@pnpm/types'
+import { type AllowBuild, type AllowedDeprecatedVersions, DEPENDENCIES_FIELDS, type PkgResolutionId, type ProjectId, type ProjectManifest, type ProjectRootDir, type RangeSpecStyle, type ReadPackageHook, type RegistryContext, type SupportedArchitectures, type TrustPolicy } from '@pnpm/types'
 import { partition } from 'ramda'
+import semver from 'semver'
 
-import type { WantedDependency } from './getNonDevWantedDependencies.js'
+import { getNonDevWantedDependencies, type WantedDependency } from './getNonDevWantedDependencies.js'
+import { hoistPeers } from './hoistPeers.js'
 import type { NodeId } from './nextNodeId.js'
 import {
   buildTree,
@@ -20,15 +22,19 @@ import {
   type ImporterToResolve,
   type ImporterToResolveOptions,
   type LinkedDependency,
+  mergePkgsDeps,
+  type MissingPeers,
   type ParentPkgAliases,
   type PendingNode,
   type PkgAddress,
   type PkgAddressOrLink,
   type ResolutionContext,
+  resolveDependencies as resolveMoreDependencies,
   type ResolvedPackage,
   type ResolvedPkgsById,
   resolveRootDependencies,
 } from './resolveDependencies.js'
+import type { MissingRequiredPeersByProject } from './resolvePeers.js'
 
 export type { DependenciesTree, DependenciesTreeNode, LinkedDependency, ResolvedPackage } from './resolveDependencies.js'
 
@@ -162,6 +168,10 @@ export interface ResolveDependencyTreeResult {
    * filter by `code` to decide what to do.
    */
   resolutionPolicyViolations: ResolutionPolicyViolation[]
+  resolveAdditionalPeers: (missingRequiredPeersByProject: MissingRequiredPeersByProject) => Promise<{
+    resolutionPolicyViolations: ResolutionPolicyViolation[]
+    updatedImporterIds: ProjectId[]
+  }>
 }
 
 export async function resolveDependencyTree<T> (
@@ -170,7 +180,7 @@ export async function resolveDependencyTree<T> (
 ): Promise<ResolveDependencyTreeResult> {
   const wantedToBeSkippedPackageIds = new Set<PkgResolutionId>()
   const autoInstallPeers = opts.autoInstallPeers === true
-  const { publishedBy, publishedByExclude } = getPublishedByPolicy(opts)
+  const { publishedBy: maximumPublishedBy, publishedByExclude } = getPublishedByPolicy(opts)
   const ctx: ResolutionContext = {
     allowBuild: opts.allowBuild,
     autoInstallPeers,
@@ -218,7 +228,7 @@ export async function resolveDependencyTree<T> (
     missingPeersOfChildrenByPkgId: {},
     hoistPeers: autoInstallPeers || opts.dedupePeerDependents,
     allPeerDepNames: new Set(),
-    maximumPublishedBy: publishedBy,
+    maximumPublishedBy,
     publishedByExclude,
     packageResolutionBarrier: {
       activeByDepth: new Map(),
@@ -275,8 +285,15 @@ export async function resolveDependencyTree<T> (
       rangeSpecStyle: importer.rangeSpecStyle,
     }
   })
-  const { pkgAddressesByImporters, time } = await resolveRootDependencies(ctx, resolveArgs)
-  const directDepsByImporterId = Object.fromEntries(importers.map(({ id }, i) => [id, pkgAddressesByImporters[i]]))
+  const {
+    pkgAddressesByImporters,
+    publishedBy: resolvedPublishedBy,
+    time,
+    workspaceRootDeps,
+  } = await resolveRootDependencies(ctx, resolveArgs)
+  const directDepsByImporterId: Record<string, PkgAddressOrLink[]> = Object.fromEntries(
+    importers.map(({ id }, index) => [id, pkgAddressesByImporters[index]])
+  )
 
   for (const directDependencies of pkgAddressesByImporters) {
     for (const directDep of directDependencies as PkgAddress[]) {
@@ -308,22 +325,223 @@ export async function resolveDependencyTree<T> (
     }
   }
 
-  for (const pendingNode of ctx.pendingNodes) {
-    ctx.dependenciesTree.set(pendingNode.nodeId, {
-      children: () => buildTree(ctx, pendingNode.resolvedPackage.id,
-        pendingNode.parentIds,
-        ctx.childrenByParentId[pendingNode.resolvedPackage.id], pendingNode.depth + 1, pendingNode.installable),
-      depth: pendingNode.depth,
-      installable: pendingNode.installable,
-      lockedPeerContext: pendingNode.lockedPeerContext,
-      previousDepPath: pendingNode.previousDepPath,
-      resolvedPackage: pendingNode.resolvedPackage,
-    })
+  let processedPendingNodes = 0
+  const resolvedImporters: ResolvedImporters = {}
+  const attemptedPeerAliasesByImporter = new Map<string, Set<string>>()
+  const declaredDirectAliasesByImporter = new Map(importers.map((importer) => [
+    importer.id,
+    new Set([
+      ...DEPENDENCIES_FIELDS.flatMap((dependenciesField) =>
+        Object.keys(importer.manifest[dependenciesField] ?? {})
+      ),
+      ...importer.wantedDependencies.flatMap(({ alias }) => alias == null ? [] : [alias]),
+    ]),
+  ]))
+  const workspaceRootImporterId = ctx.resolvePeersFromWorkspaceRoot
+    ? importers.find(({ id }) => id === '.')?.id
+    : undefined
+
+  materializePendingNodes()
+  for (const importer of importers) {
+    updateResolvedImporter(importer)
   }
 
-  const resolvedImporters: ResolvedImporters = {}
+  async function resolveAdditionalPeers (
+    missingRequiredPeersByProject: MissingRequiredPeersByProject
+  ): Promise<{
+    resolutionPolicyViolations: ResolutionPolicyViolation[]
+    updatedImporterIds: ProjectId[]
+  }> {
+    if (!ctx.autoInstallPeers) {
+      return {
+        resolutionPolicyViolations: [],
+        updatedImporterIds: [],
+      }
+    }
+    const violationCount = ctx.resolutionPolicyViolations.length
+    const additionalResolutions = await Promise.all(importers.map(async (importer, index) => {
+      const dependencies = getAdditionalPeerDependencies(
+        importer.id,
+        importer.rootDir,
+        missingRequiredPeersByProject[importer.id]
+      )
+      if (Object.keys(dependencies).length === 0) return undefined
 
-  for (const { id, wantedDependencies } of importers) {
+      const parentPkgAliases = getCurrentParentPkgAliases(importer.id, index)
+      for (const peerName of Object.keys(dependencies)) {
+        parentPkgAliases[peerName] = true
+      }
+      const resolution = await resolveMoreDependencies(
+        ctx,
+        resolveArgs[index].preferredVersions,
+        getNonDevWantedDependencies({ dependencies }),
+        {
+          ...resolveArgs[index].options,
+          parentPkgAliases,
+          publishedBy: resolvedPublishedBy,
+          updateToLatest: false,
+        }
+      )
+      return {
+        importerId: importer.id,
+        parentPkgAliases,
+        peerResolution: await resolution.resolvingPeers,
+        pkgAddresses: resolution.pkgAddresses,
+      }
+    }))
+
+    const updatedImporterIds: ProjectId[] = []
+    for (const additionalResolution of additionalResolutions) {
+      if (additionalResolution == null) continue
+      if (appendAdditionalPeerAddresses(additionalResolution)) {
+        updatedImporterIds.push(additionalResolution.importerId)
+      }
+    }
+    if (updatedImporterIds.length > 0) {
+      materializePendingNodes()
+      for (const importer of importers) {
+        if (updatedImporterIds.includes(importer.id)) {
+          updateResolvedImporter(importer)
+        }
+      }
+    }
+    return {
+      resolutionPolicyViolations: ctx.resolutionPolicyViolations.slice(violationCount),
+      updatedImporterIds,
+    }
+  }
+
+  function getAdditionalPeerDependencies (
+    importerId: ProjectId,
+    importerRootDir: ProjectRootDir,
+    missingRequiredPeers: MissingRequiredPeersByProject[string] | undefined
+  ): Record<string, string> {
+    if (missingRequiredPeers == null) return {}
+    const peerRequirements: MissingPeers[] = []
+    const attemptedPeerAliases = getAttemptedPeerAliases(importerId)
+    for (const [peerName, ranges] of missingRequiredPeers) {
+      if (
+        attemptedPeerAliases.has(peerName) ||
+        hasExistingPeerProvider(importerId, peerName)
+      ) continue
+      // Protocol and catalog targets stay unresolved here rather than gaining
+      // selection semantics that differ from the initial peer-hoist pass.
+      if ([...ranges].some((range) => semver.validRange(range, { includePrerelease: true }) == null)) continue
+      for (const range of [...ranges].sort()) {
+        peerRequirements.push({
+          [peerName]: {
+            optional: false,
+            range,
+          },
+        })
+      }
+    }
+    const mergedPeers = mergePkgsDeps(peerRequirements, {
+      autoInstallPeersFromHighestMatch: ctx.autoInstallPeersFromHighestMatch,
+    })
+    const dependencies = hoistPeers({
+      autoInstallPeers: true,
+      allPreferredVersions: ctx.allPreferredVersions,
+      workspaceRootDeps,
+      overrideBareSpecifier: ctx.overrideBareSpecifier == null
+        ? undefined
+        : (name, range) => ctx.overrideBareSpecifier!(name, range, importerRootDir),
+    }, Object.entries(mergedPeers))
+    const unattemptedDependencies: Record<string, string> = {}
+    for (const peerName of Object.keys(dependencies).sort()) {
+      if (attemptedPeerAliases.has(peerName) || hasExistingPeerProvider(importerId, peerName)) continue
+      attemptedPeerAliases.add(peerName)
+      unattemptedDependencies[peerName] = dependencies[peerName]
+    }
+    return unattemptedDependencies
+  }
+
+  function getAttemptedPeerAliases (importerId: ProjectId): Set<string> {
+    let attemptedPeerAliases = attemptedPeerAliasesByImporter.get(importerId)
+    if (attemptedPeerAliases == null) {
+      attemptedPeerAliases = new Set()
+      attemptedPeerAliasesByImporter.set(importerId, attemptedPeerAliases)
+    }
+    return attemptedPeerAliases
+  }
+
+  function hasExistingPeerProvider (importerId: ProjectId, peerName: string): boolean {
+    if (declaredDirectAliasesByImporter.get(importerId)?.has(peerName) === true) return true
+    if (directDepsByImporterId[importerId].some((dependency) =>
+      dependency.alias === peerName || dependency.pkg.name === peerName
+    )) return true
+    return workspaceRootImporterId != null &&
+      workspaceRootImporterId !== importerId &&
+      directDepsByImporterId[workspaceRootImporterId].some((dependency) =>
+        dependency.alias === peerName || dependency.pkg.name === peerName
+      )
+  }
+
+  function getCurrentParentPkgAliases (importerId: ProjectId, index: number): ParentPkgAliases {
+    const parentPkgAliases = { ...resolveArgs[index].parentPkgAliases }
+    for (const directDependency of directDepsByImporterId[importerId]) {
+      parentPkgAliases[directDependency.alias] = directDependency.isLinkedDependency === true
+        ? true
+        : directDependency
+    }
+    return parentPkgAliases
+  }
+
+  function appendAdditionalPeerAddresses (
+    {
+      importerId,
+      parentPkgAliases,
+      peerResolution,
+      pkgAddresses,
+    }: {
+      importerId: ProjectId
+      parentPkgAliases: ParentPkgAliases
+      peerResolution: { resolvedPeers: Record<string, PkgAddress> }
+      pkgAddresses: PkgAddressOrLink[]
+    }
+  ): boolean {
+    const directDependencies = directDepsByImporterId[importerId]
+    const directAliases = new Set(directDependencies.map(({ alias }) => alias))
+    let changed = false
+    for (const pkgAddress of pkgAddresses) {
+      if (directAliases.has(pkgAddress.alias)) continue
+      directDependencies.push(pkgAddress)
+      directAliases.add(pkgAddress.alias)
+      changed = true
+    }
+    for (const [peerName, resolvedPeerAddress] of Object.entries(peerResolution.resolvedPeers)) {
+      if (
+        parentPkgAliases[peerName] ||
+        directAliases.has(resolvedPeerAddress.alias) ||
+        hasExistingPeerProvider(importerId, peerName)
+      ) continue
+      directDependencies.push({
+        ...resolvedPeerAddress,
+        hoistedPeerProvider: true,
+      })
+      directAliases.add(resolvedPeerAddress.alias)
+      changed = true
+    }
+    return changed
+  }
+
+  function materializePendingNodes (): void {
+    for (; processedPendingNodes < ctx.pendingNodes.length; processedPendingNodes++) {
+      const pendingNode = ctx.pendingNodes[processedPendingNodes]
+      ctx.dependenciesTree.set(pendingNode.nodeId, {
+        children: () => buildTree(ctx, pendingNode.resolvedPackage.id,
+          pendingNode.parentIds,
+          ctx.childrenByParentId[pendingNode.resolvedPackage.id], pendingNode.depth + 1, pendingNode.installable),
+        depth: pendingNode.depth,
+        installable: pendingNode.installable,
+        lockedPeerContext: pendingNode.lockedPeerContext,
+        previousDepPath: pendingNode.previousDepPath,
+        resolvedPackage: pendingNode.resolvedPackage,
+      })
+    }
+  }
+
+  function updateResolvedImporter ({ id, wantedDependencies }: ImporterToResolveGeneric<T>): void {
     const directDeps = dedupeSameAliasDirectDeps(directDepsByImporterId[id], wantedDependencies)
     const [linkedDependencies, directNonLinkedDeps] = partition((dep) => dep.isLinkedDependency === true, directDeps) as [LinkedDependency[], PkgAddress[]]
     resolvedImporters[id] = {
@@ -361,6 +579,7 @@ export async function resolveDependencyTree<T> (
     time,
     allPeerDepNames: ctx.allPeerDepNames,
     resolutionPolicyViolations: ctx.resolutionPolicyViolations,
+    resolveAdditionalPeers,
   }
 }
 

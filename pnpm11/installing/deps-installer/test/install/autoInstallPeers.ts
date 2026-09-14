@@ -5,11 +5,14 @@ import { assertProject } from '@pnpm/assert-project'
 import { createPeerDepGraphHash } from '@pnpm/deps.path'
 import { addDependenciesToPackage, install, type MutatedProject, mutateModules, mutateModulesInSingleProject, type PackageManifest } from '@pnpm/installing.deps-installer'
 import { prepareEmpty, preparePackages } from '@pnpm/prepare'
+import type { ResolutionPolicyViolation } from '@pnpm/resolving.resolver-base'
 import { addDistTag, REGISTRY_MOCK_PORT } from '@pnpm/testing.registry-mock'
-import type { ProjectRootDir } from '@pnpm/types'
+import type { ProjectManifest, ProjectRootDir } from '@pnpm/types'
 import { rimrafSync } from '@zkochan/rimraf'
 
 import { testDefaults } from '../utils/index.js'
+
+type SharedDepthProjectId = 'project1' | 'project2'
 
 test('a peer dependency declared with a scheme specifier is accepted and auto-installed', async () => {
   const project = prepareEmpty()
@@ -445,6 +448,200 @@ test('auto install peer deps in a workspace. test #2', async () => {
   }))
 })
 
+test.each([
+  {
+    dedupePeerDependents: false,
+    importerOrder: ['project1', 'project2'] as const,
+    name: 'shallower importer first',
+  },
+  {
+    dedupePeerDependents: false,
+    importerOrder: ['project2', 'project1'] as const,
+    name: 'deeper importer first',
+  },
+  {
+    dedupePeerDependents: true,
+    importerOrder: ['project1', 'project2'] as const,
+    name: 'peer-dependent deduplication enabled',
+  },
+])('auto install a required peer discovered in a deeper shared workspace occurrence with $name', async ({ dedupePeerDependents, importerOrder }) => {
+  const project = prepareEmpty()
+  const { allProjects, mutations } = createSharedDepthWorkspace(importerOrder)
+  const runInstall = async () => mutateModules(mutations, testDefaults({
+    allProjects,
+    autoInstallPeers: true,
+    dedupePeerDependents,
+    strictPeerDependencies: true,
+  }))
+
+  await runInstall()
+  const firstLockfile = project.readLockfile()
+  expect(firstLockfile.importers.project1.dependencies?.['@pnpm.e2e/abc-parent-with-ab']?.version).toBe('1.0.0(@pnpm.e2e/peer-c@1.0.0)')
+  expect(firstLockfile.importers.project2.dependencies?.['@pnpm.e2e/abc-grand-parent-without-c']?.version).toBe('1.0.0(@pnpm.e2e/peer-c@1.0.0)')
+  const abcSnapshots = Object.keys(firstLockfile.snapshots)
+    .filter((depPath) => depPath.startsWith('@pnpm.e2e/abc@1.0.0'))
+  expect(abcSnapshots).not.toHaveLength(0)
+  expect(abcSnapshots).not.toContain('@pnpm.e2e/abc@1.0.0')
+  for (const depPath of abcSnapshots) {
+    expect(depPath).toContain('@pnpm.e2e/peer-c@1.0.0')
+  }
+
+  await runInstall()
+  expect(project.readLockfile()).toStrictEqual(firstLockfile)
+})
+
+test('do not append a peer that a distant ancestor provides', async () => {
+  await Promise.all([
+    addDistTag({ package: '@pnpm.e2e/abc-parent-with-ab', version: '1.0.0', distTag: 'latest' }),
+    addDistTag({ package: '@pnpm.e2e/peer-c', version: '1.0.0', distTag: 'latest' }),
+  ])
+  const project = prepareEmpty()
+  await addDependenciesToPackage({}, [
+    '@pnpm.e2e/abc-grand-parent-with-c@1.0.0',
+  ], testDefaults({
+    autoInstallPeers: true,
+    strictPeerDependencies: true,
+  }))
+
+  project.hasNot('@pnpm.e2e/peer-c')
+  const parentSnapshots = Object.entries(project.readLockfile().snapshots)
+    .filter(([depPath]) => depPath.startsWith('@pnpm.e2e/abc-parent-with-ab@1.0.0'))
+  expect(parentSnapshots).toHaveLength(1)
+  expect(parentSnapshots[0][0]).toContain('@pnpm.e2e/peer-c@1.0.0')
+  expect(parentSnapshots[0][1].dependencies?.['@pnpm.e2e/abc']).toContain('@pnpm.e2e/peer-c@1.0.0')
+})
+
+test('do not propagate an optional peer discovered in a deeper shared workspace occurrence', async () => {
+  const project = prepareEmpty()
+  const { allProjects, mutations } = createSharedDepthWorkspace()
+  await mutateModules(mutations, testDefaults({
+    allProjects,
+    autoInstallPeers: true,
+    dedupePeerDependents: false,
+    hooks: {
+      readPackage: [(pkg: PackageManifest) => {
+        if (pkg.name === '@pnpm.e2e/abc') {
+          pkg.peerDependenciesMeta = {
+            ...pkg.peerDependenciesMeta,
+            '@pnpm.e2e/peer-c': { optional: true },
+          }
+        }
+        return pkg
+      }],
+    },
+    strictPeerDependencies: true,
+  }))
+
+  expect(project.readLockfile().importers.project2.dependencies?.['@pnpm.e2e/abc-grand-parent-without-c']?.version)
+    .not.toContain('@pnpm.e2e/peer-c@')
+  assertProject(path.resolve('project2')).hasNot('@pnpm.e2e/peer-c')
+})
+
+test('do not append a deeper required peer when autoInstallPeers is disabled', async () => {
+  const project = prepareEmpty()
+  const { allProjects, mutations } = createSharedDepthWorkspace()
+  await mutateModules(mutations, testDefaults({
+    allProjects,
+    autoInstallPeers: false,
+    dedupePeerDependents: true,
+  }))
+
+  expect(project.readLockfile().importers.project2.dependencies?.['@pnpm.e2e/abc-grand-parent-without-c']?.version)
+    .not.toContain('@pnpm.e2e/peer-c@')
+  assertProject(path.resolve('project2')).hasNot('@pnpm.e2e/peer-c')
+})
+
+test('resolve newly discovered required peers to a fixpoint', async () => {
+  const project = prepareEmpty()
+  const { allProjects, mutations } = createSharedDepthWorkspace(undefined, {
+    'is-positive': '1.0.0',
+  })
+  await mutateModules(mutations, testDefaults({
+    allProjects,
+    autoInstallPeers: true,
+    dedupePeerDependents: false,
+    hooks: {
+      readPackage: [(pkg: PackageManifest) => {
+        if (pkg.name === '@pnpm.e2e/peer-c') {
+          pkg.peerDependencies = {
+            'is-positive': '1.0.0',
+          }
+        }
+        return pkg
+      }],
+    },
+    strictPeerDependencies: true,
+  }))
+
+  const peerCSnapshots = Object.keys(project.readLockfile().snapshots)
+    .filter((depPath) => depPath.startsWith('@pnpm.e2e/peer-c@1.0.0'))
+  expect(peerCSnapshots).not.toHaveLength(0)
+  for (const depPath of peerCSnapshots) {
+    expect(depPath).toContain('is-positive@1.0.0')
+  }
+})
+
+test('handle policy violations discovered while resolving an additional peer', async () => {
+  prepareEmpty()
+  const { allProjects, mutations } = createSharedDepthWorkspace(undefined, {
+    '@pnpm.e2e/peer-c': '2.0.0',
+  })
+  const violationBatches: string[][] = []
+  await mutateModules(mutations, testDefaults({
+    allProjects,
+    autoInstallPeers: true,
+    dedupePeerDependents: false,
+    handleResolutionPolicyViolations: async (violations: readonly ResolutionPolicyViolation[]) => {
+      violationBatches.push(violations.map(({ name, version }) => `${name}@${version}`))
+    },
+    hooks: {
+      readPackage: [withExactPeerC],
+    },
+    minimumReleaseAge: Date.now() / (60 * 1000),
+  }))
+
+  expect(violationBatches).toHaveLength(2)
+  expect(violationBatches[0]).not.toContain('@pnpm.e2e/peer-c@1.0.0')
+  expect(violationBatches[1]).toContain('@pnpm.e2e/peer-c@1.0.0')
+})
+
+test('clear the resolution cache when resolving an additional peer throws', async () => {
+  const project = prepareEmpty()
+  const { allProjects, mutations } = createSharedDepthWorkspace(undefined, {
+    '@pnpm.e2e/peer-c': '2.0.0',
+  })
+  let shouldThrow = true
+  const options = testDefaults({
+    allProjects,
+    autoInstallPeers: true,
+    dedupePeerDependents: false,
+    hooks: {
+      readPackage: [(pkg: PackageManifest) => {
+        const updatedPkg = withExactPeerC(pkg)
+        if (shouldThrow && updatedPkg.name === '@pnpm.e2e/peer-c' && updatedPkg.version === '1.0.0') {
+          throw new Error('additional peer resolution failed')
+        }
+        return updatedPkg
+      }],
+    },
+  })
+  const clearResolutionCache = options.storeController.clearResolutionCache.bind(options.storeController)
+  let cacheClears = 0
+  options.storeController.clearResolutionCache = () => {
+    cacheClears++
+    clearResolutionCache()
+  }
+
+  await expect(mutateModules(mutations, options)).rejects.toThrow('additional peer resolution failed')
+  expect(cacheClears).toBe(1)
+
+  shouldThrow = false
+  await mutateModules(mutations, options)
+  expect(cacheClears).toBe(2)
+  expect(project.readLockfile().importers.project2.dependencies?.['@pnpm.e2e/abc-grand-parent-without-c']?.version)
+    .toContain('@pnpm.e2e/peer-c@1.0.0')
+})
+
 // This test may be removed if autoInstallPeers will become true by default
 test('installation on a package with many complex circular dependencies does not fail when auto install peers is on', async () => {
   prepareEmpty()
@@ -872,3 +1069,58 @@ test('a package entry keeps the declared peerDependencies ranges when the graph 
   await install(manifest('100.1.0'), opts())
   expect(declaredPeerRanges()).toStrictEqual(expectedPeerRanges)
 })
+
+function createSharedDepthWorkspace (
+  importerOrder: readonly SharedDepthProjectId[] = ['project1', 'project2'],
+  additionalProject1Dependencies: Record<string, string> = {}
+): {
+  allProjects: Array<{
+    buildIndex: number
+    manifest: ProjectManifest
+    rootDir: ProjectRootDir
+  }>
+  mutations: MutatedProject[]
+} {
+  const projects = {
+    project1: {
+      buildIndex: 0,
+      manifest: {
+        name: 'project1',
+        dependencies: {
+          '@pnpm.e2e/abc-parent-with-ab': '1.0.0',
+          '@pnpm.e2e/peer-c': '1.0.0',
+          ...additionalProject1Dependencies,
+        },
+      },
+      rootDir: path.resolve('project1') as ProjectRootDir,
+    },
+    project2: {
+      buildIndex: 0,
+      manifest: {
+        name: 'project2',
+        dependencies: {
+          '@pnpm.e2e/abc-grand-parent-without-c': '1.0.0',
+        },
+      },
+      rootDir: path.resolve('project2') as ProjectRootDir,
+    },
+  }
+  return {
+    allProjects: importerOrder.map((projectId) => projects[projectId]),
+    mutations: importerOrder.map((projectId) => ({
+      mutation: 'install',
+      rootDir: projects[projectId].rootDir,
+    })),
+  }
+}
+
+function withExactPeerC (pkg: PackageManifest): PackageManifest {
+  if (pkg.name !== '@pnpm.e2e/abc') return pkg
+  return {
+    ...pkg,
+    peerDependencies: {
+      ...pkg.peerDependencies,
+      '@pnpm.e2e/peer-c': '1.0.0',
+    },
+  }
+}
